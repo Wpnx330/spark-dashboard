@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.11.0](https://github.com/niklasfrick/spark-dashboard/compare/spark-dashboard-v0.10.0...spark-dashboard-v0.11.0) (2026-06-18)
+
+
+### Features
+
+* **docker:** harden runtime image with distroless base and self-probe healthcheck ([1ccc1db](https://github.com/niklasfrick/spark-dashboard/commit/1ccc1dbce75147a2667ecfc40549250d5d122fff))
+* **engines:** parse vLLM speculative-decoding metrics ([ac512e9](https://github.com/niklasfrick/spark-dashboard/commit/ac512e9bca984b846834c43dc59949f07b513ae7))
+* **frontend:** adapt hardware cards to vertical space ([68ee1ff](https://github.com/niklasfrick/spark-dashboard/commit/68ee1fffa58cafb9ad1dcb5c0d58b9e46dee1451))
+* **frontend:** surface speculative-decoding metrics in cache card ([feb936a](https://github.com/niklasfrick/spark-dashboard/commit/feb936a1c78a71c6024b8570e0dcef2171194293))
+
+
+### Bug Fixes
+
+* **frontend:** scale GPU power gauge by observed peak when no cap ([e2d525e](https://github.com/niklasfrick/spark-dashboard/commit/e2d525eddc7a6becd55bccab5d9179986c6b4bcc))
+* **metrics:** resolve GPU power limit via NVML fallback chain ([e68d7cb](https://github.com/niklasfrick/spark-dashboard/commit/e68d7cb2725d1f69f4a6648fe8738943ad24e776))
+
+
+### Dependencies & Chores
+
+* **ci:** bump github actions to latest stable ([49b68bd](https://github.com/niklasfrick/spark-dashboard/commit/49b68bd3d21d8b4ce77a50b4aaaa1b483993592a))
+* **deps:** bump frontend deps to latest stable ([124ce79](https://github.com/niklasfrick/spark-dashboard/commit/124ce7983b67da628517592ebcc4bed02e03ce38))
+* **deps:** bump rust crates to latest stable ([32d4e42](https://github.com/niklasfrick/spark-dashboard/commit/32d4e420327cbea34d979c4000d59d61f068f15e))
+
 ## [0.10.0](https://github.com/niklasfrick/spark-dashboard/compare/spark-dashboard-v0.9.0...spark-dashboard-v0.10.0) (2026-06-17)
 
 
