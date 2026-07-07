@@ -21,6 +21,9 @@ interface DashboardProps {
   /** When set, filters the dashboard to show only one section.
    *  Used by the mobile view toggle in App.tsx. */
   filterView?: 'hardware' | 'model'
+  /** When false, the dashboard avoids flex-1 so content determines height.
+   *  Used on narrow screens with Both view to prevent console overlap. */
+  fillHeight?: boolean
 }
 
 function HwCard({ title, subtitle, children }: { title?: string; subtitle?: string; children: React.ReactNode }) {
@@ -64,6 +67,7 @@ export function Dashboard({
   events,
   requests,
   filterView,
+  fillHeight = true,
 }: DashboardProps) {
   if (!metrics) return null
 
@@ -144,7 +148,7 @@ export function Dashboard({
   const showEngineCharts = rootSize.height === 0 || rootSize.height >= ENGINE_CHARTS_MIN_HEIGHT_PX
 
   return (
-    <div ref={rootRef} className="flex flex-col flex-1 min-h-0 gap-2">
+    <div ref={rootRef} className={`flex flex-col gap-2 ${fillHeight && filterView !== 'model' ? 'flex-1 min-h-0' : ''}`}>
       {/* ── LLM Engines — auto-height, fits content; hardware fills remainder ── */}
       {(!filterView || filterView === 'model') && (
         <div className="shrink-0 min-h-0">

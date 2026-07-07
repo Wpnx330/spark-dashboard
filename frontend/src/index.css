@@ -171,3 +171,9 @@
 
 /* Gauge glow filter — reused by ArcGauge */
 .gauge-glow { filter: drop-shadow(0 0 4px var(--glow-color, #76B900)); }
+
+/* FlipCard fade animation */
+@keyframes flipFadeIn {
+  from { opacity: 0.4; }
+  to { opacity: 1; }
+}

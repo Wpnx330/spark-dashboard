@@ -62,6 +62,9 @@ interface TimeSeriesChartProps {
   seriesLabel?: string
   /** Extra classes applied to the outer wrapper (e.g. grid column placement). */
   className?: string
+  /** When true, skip the title/legend header so the chart fills its container
+   *  edge-to-edge. Used inside FlipCard back faces where space is tight. */
+  compact?: boolean
 }
 
 function formatTime(timestamp: number): string {
@@ -139,6 +142,7 @@ export const TimeSeriesChart = React.memo(function TimeSeriesChart({
   hideTooltipLabel = false,
   seriesLabel,
   className,
+  compact = false,
 }: TimeSeriesChartProps) {
   const isMulti = series && series.length > 0
 
@@ -174,24 +178,26 @@ export const TimeSeriesChart = React.memo(function TimeSeriesChart({
           legends (Prefill / Decode / Latency) line up with single-title
           charts (KV / E2E) along the bottom. Legend always sits on its own
           line below the title for consistent layout across charts. */}
-      <div className="flex flex-col gap-1 mb-1 min-h-[2.25rem]">
-        {title && (
-          <h3 className="text-xs font-medium text-zinc-500">{title}</h3>
-        )}
-        {isMulti && (
-          <div className="flex items-center gap-3 flex-wrap">
-            {series.map((s, i) => (
-              <div key={i} className="flex items-center gap-1.5">
-                <span
-                  className="inline-block w-2.5 h-[2px] rounded-full"
-                  style={{ backgroundColor: s.color }}
-                />
-                <span className="text-[11px] text-zinc-500">{s.label}</span>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
+      {!compact && (
+        <div className="flex flex-col gap-1 mb-1 min-h-[2.25rem]">
+          {title && (
+            <h3 className="text-xs font-medium text-zinc-500">{title}</h3>
+          )}
+          {isMulti && (
+            <div className="flex items-center gap-3 flex-wrap">
+              {series.map((s, i) => (
+                <div key={i} className="flex items-center gap-1.5">
+                  <span
+                    className="inline-block w-2.5 h-[2px] rounded-full"
+                    style={{ backgroundColor: s.color }}
+                  />
+                  <span className="text-[11px] text-zinc-500">{s.label}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
       <ChartContainer
         config={chartConfig}
         style={{ height: typeof height === 'number' ? `${height}px` : height }}
