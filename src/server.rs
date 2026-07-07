@@ -11,6 +11,7 @@ struct FrontendAssets;
 pub fn create_router(tx: broadcast::Sender<String>) -> Router {
     Router::new()
         .route("/ws", get(crate::ws::ws_handler))
+        .route("/ws/logs", get(crate::logs::ws_logs_handler))
         // Liveness probe for container HEALTHCHECK / orchestrators. Intentionally
         // dependency-free: it reports that the HTTP server is up, not that any
         // engine/GPU is healthy (that's surfaced over /ws).

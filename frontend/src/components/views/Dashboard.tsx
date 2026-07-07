@@ -18,6 +18,9 @@ interface DashboardProps {
   }
   events: GpuEvent[]
   requests: InferenceRequest[]
+  /** When set, filters the dashboard to show only one section.
+   *  Used by the mobile view toggle in App.tsx. */
+  filterView?: 'hardware' | 'model'
 }
 
 function HwCard({ title, subtitle, children }: { title?: string; subtitle?: string; children: React.ReactNode }) {
@@ -60,6 +63,7 @@ export function Dashboard({
   history,
   events,
   requests,
+  filterView,
 }: DashboardProps) {
   if (!metrics) return null
 
@@ -142,17 +146,20 @@ export function Dashboard({
   return (
     <div ref={rootRef} className="flex flex-col flex-1 min-h-0 gap-2">
       {/* ── LLM Engines — auto-height, fits content; hardware fills remainder ── */}
-      <div className="shrink-0 min-h-0">
-        <EngineSection
-          engines={metrics.engines}
-          showCharts={showEngineCharts}
-          getChartData={history.getChartData}
-          requests={requests}
-        />
-      </div>
+      {(!filterView || filterView === 'model') && (
+        <div className="shrink-0 min-h-0">
+          <EngineSection
+            engines={metrics.engines}
+            showCharts={showEngineCharts}
+            getChartData={history.getChartData}
+            requests={requests}
+          />
+        </div>
+      )}
 
       {/* ── Hardware Overview — fills the rest of the viewport ── */}
-      <div className="flex-1 min-h-0 bg-[#0a0a0d]/80 rounded-xl border border-white/[0.03] p-1 lg:p-1.5 2xl:p-2 flex flex-col">
+      {(!filterView || filterView === 'hardware') && (
+        <div className="flex-1 min-h-0 bg-[#0a0a0d]/80 rounded-xl border border-white/[0.03] p-1 lg:p-1.5 2xl:p-2 flex flex-col">
         <div ref={hwGridRef} className="flex-1 min-h-0 grid grid-cols-2 sm:grid-cols-4 gap-1 lg:gap-1.5 auto-rows-fr">
 
           {/* GPU Utilization */}
@@ -337,6 +344,7 @@ export function Dashboard({
 
         </div>
       </div>
+      )}
     </div>
   )
 }
