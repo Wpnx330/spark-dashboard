@@ -4,9 +4,10 @@ import { useMetricsHistory } from './hooks/useMetricsHistory'
 import { ConnectionBadge } from './components/ConnectionBadge'
 import { Dashboard } from './components/views/Dashboard'
 import { LogViewer } from './components/LogViewer'
+import { HistoryView } from './components/HistoryView'
 import type { GpuEvent, InferenceRequest } from './types/events'
 
-type MobileView = 'both' | 'model' | 'hardware'
+type MobileView = 'both' | 'model' | 'hardware' | 'historical'
 
 function App() {
   const { metrics, connectionStatus, isStale } = useMetrics()
@@ -44,6 +45,8 @@ function App() {
     [getRequests],
   )
 
+  const isHistorical = mobileView === 'historical'
+
   return (
     <div className="h-dvh flex flex-col bg-[#08080a] overflow-hidden">
       <header className="shrink-0 border-b border-white/[0.04] px-4 py-1.5 flex justify-between items-center gap-3">
@@ -52,11 +55,11 @@ function App() {
           <span className="text-zinc-500 font-normal">Dashboard</span>
         </h1>
 
-        {/* View toggle — visible on all screen sizes */}
+        {/* View toggle */}
         <div className="flex bg-[#1a1a1f] rounded-lg p-0.5 border border-white/[0.05]">
           <button
             onClick={() => setMobileView('both')}
-            className={`px-3 py-1 rounded-md text-xs font-medium transition-colors ${
+            className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors ${
               mobileView === 'both'
                 ? 'bg-[#76B900] text-black shadow-sm'
                 : 'text-zinc-400 hover:text-zinc-200'
@@ -66,7 +69,7 @@ function App() {
           </button>
           <button
             onClick={() => setMobileView('model')}
-            className={`px-3 py-1 rounded-md text-xs font-medium transition-colors ${
+            className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors ${
               mobileView === 'model'
                 ? 'bg-[#76B900] text-black shadow-sm'
                 : 'text-zinc-400 hover:text-zinc-200'
@@ -76,7 +79,7 @@ function App() {
           </button>
           <button
             onClick={() => setMobileView('hardware')}
-            className={`px-3 py-1 rounded-md text-xs font-medium transition-colors ${
+            className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors ${
               mobileView === 'hardware'
                 ? 'bg-[#76B900] text-black shadow-sm'
                 : 'text-zinc-400 hover:text-zinc-200'
@@ -84,13 +87,23 @@ function App() {
           >
             Hardware
           </button>
+          <button
+            onClick={() => setMobileView('historical')}
+            className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors ${
+              mobileView === 'historical'
+                ? 'bg-[#76B900] text-black shadow-sm'
+                : 'text-zinc-400 hover:text-zinc-200'
+            }`}
+          >
+            Historical
+          </button>
         </div>
 
         <ConnectionBadge status={connectionStatus} isStale={isStale} />
       </header>
 
       <main className={`flex-1 min-h-0 flex flex-col overflow-y-auto p-3 lg:p-4 2xl:p-5 min-[1920px]:p-6 ${isStale ? 'opacity-50' : ''}`}>
-        {!metrics && connectionStatus !== 'connected' && (
+        {!metrics && connectionStatus !== 'connected' && !isHistorical && (
           <div className="flex-1 flex items-center justify-center">
             <div className="text-center">
               <h2 className="text-xl font-bold text-zinc-50 mb-2">Waiting for metrics</h2>
@@ -101,23 +114,28 @@ function App() {
           </div>
         )}
 
-        {/* Content area — filtered by Model/Hardware toggle when active */}
-        {(() => {
-          const filter = mobileView === 'hardware' ? 'hardware' : mobileView === 'model' ? 'model' : undefined
-          return (
-            <>
-              <Dashboard
-                metrics={metrics}
-                history={history}
-                events={events}
-                requests={requests}
-                filterView={filter}
-                fillHeight={!isNarrow || filter !== undefined}
-              />
-              <LogViewer />
-            </>
-          )
-        })()}
+        {isHistorical ? (
+          <HistoryView />
+        ) : (
+          <>
+            {(() => {
+              const filter = mobileView === 'hardware' ? 'hardware' : mobileView === 'model' ? 'model' : undefined
+              return (
+                <>
+                  <Dashboard
+                    metrics={metrics}
+                    history={history}
+                    events={events}
+                    requests={requests}
+                    filterView={filter}
+                    fillHeight={!isNarrow || filter !== undefined}
+                  />
+                  <LogViewer />
+                </>
+              )
+            })()}
+          </>
+        )}
       </main>
     </div>
   )

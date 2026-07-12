@@ -45,3 +45,4 @@ prometheus-parse = "0.2"
 nvml-wrapper = "0.12"
 procfs = "0.18"
 bollard = "0.21"
+rusqlite = { version = "0.34", features = ["bundled"] }
