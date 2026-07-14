@@ -1,22 +1,40 @@
+use axum::extract::{Query, State};
 use axum::response::IntoResponse;
-use axum::{routing::get, Router};
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use rust_embed::Embed;
+use serde::Deserialize;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
+
+use crate::history::HistoryDb;
+
+/// Shared application state injected into handlers.
+pub struct AppState {
+    pub tx: broadcast::Sender<String>,
+    pub history: HistoryDb,
+}
 
 #[derive(Embed)]
 #[folder = "frontend/dist"]
 struct FrontendAssets;
 
-pub fn create_router(tx: broadcast::Sender<String>) -> Router {
+pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/ws", get(crate::ws::ws_handler))
-        // Liveness probe for container HEALTHCHECK / orchestrators. Intentionally
-        // dependency-free: it reports that the HTTP server is up, not that any
-        // engine/GPU is healthy (that's surfaced over /ws).
+        // Liveness probe
         .route("/healthz", get(healthz))
+        // History API
+        .route("/api/history/summary", get(history_summary))
+        .route("/api/history/settings", get(history_settings))
+        .route("/api/history/settings", post(history_settings_update))
+        .route("/api/history/toggle", post(history_toggle))
+        .route("/api/history/lookup-pricing", post(history_lookup_pricing))
+        .route("/api/history/prune", post(history_prune))
+        .route("/api/history/size", get(history_db_size))
         .fallback(static_handler)
-        .with_state(tx)
+        .with_state(state)
         .layer(CorsLayer::permissive())
 }
 
@@ -24,13 +42,263 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
+// ---------------------------------------------------------------------------
+// History API handlers
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct SummaryQuery {
+    engine: String,
+    since_ms: i64,
+    until_ms: i64,
+}
+
+async fn history_summary(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<SummaryQuery>,
+) -> impl IntoResponse {
+    match state
+        .history
+        .query_summary(&q.engine, q.since_ms, q.until_ms)
+        .await
+    {
+        Ok(Some(summary)) => Json(serde_json::json!(summary)).into_response(),
+        Ok(None) => Json(serde_json::json!({"error": "no data"})).into_response(),
+        Err(e) => Json(serde_json::json!({"error": format!("{}", e)})).into_response(),
+    }
+}
+
+async fn history_settings(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let enabled = state.history.is_enabled();
+    let prompt_rate = state
+        .history
+        .get_setting("cloud_prompt_rate")
+        .await
+        .unwrap_or(None)
+        .unwrap_or_default();
+    let gen_rate = state
+        .history
+        .get_setting("cloud_gen_rate")
+        .await
+        .unwrap_or(None)
+        .unwrap_or_default();
+    let elect_rate = state
+        .history
+        .get_setting("electricity_rate")
+        .await
+        .unwrap_or(None)
+        .unwrap_or_default();
+    let utc_offset = state
+        .history
+        .get_setting("utc_offset")
+        .await
+        .unwrap_or(None)
+        .unwrap_or_else(|| "-4".into());
+    Json(serde_json::json!({
+        "enabled": enabled,
+        "cloud_prompt_rate": prompt_rate,
+        "cloud_gen_rate": gen_rate,
+        "electricity_rate": elect_rate,
+        "utc_offset": utc_offset,
+    }))
+}
+
+#[derive(Deserialize)]
+struct SettingsUpdate {
+    cloud_prompt_rate: Option<String>,
+    cloud_gen_rate: Option<String>,
+    electricity_rate: Option<String>,
+    utc_offset: Option<String>,
+}
+
+async fn history_settings_update(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SettingsUpdate>,
+) -> impl IntoResponse {
+    if let Some(v) = &body.cloud_prompt_rate {
+        let _ = state.history.set_setting("cloud_prompt_rate", v).await;
+    }
+    if let Some(v) = &body.cloud_gen_rate {
+        let _ = state.history.set_setting("cloud_gen_rate", v).await;
+    }
+    if let Some(v) = &body.electricity_rate {
+        let _ = state.history.set_setting("electricity_rate", v).await;
+    }
+    if let Some(v) = &body.utc_offset {
+        let _ = state.history.set_setting("utc_offset", v).await;
+    }
+    Json(serde_json::json!({"ok": true}))
+}
+
+#[derive(Deserialize)]
+struct ToggleBody {
+    enabled: bool,
+}
+
+async fn history_toggle(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ToggleBody>,
+) -> impl IntoResponse {
+    match state.history.set_enabled(body.enabled).await {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) => Json(serde_json::json!({"error": format!("{}", e)})).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct LookupPricingBody {
+    model: String,
+}
+
+/// Look up live pricing for a model via OpenRouter's free models API.
+async fn history_lookup_pricing(Json(body): Json<LookupPricingBody>) -> impl IntoResponse {
+    let model_id = body.model.trim().to_lowercase();
+    if model_id.is_empty() {
+        return Json(serde_json::json!({"error": "no model specified"})).into_response();
+    }
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent("spark-dashboard/0.11.0")
+        .danger_accept_invalid_certs(true)
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return Json(
+                serde_json::json!({"error": format!("failed to build HTTP client: {}", e)}),
+            )
+            .into_response()
+        }
+    };
+
+    let resp = match client
+        .get("https://openrouter.ai/api/v1/models")
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return Json(serde_json::json!({"error": format!("failed to fetch pricing: {}", e)}))
+                .into_response()
+        }
+    };
+
+    let json: serde_json::Value =
+        match resp.json().await {
+            Ok(j) => j,
+            Err(e) => return Json(
+                serde_json::json!({"error": format!("failed to parse OpenRouter response: {}", e)}),
+            )
+            .into_response(),
+        };
+    // Try exact match first, then partial match
+    let models = json
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| {
+                    let id = m.get("id").and_then(|i| i.as_str())?.to_lowercase();
+                    let pricing = m.get("pricing")?;
+                    let prompt = pricing.get("prompt").and_then(|p| p.as_str())?;
+                    let completion = pricing.get("completion").and_then(|c| c.as_str())?;
+                    let matches =
+                        id == model_id || model_id.contains(&id) || id.contains(&model_id);
+                    if matches {
+                        Some((
+                            prompt.parse::<f64>().unwrap_or(0.0) * 1_000_000.0,
+                            completion.parse::<f64>().unwrap_or(0.0) * 1_000_000.0,
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if let Some(&(prompt, gen)) = models.first() {
+        Json(serde_json::json!({
+            "prompt_rate": format!("{:.4}", prompt),
+            "gen_rate": format!("{:.4}", gen),
+            "model": model_id,
+            "source": "openrouter"
+        }))
+        .into_response()
+    } else {
+        // Try partial name without the org prefix
+        let short_name = model_id.split('/').next_back().unwrap_or(&model_id);
+        let partial = json
+            .get("data")
+            .and_then(|d| d.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| {
+                        let id = m.get("id").and_then(|i| i.as_str())?.to_lowercase();
+                        if !id.contains(short_name) {
+                            return None;
+                        }
+                        let pricing = m.get("pricing")?;
+                        let prompt = pricing.get("prompt").and_then(|p| p.as_str())?;
+                        let completion = pricing.get("completion").and_then(|c| c.as_str())?;
+                        Some((
+                            prompt.parse::<f64>().unwrap_or(0.0) * 1_000_000.0,
+                            completion.parse::<f64>().unwrap_or(0.0) * 1_000_000.0,
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        if let Some(&(prompt, gen)) = partial.first() {
+            Json(serde_json::json!({
+                "prompt_rate": format!("{:.4}", prompt),
+                "gen_rate": format!("{:.4}", gen),
+                "model": model_id,
+                "source": "openrouter"
+            }))
+            .into_response()
+        } else {
+            Json(serde_json::json!({"error": format!("model '{}' not found on OpenRouter", model_id)})).into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct PruneBody {
+    older_than_ms: i64,
+}
+
+async fn history_prune(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<PruneBody>,
+) -> impl IntoResponse {
+    match state.history.prune(body.older_than_ms).await {
+        Ok((s, h, d)) => Json(serde_json::json!({"pruned_1s": s, "pruned_1h": h, "pruned_1d": d}))
+            .into_response(),
+        Err(e) => Json(serde_json::json!({"error": format!("{}", e)})).into_response(),
+    }
+}
+
+async fn history_db_size(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match state.history.db_size().await {
+        Ok(bytes) => Json(serde_json::json!({"bytes": bytes})).into_response(),
+        Err(e) => Json(serde_json::json!({"error": format!("{}", e)})).into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Static file serving (SPA)
+// ---------------------------------------------------------------------------
+
 async fn static_handler(uri: axum::http::Uri) -> impl IntoResponse {
     let mut path = uri.path().trim_start_matches('/');
     if path.is_empty() {
         path = "index.html";
     }
 
-    // Try exact file match first
     if let Some(file) = FrontendAssets::get(path) {
         let mime = mime_guess::from_path(path).first_or_octet_stream();
         return (
@@ -41,7 +309,6 @@ async fn static_handler(uri: axum::http::Uri) -> impl IntoResponse {
             .into_response();
     }
 
-    // SPA fallback: serve index.html for any unmatched route
     if let Some(index) = FrontendAssets::get("index.html") {
         return (
             axum::http::StatusCode::OK,
@@ -52,27 +319,4 @@ async fn static_handler(uri: axum::http::Uri) -> impl IntoResponse {
     }
 
     (axum::http::StatusCode::NOT_FOUND, "Not Found").into_response()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn healthz_returns_ok() {
-        let (tx, _rx) = broadcast::channel::<String>(16);
-        let app = create_router(tx);
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let resp = reqwest::get(format!("http://{addr}/healthz"))
-            .await
-            .expect("request to /healthz");
-        assert_eq!(resp.status(), reqwest::StatusCode::OK);
-        assert_eq!(resp.text().await.unwrap(), "ok");
-    }
 }

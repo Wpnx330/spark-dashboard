@@ -38,6 +38,7 @@ pub async fn metrics_collector(
     gpu_index: Option<u32>,
     simulate_gpus: u32,
     engine_state: std::sync::Arc<tokio::sync::RwLock<Vec<EngineSnapshot>>>,
+    history_db: crate::history::HistoryDb,
 ) {
     let mut interval = tokio::time::interval(Duration::from_millis(poll_interval_ms));
 
@@ -105,6 +106,11 @@ pub async fn metrics_collector(
     sys.refresh_cpu_usage();
 
     let mut memory_logged = false;
+    // Track cumulative counter values to compute per-second deltas
+    use std::collections::HashMap;
+    let mut prev_prompt: HashMap<String, i64> = HashMap::new();
+    let mut prev_gen: HashMap<String, i64> = HashMap::new();
+    let mut prev_reqs: HashMap<String, i64> = HashMap::new();
 
     loop {
         interval.tick().await;
@@ -157,6 +163,7 @@ pub async fn metrics_collector(
         ));
         let gpu = gpus.first().cloned().unwrap_or_else(gpu::empty_gpu_metrics);
 
+        let engines_for_history = engines.clone();
         let snapshot = MetricsSnapshot {
             timestamp_ms,
             gpu,
@@ -178,6 +185,52 @@ pub async fn metrics_collector(
                 tracing::error!("Failed to serialize metrics: {}", e);
             }
         }
+
+        // Log to history database (if enabled)
+        let ts = timestamp_ms as i64;
+        for eng in &engines_for_history {
+            if let Some(m) = &eng.metrics {
+                // Compute per-second deltas from cumulative counters
+                let cur_prompt = m.total_prompt_tokens.map(|v| v as i64);
+                let cur_gen = m.total_generation_tokens.map(|v| v as i64);
+                let cur_reqs = m.total_requests.map(|v| v as i64);
+                let delta_prompt = match (prev_prompt.get(&eng.endpoint), cur_prompt) {
+                    (Some(&prev), Some(cur)) if cur >= prev => Some(cur - prev),
+                    _ => None,
+                };
+                let delta_gen = match (prev_gen.get(&eng.endpoint), cur_gen) {
+                    (Some(&prev), Some(cur)) if cur >= prev => Some(cur - prev),
+                    _ => None,
+                };
+                let delta_reqs = match (prev_reqs.get(&eng.endpoint), cur_reqs) {
+                    (Some(&prev), Some(cur)) if cur >= prev => Some(cur - prev),
+                    _ => None,
+                };
+                if let Some(v) = cur_prompt { prev_prompt.insert(eng.endpoint.clone(), v); }
+                if let Some(v) = cur_gen { prev_gen.insert(eng.endpoint.clone(), v); }
+                if let Some(v) = cur_reqs { prev_reqs.insert(eng.endpoint.clone(), v); }
+                history_db.insert_1s(
+                    &eng.endpoint, ts,
+                    delta_prompt,
+                    delta_gen,
+                    delta_reqs,
+                    m.prompt_tokens_per_sec,
+                    m.tokens_per_sec,
+                    m.ttft_ms,
+                    m.inter_token_latency_ms,
+                    m.e2e_latency_ms,
+                    snapshot.gpu.power_watts,
+                    snapshot.gpu.utilization_percent.map(|v| v as f64),
+                    snapshot.gpu.temperature_celsius.map(|v| v as f64),
+                    m.active_requests.map(|v| v as i64),
+                    m.queued_requests.map(|v| v as i64),
+                    m.kv_cache_percent,
+                    m.prefix_cache_hit_rate,
+                    Some(snapshot.cpu.aggregate_percent as f64),
+                    None, // mem_used_pct - not directly available
+                ).await.ok();
+            }
+        }
     }
 }
 
@@ -189,6 +242,7 @@ pub async fn metrics_collector(
     _gpu_index: Option<u32>,
     simulate_gpus: u32,
     engine_state: std::sync::Arc<tokio::sync::RwLock<Vec<EngineSnapshot>>>,
+    _history_db: crate::history::HistoryDb,
 ) {
     let mut interval = tokio::time::interval(Duration::from_millis(poll_interval_ms));
 
