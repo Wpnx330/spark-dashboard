@@ -19,6 +19,12 @@ interface DashboardProps {
   }
   events: GpuEvent[]
   requests: InferenceRequest[]
+  /** When set, filters the dashboard to show only one section.
+   *  Used by the mobile view toggle in App.tsx. */
+  filterView?: 'hardware' | 'model'
+  /** When false, the dashboard avoids flex-1 so content determines height.
+   *  Used on narrow screens with Both view to prevent console overlap. */
+  fillHeight?: boolean
 }
 
 function HwCard({ title, subtitle, children }: { title?: string; subtitle?: string; children: React.ReactNode }) {
@@ -61,6 +67,8 @@ export function Dashboard({
   history,
   events,
   requests,
+  filterView,
+  fillHeight = true,
 }: DashboardProps) {
   // Which GPU the hardware chart panels show on multi-GPU hosts. Held above
   // the early return so incoming snapshots cannot reset it.
@@ -162,20 +170,23 @@ export function Dashboard({
   const NET_TX_COLOR = '#A855F7'
 
   return (
-    <div ref={rootRef} className="flex flex-col flex-1 min-h-0 gap-2">
+    <div ref={rootRef} className={`flex flex-col gap-2 ${fillHeight && filterView !== 'model' ? 'flex-1 min-h-0' : ''}`}>
       {/* ── LLM Engines — auto-height, fits content; hardware fills remainder ── */}
-      <div className="shrink-0 min-h-0">
-        <EngineSection
-          engines={metrics.engines}
-          showCharts={showEngineCharts}
-          getChartData={history.getChartData}
-          requests={requests}
-          gpuCount={gpus.length}
-        />
-      </div>
+      {(!filterView || filterView === 'model') && (
+        <div className="shrink-0 min-h-0">
+          <EngineSection
+            engines={metrics.engines}
+            showCharts={showEngineCharts}
+            getChartData={history.getChartData}
+            requests={requests}
+            gpuCount={gpus.length}
+          />
+        </div>
+      )}
 
       {/* ── Hardware Overview — fills the rest of the viewport ── */}
-      <div className="flex-1 min-h-0 bg-[#0a0a0d]/80 rounded-xl border border-white/[0.03] p-1 lg:p-1.5 2xl:p-2 flex flex-col">
+      {(!filterView || filterView === 'hardware') && (
+        <div className="flex-1 min-h-0 bg-[#0a0a0d]/80 rounded-xl border border-white/[0.03] p-1 lg:p-1.5 2xl:p-2 flex flex-col">
         {multiGpu && (
           <div role="group" aria-label="GPU selector" className="shrink-0 grid grid-cols-2 lg:grid-cols-4 gap-1 lg:gap-1.5 mb-1 lg:mb-1.5">
             {gpus.map((gpu) => {
@@ -393,6 +404,7 @@ export function Dashboard({
 
         </div>
       </div>
+      )}
     </div>
   )
 }

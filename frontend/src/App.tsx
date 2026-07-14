@@ -107,9 +107,7 @@ function App() {
           <div className="flex-1 flex items-center justify-center">
             <div className="text-center">
               <h2 className="text-xl font-bold text-zinc-50 mb-2">Waiting for metrics</h2>
-              <p className="text-zinc-400">
-                Connecting to the metrics server at {window.location.origin}. Make sure spark-dashboard is running.
-              </p>
+              <p className="text-sm text-zinc-400">Connecting to backend...</p>
             </div>
           </div>
         )}
