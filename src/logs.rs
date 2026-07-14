@@ -26,7 +26,7 @@ async fn handle_logs_socket(mut socket: WebSocket) {
     debug!("Streaming logs for container: {}", container_id);
 
     // Spawn `docker logs -f --tail=100` and stream its output
-    let mut cmd = tokio::process::Command::new("docker")
+    let cmd = tokio::process::Command::new("docker")
         .args([
             "logs",
             "-f",

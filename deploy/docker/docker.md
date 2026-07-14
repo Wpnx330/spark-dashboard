@@ -168,6 +168,79 @@ docker compose pull && docker compose up -d
 
 Or pin to a new explicit `SPARK_DASHBOARD_IMAGE` tag and re-run `up -d`.
 
+## History database
+
+The dashboard writes 1-second metric snapshots to a SQLite database at
+**`/var/lib/spark-dashboard/history.db`** inside the container. Compose persists
+this via a named volume (`spark-dashboard-data`) — data survives container
+recreation. With `docker run`, add a mount explicitly:
+
+```bash
+docker run --rm --gpus all --pid=host -p 3000:3000 \
+  -v /var/run/docker.sock:/var/run/docker.sock:ro \
+  -v spark-dashboard-data:/var/lib/spark-dashboard \
+  --group-add "$(getent group docker | cut -d: -f3)" \
+  ghcr.io/niklasfrick/spark-dashboard:latest
+```
+
+### Storage layout
+
+Three tables store data at different granularities:
+
+| Table             | Granularity | Retention              |
+| ----------------- | ----------- | ---------------------- |
+| `snapshots_1s`    | 1-second    | Until rolled up (1h)   |
+| `snapshots_1h`    | 1-hour      | 30 days                |
+| `snapshots_1d`    | 1-day       | Indefinite (prunable)  |
+
+Completed hours roll up into `snapshots_1h` (pruning the 1s source data), and
+completed days roll up into `snapshots_1d`. The rollup preserves weighted
+averages for TPS, max values for gauges, and cumulative sums for token counts
+and power.
+
+### Inspecting the database
+
+The distroless image has no shell, so `docker exec` won't work. To inspect the
+DB, mount the volume into a companion container:
+
+```bash
+docker run --rm -v spark-dashboard-data:/data -v $PWD:/work \
+  nouchka/sqlite3 sqlite3 /data/history.db
+```
+
+Useful queries:
+
+```sql
+-- Total rows per table
+SELECT 'snapshots_1s', COUNT(*) FROM snapshots_1s
+UNION ALL SELECT 'snapshots_1h', COUNT(*) FROM snapshots_1h
+UNION ALL SELECT 'snapshots_1d', COUNT(*) FROM snapshots_1d;
+
+-- Database size in MB
+SELECT ROUND(SUM(pgsize) / 1024.0 / 1024.0, 1) || ' MB' FROM dbstat;
+```
+
+### Pruning
+
+The UI exposes a prune control that calls `POST /api/history/prune` to delete
+data older than a given timestamp across all three tables. To prune
+programmatically:
+
+```bash
+# Delete everything older than 7 days (epoch ms)
+curl -X POST http://localhost:3000/api/history/prune \
+  -H 'Content-Type: application/json' \
+  -d "{\"older_than_ms\": $(date -d '7 days ago' +%s)000}"
+```
+
+### Resetting
+
+To start fresh, remove the named volume (this destroys all history data):
+
+```bash
+docker compose down -v
+```
+
 ## Building / testing locally
 
 Use the dev harness (see [`dev/README.md`](../../dev/README.md)):

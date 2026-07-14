@@ -169,7 +169,7 @@ pub async fn metrics_collector(
                     m.ttft_ms,
                     m.inter_token_latency_ms,
                     m.e2e_latency_ms,
-                    snapshot.gpu.power_watts.map(|v| v as f64),
+                    snapshot.gpu.power_watts,
                     snapshot.gpu.utilization_percent.map(|v| v as f64),
                     snapshot.gpu.temperature_celsius.map(|v| v as f64),
                     m.active_requests.map(|v| v as i64),

@@ -1,7 +1,7 @@
 use axum::extract::{Query, State};
 use axum::response::IntoResponse;
-use axum::{Json, Router};
 use axum::routing::{get, post};
+use axum::{Json, Router};
 use rust_embed::Embed;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -23,7 +23,6 @@ struct FrontendAssets;
 pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/ws", get(crate::ws::ws_handler))
-        .route("/ws/logs", get(crate::logs::ws_logs_handler))
         // Liveness probe
         .route("/healthz", get(healthz))
         // History API
@@ -58,25 +57,49 @@ async fn history_summary(
     State(state): State<Arc<AppState>>,
     Query(q): Query<SummaryQuery>,
 ) -> impl IntoResponse {
-    match state.history.query_summary(&q.engine, q.since_ms, q.until_ms).await {
+    match state
+        .history
+        .query_summary(&q.engine, q.since_ms, q.until_ms)
+        .await
+    {
         Ok(Some(summary)) => Json(serde_json::json!(summary)).into_response(),
         Ok(None) => Json(serde_json::json!({"error": "no data"})).into_response(),
         Err(e) => Json(serde_json::json!({"error": format!("{}", e)})).into_response(),
     }
 }
 
-async fn history_settings(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn history_settings(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let enabled = state.history.is_enabled();
-    let prompt_rate = state.history.get_setting("cloud_prompt_rate").await.unwrap_or(None).unwrap_or_default();
-    let gen_rate = state.history.get_setting("cloud_gen_rate").await.unwrap_or(None).unwrap_or_default();
-    let elect_rate = state.history.get_setting("electricity_rate").await.unwrap_or(None).unwrap_or_default();
+    let prompt_rate = state
+        .history
+        .get_setting("cloud_prompt_rate")
+        .await
+        .unwrap_or(None)
+        .unwrap_or_default();
+    let gen_rate = state
+        .history
+        .get_setting("cloud_gen_rate")
+        .await
+        .unwrap_or(None)
+        .unwrap_or_default();
+    let elect_rate = state
+        .history
+        .get_setting("electricity_rate")
+        .await
+        .unwrap_or(None)
+        .unwrap_or_default();
+    let utc_offset = state
+        .history
+        .get_setting("utc_offset")
+        .await
+        .unwrap_or(None)
+        .unwrap_or_else(|| "-4".into());
     Json(serde_json::json!({
         "enabled": enabled,
         "cloud_prompt_rate": prompt_rate,
         "cloud_gen_rate": gen_rate,
         "electricity_rate": elect_rate,
+        "utc_offset": utc_offset,
     }))
 }
 
@@ -85,6 +108,7 @@ struct SettingsUpdate {
     cloud_prompt_rate: Option<String>,
     cloud_gen_rate: Option<String>,
     electricity_rate: Option<String>,
+    utc_offset: Option<String>,
 }
 
 async fn history_settings_update(
@@ -99,6 +123,9 @@ async fn history_settings_update(
     }
     if let Some(v) = &body.electricity_rate {
         let _ = state.history.set_setting("electricity_rate", v).await;
+    }
+    if let Some(v) = &body.utc_offset {
+        let _ = state.history.set_setting("utc_offset", v).await;
     }
     Json(serde_json::json!({"ok": true}))
 }
@@ -124,9 +151,7 @@ struct LookupPricingBody {
 }
 
 /// Look up live pricing for a model via OpenRouter's free models API.
-async fn history_lookup_pricing(
-    Json(body): Json<LookupPricingBody>,
-) -> impl IntoResponse {
+async fn history_lookup_pricing(Json(body): Json<LookupPricingBody>) -> impl IntoResponse {
     let model_id = body.model.trim().to_lowercase();
     if model_id.is_empty() {
         return Json(serde_json::json!({"error": "no model specified"})).into_response();
@@ -139,7 +164,12 @@ async fn history_lookup_pricing(
         .build()
     {
         Ok(c) => c,
-        Err(e) => return Json(serde_json::json!({"error": format!("failed to build HTTP client: {}", e)})).into_response(),
+        Err(e) => {
+            return Json(
+                serde_json::json!({"error": format!("failed to build HTTP client: {}", e)}),
+            )
+            .into_response()
+        }
     };
 
     let resp = match client
@@ -149,62 +179,90 @@ async fn history_lookup_pricing(
         .and_then(|r| r.error_for_status())
     {
         Ok(r) => r,
-        Err(e) => return Json(serde_json::json!({"error": format!("failed to fetch pricing: {}", e)})).into_response(),
+        Err(e) => {
+            return Json(serde_json::json!({"error": format!("failed to fetch pricing: {}", e)}))
+                .into_response()
+        }
     };
 
-    let json: serde_json::Value = match resp.json().await {
-        Ok(j) => j,
-        Err(e) => return Json(serde_json::json!({"error": format!("failed to parse OpenRouter response: {}", e)})).into_response(),
-    };
-                    // Try exact match first, then partial match
-                    let models = json.get("data").and_then(|d| d.as_array()).map(|arr| {
-                        arr.iter().filter_map(|m| {
-                            let id = m.get("id").and_then(|i| i.as_str())?.to_lowercase();
-                            let pricing = m.get("pricing")?;
-                            let prompt = pricing.get("prompt").and_then(|p| p.as_str())?;
-                            let completion = pricing.get("completion").and_then(|c| c.as_str())?;
-                            let matches = id == model_id || model_id.contains(&id) || id.contains(&model_id);
-                            if matches {
-                                Some((prompt.parse::<f64>().unwrap_or(0.0) * 1_000_000.0,
-                                      completion.parse::<f64>().unwrap_or(0.0) * 1_000_000.0))
-                            } else {
-                                None
-                            }
-                        }).collect::<Vec<_>>()
-                    }).unwrap_or_default();
-
-                    if let Some(&(prompt, gen)) = models.first() {
-                        Json(serde_json::json!({
-                            "prompt_rate": format!("{:.4}", prompt),
-                            "gen_rate": format!("{:.4}", gen),
-                            "model": model_id,
-                            "source": "openrouter"
-                        })).into_response()
+    let json: serde_json::Value =
+        match resp.json().await {
+            Ok(j) => j,
+            Err(e) => return Json(
+                serde_json::json!({"error": format!("failed to parse OpenRouter response: {}", e)}),
+            )
+            .into_response(),
+        };
+    // Try exact match first, then partial match
+    let models = json
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| {
+                    let id = m.get("id").and_then(|i| i.as_str())?.to_lowercase();
+                    let pricing = m.get("pricing")?;
+                    let prompt = pricing.get("prompt").and_then(|p| p.as_str())?;
+                    let completion = pricing.get("completion").and_then(|c| c.as_str())?;
+                    let matches =
+                        id == model_id || model_id.contains(&id) || id.contains(&model_id);
+                    if matches {
+                        Some((
+                            prompt.parse::<f64>().unwrap_or(0.0) * 1_000_000.0,
+                            completion.parse::<f64>().unwrap_or(0.0) * 1_000_000.0,
+                        ))
                     } else {
-                        // Try partial name without the org prefix
-                        let short_name = model_id.split('/').last().unwrap_or(&model_id);
-                        let partial = json.get("data").and_then(|d| d.as_array()).map(|arr| {
-                            arr.iter().filter_map(|m| {
-                                let id = m.get("id").and_then(|i| i.as_str())?.to_lowercase();
-                                if !id.contains(short_name) { return None; }
-                                let pricing = m.get("pricing")?;
-                                let prompt = pricing.get("prompt").and_then(|p| p.as_str())?;
-                                let completion = pricing.get("completion").and_then(|c| c.as_str())?;
-                                Some((prompt.parse::<f64>().unwrap_or(0.0) * 1_000_000.0,
-                                      completion.parse::<f64>().unwrap_or(0.0) * 1_000_000.0))
-                            }).collect::<Vec<_>>()
-                        }).unwrap_or_default();
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
-                        if let Some(&(prompt, gen)) = partial.first() {
-                            Json(serde_json::json!({
-                                "prompt_rate": format!("{:.4}", prompt),
-                                "gen_rate": format!("{:.4}", gen),
-                                "model": model_id,
-                                "source": "openrouter"
-                            })).into_response()
-                        } else {
-                            Json(serde_json::json!({"error": format!("model '{}' not found on OpenRouter", model_id)})).into_response()
+    if let Some(&(prompt, gen)) = models.first() {
+        Json(serde_json::json!({
+            "prompt_rate": format!("{:.4}", prompt),
+            "gen_rate": format!("{:.4}", gen),
+            "model": model_id,
+            "source": "openrouter"
+        }))
+        .into_response()
+    } else {
+        // Try partial name without the org prefix
+        let short_name = model_id.split('/').next_back().unwrap_or(&model_id);
+        let partial = json
+            .get("data")
+            .and_then(|d| d.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| {
+                        let id = m.get("id").and_then(|i| i.as_str())?.to_lowercase();
+                        if !id.contains(short_name) {
+                            return None;
                         }
+                        let pricing = m.get("pricing")?;
+                        let prompt = pricing.get("prompt").and_then(|p| p.as_str())?;
+                        let completion = pricing.get("completion").and_then(|c| c.as_str())?;
+                        Some((
+                            prompt.parse::<f64>().unwrap_or(0.0) * 1_000_000.0,
+                            completion.parse::<f64>().unwrap_or(0.0) * 1_000_000.0,
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        if let Some(&(prompt, gen)) = partial.first() {
+            Json(serde_json::json!({
+                "prompt_rate": format!("{:.4}", prompt),
+                "gen_rate": format!("{:.4}", gen),
+                "model": model_id,
+                "source": "openrouter"
+            }))
+            .into_response()
+        } else {
+            Json(serde_json::json!({"error": format!("model '{}' not found on OpenRouter", model_id)})).into_response()
+        }
     }
 }
 
@@ -218,14 +276,13 @@ async fn history_prune(
     Json(body): Json<PruneBody>,
 ) -> impl IntoResponse {
     match state.history.prune(body.older_than_ms).await {
-        Ok((s, h, d)) => Json(serde_json::json!({"pruned_1s": s, "pruned_1h": h, "pruned_1d": d})).into_response(),
+        Ok((s, h, d)) => Json(serde_json::json!({"pruned_1s": s, "pruned_1h": h, "pruned_1d": d}))
+            .into_response(),
         Err(e) => Json(serde_json::json!({"error": format!("{}", e)})).into_response(),
     }
 }
 
-async fn history_db_size(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn history_db_size(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match state.history.db_size().await {
         Ok(bytes) => Json(serde_json::json!({"bytes": bytes})).into_response(),
         Err(e) => Json(serde_json::json!({"error": format!("{}", e)})).into_response(),

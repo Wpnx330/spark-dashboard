@@ -1,7 +1,6 @@
 mod cli;
 mod engines;
 mod history;
-mod logs;
 mod metrics;
 mod server;
 mod ws;

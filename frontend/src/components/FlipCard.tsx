@@ -23,12 +23,22 @@ interface FlipCardProps {
 export function FlipCard({ front, back, className = '', minHeight = 60 }: FlipCardProps) {
   const [flipped, setFlipped] = useState(false)
 
-  const handleClick = () => setFlipped((f) => !f)
+  const handleClick = (e: React.MouseEvent) => {
+    // Don't flip when the user clicks on an interactive child (button, input, link,
+    // select, textarea, or another role="button" element). This prevents nested
+    // controls like SloSettingsControl's gear button from also triggering the flip.
+    // We compare against e.currentTarget (the FlipCard wrapper itself) so the
+    // FlipCard's own role="button" doesn't cause a false-positive short-circuit.
+    const target = e.target as HTMLElement
+    const interactive = target.closest('button, [role="button"], input, select, textarea, a')
+    if (interactive && interactive !== e.currentTarget) return
+    setFlipped((f) => !f)
+  }
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' || e.key === ' ') {
       e.preventDefault()
-      handleClick()
+      setFlipped((f) => !f)
     }
   }
 

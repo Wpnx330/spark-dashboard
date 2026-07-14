@@ -405,10 +405,7 @@ export function HistoryView() {
               />
               <div className="text-[9px] text-zinc-500 mt-1 space-y-0.5">
                 <div>Server (UTC): {new Date().toISOString().slice(0,19).replace("T", " ")}</div>
-                <div>Your time (UTC{utcOffset > 0 ? "+" : ""}{utcOffset}h): {(() => {{
-                  const d = new Date(Date.now() + utcOffset * 3600000)
-                  return d.toISOString().slice(0,19).replace("T", " ")
-                }})()}</div>
+                <div>Your time (UTC{utcOffset > 0 ? "+" : ""}{utcOffset}h): {new Date(Date.now() + utcOffset * 3600000).toISOString().slice(0, 19).replace("T", " ")}</div>
               </div>
             </div>
           </div>

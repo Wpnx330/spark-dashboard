@@ -247,15 +247,16 @@ export function EngineCard({
               }
               back={
                 <div className="w-full h-full flex flex-col p-1.5">
+                  <div className="text-[10px] font-semibold text-zinc-400 tracking-tight mb-1 shrink-0">Prompt Processing / Prefill Throughput (tok/s)</div>
                   {chartData ? (
                     <div className="flex-1 min-h-0">
                       <TimeSeriesChart
                         compact
                         hideTooltipLabel
-                      series={prefillTokenSeries(chartData)}
-                      unit="tok/s"
-                      height="100%"
-                    />
+                        series={prefillTokenSeries(chartData)}
+                        unit="tok/s"
+                        height="100%"
+                      />
                     </div>
                   ) : (
                     <span className="text-zinc-500 text-xs">No data</span>
@@ -279,14 +280,16 @@ export function EngineCard({
               }
               back={
                 <div className="w-full h-full flex flex-col p-1.5">
+                  <div className="text-[10px] font-semibold text-zinc-400 tracking-tight mb-1 shrink-0">Token Generation / Decode Throughput (tok/s)</div>
                   {chartData ? (
                     <div className="flex-1 min-h-0">
                       <TimeSeriesChart
+                        compact
                         hideTooltipLabel
-                      series={decodeTokenSeries(chartData)}
-                      unit="tok/s"
-                      height="clamp(72px, 13vh, 180px)"
-                    />
+                        series={decodeTokenSeries(chartData)}
+                        unit="tok/s"
+                        height="100%"
+                      />
                     </div>
                   ) : (
                     <span className="text-zinc-500 text-xs">No data</span>
@@ -313,18 +316,24 @@ export function EngineCard({
               }
               back={
                 <div className="w-full h-full flex flex-col p-1.5">
+                  <div className="text-[10px] font-semibold text-zinc-400 tracking-tight mb-1 shrink-0">{latencyHeading} (ms)</div>
                   {chartData ? (
                     <div className="flex-1 min-h-0">
                       <TimeSeriesChart
+                        compact
                         hideTooltipLabel
-                      series={[
-                        { data: ttftSeries, label: 'TTFT', color: '#f59e0b' },
-                        { data: chartData.queueTime, label: 'Queue', color: '#8b5cf6' },
-                        { data: itlSeries, label: 'ITL', color: '#14b8a6' },
-                      ]}
-                      unit="ms"
-                      height="clamp(72px, 13vh, 180px)"
-                    />
+                        series={[
+                          // TTFT lives on the left axis (typically hundreds of ms).
+                          // Queue + ITL + TPOT share a right axis (often single/double digits)
+                          // so small variations remain visible against the TTFT scale.
+                          { data: ttftSeries, label: 'TTFT', color: '#f59e0b', axis: 'left' },
+                          { data: chartData.queueTime, label: 'Queue', color: '#8b5cf6', axis: 'right' },
+                          { data: itlSeries, label: 'ITL', color: '#14b8a6', axis: 'right' },
+                          { data: tpotSeries, label: 'TPOT', color: '#ec4899', axis: 'right' },
+                        ]}
+                        unit="ms"
+                        height="100%"
+                      />
                     </div>
                   ) : (
                     <span className="text-zinc-500 text-xs">No data</span>
@@ -359,15 +368,17 @@ export function EngineCard({
               }
               back={
                 <div className="w-full h-full flex flex-col p-1.5">
+                  <div className="text-[10px] font-semibold text-zinc-400 tracking-tight mb-1 shrink-0">E2E Latency (s)</div>
                   {chartData ? (
                     <div className="flex-1 min-h-0">
                       <TimeSeriesChart
+                        compact
                         hideTooltipLabel
-                      seriesLabel="E2E Latency"
-                      data={e2eSeries.map(p => ({ ...p, value: p.value / 1000 }))}
-                      unit="s"
-                      height="clamp(72px, 13vh, 180px)"
-                    />
+                        seriesLabel="E2E Latency"
+                        data={e2eSeries.map(p => ({ ...p, value: p.value / 1000 }))}
+                        unit="s"
+                        height="100%"
+                      />
                     </div>
                   ) : (
                     <span className="text-zinc-500 text-xs">No data</span>
@@ -397,18 +408,20 @@ export function EngineCard({
               }
               back={
                 <div className="w-full h-full flex flex-col p-1.5">
+                  <div className="text-[10px] font-semibold text-zinc-400 tracking-tight mb-1 shrink-0">Requests</div>
                   {chartData ? (
                     <div className="flex-1 min-h-0">
                       <TimeSeriesChart
+                        compact
                         hideTooltipLabel
-                      series={[
-                        { data: chartData.activeRequests, label: 'Active', color: '#76B900' },
-                        { data: chartData.queuedRequests, label: 'Queued', color: '#f59e0b' },
-                        { data: chartData.totalRequests, label: 'Total', color: '#3b82f6' },
-                      ]}
-                      unit=""
-                      height="clamp(72px, 13vh, 180px)"
-                    />
+                        series={[
+                          { data: chartData.activeRequests, label: 'Active', color: '#76B900' },
+                          { data: chartData.queuedRequests, label: 'Queued', color: '#f59e0b' },
+                          { data: chartData.totalRequests, label: 'Total', color: '#3b82f6' },
+                        ]}
+                        unit=""
+                        height="100%"
+                      />
                     </div>
                   ) : (
                     <span className="text-zinc-500 text-xs">No data</span>
@@ -422,7 +435,7 @@ export function EngineCard({
               className="bg-white/[0.02] rounded-md min-w-0"
               front={
                 <div className="px-3 py-2.5 2xl:px-4 2xl:py-3">
-                  <div className="text-[11px] 2xl:text-xs min-[1920px]:text-sm font-semibold text-zinc-300 tracking-tight mb-1.5 truncate">Cache &amp; Speculative Decoding</div>
+                  <div className="text-[11px] 2xl:text-xs min-[1920px]:text-sm font-semibold text-zinc-300 tracking-tight mb-1.5 truncate">Cache & Speculative Decoding</div>
                   <div className="grid grid-cols-2 gap-1.5">
                     <div className="flex flex-col gap-0.5 min-w-0">
                       <span className="text-[10px] font-medium text-zinc-400 uppercase tracking-wider truncate">KV Cache</span>
@@ -460,18 +473,20 @@ export function EngineCard({
               }
               back={
                 <div className="w-full h-full flex flex-col p-1.5">
+                  <div className="text-[10px] font-semibold text-zinc-400 tracking-tight mb-1 shrink-0">Cache (%)</div>
                   {chartData ? (
                     <div className="flex-1 min-h-0">
                       <TimeSeriesChart
+                        compact
                         hideTooltipLabel
-                      series={[
-                        { data: chartData.kv, label: 'KV Cache', color: '#76B900' },
-                        { data: chartData.prefixCacheHit, label: 'Prefix Hit', color: '#3b82f6' },
-                      ]}
-                      yDomain={[0, 100]}
-                      unit="%"
-                      height="clamp(72px, 13vh, 180px)"
-                    />
+                        series={[
+                          { data: chartData.kv, label: 'KV Cache', color: '#76B900' },
+                          { data: chartData.prefixCacheHit, label: 'Prefix Hit', color: '#3b82f6' },
+                        ]}
+                        yDomain={[0, 100]}
+                        unit="%"
+                        height="100%"
+                      />
                     </div>
                   ) : (
                     <span className="text-zinc-500 text-xs">No data</span>

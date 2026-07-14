@@ -22,3 +22,7 @@ Thumbs.db
 # Claude Code workspace
 .claude/
 .gstack/
+.clinerules/
+
+# Cline Memory Bank
+/memory-bank/

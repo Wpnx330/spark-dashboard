@@ -3,7 +3,6 @@ import { useMetrics } from './hooks/useMetrics'
 import { useMetricsHistory } from './hooks/useMetricsHistory'
 import { ConnectionBadge } from './components/ConnectionBadge'
 import { Dashboard } from './components/views/Dashboard'
-import { LogViewer } from './components/LogViewer'
 import { HistoryView } from './components/HistoryView'
 import type { GpuEvent, InferenceRequest } from './types/events'
 
@@ -130,7 +129,6 @@ function App() {
                     filterView={filter}
                     fillHeight={!isNarrow || filter !== undefined}
                   />
-                  <LogViewer />
                 </>
               )
             })()}

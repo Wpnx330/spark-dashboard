@@ -43,8 +43,12 @@ services:
     # Read-only Docker socket so the dashboard can list vLLM containers. The
     # added group must match the host's docker GID — set DOCKER_GID in .env
     # (find it with: getent group docker | cut -d: -f3). Defaults to 999.
+    #
+    # Persistent volume for the history database — without this mount the DB
+    # lives only inside the container and is lost on recreation.
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      - spark-dashboard-data:/var/lib/spark-dashboard
     group_add:
       - "${DOCKER_GID:-999}"
 
@@ -57,3 +61,6 @@ services:
       - RUST_LOG=${RUST_LOG:-info}
 
     restart: unless-stopped
+
+volumes:
+  spark-dashboard-data:
