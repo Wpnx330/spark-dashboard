@@ -1,5 +1,6 @@
 mod cli;
 mod engines;
+mod history;
 mod metrics;
 mod server;
 mod ws;
@@ -7,6 +8,7 @@ mod ws;
 use clap::{Args, Parser, Subcommand};
 use cli::service::ServiceCommand;
 use engines::{ApiKeyResolver, EngineOverride, EngineType};
+use server::AppState;
 use std::process::ExitCode;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
@@ -166,23 +168,70 @@ async fn run_server_inner(args: RunArgs) -> Result<(), Box<dyn std::error::Error
     // Shared engine state: engine collector writes, metrics collector reads
     let engine_state: Arc<RwLock<Vec<engines::EngineSnapshot>>> = Arc::new(RwLock::new(Vec::new()));
 
-    // Spawn engine collector loop as separate tokio task (Research Pitfall 7:
-    // separate task so slow engine API calls don't block hardware metrics)
+    // Initialize history database
+    // Use /tmp/ by default (always writable by the spark-dashboard system user).
+    // Try /var/lib/ only if the directory already exists and is writable.
+    let history_db = {
+        let var_path = "/var/lib/spark-dashboard/history.db";
+        let var_dir = std::path::Path::new("/var/lib/spark-dashboard");
+        let use_var = var_dir.exists()
+            && var_dir.is_dir()
+            && !var_dir.metadata().map(|m| m.permissions().readonly()).unwrap_or(true);
+        let path = if use_var {
+            var_path
+        } else {
+            "/tmp/spark-dashboard-history.db"
+        };
+        match history::HistoryDb::open(path) {
+            Ok(db) => {
+                tracing::info!("History database at {}", path);
+                db
+            }
+            Err(e) => {
+                tracing::warn!("History database at {} failed ({}), using :memory:", path, e);
+                history::HistoryDb::open(":memory:")?
+            }
+        }
+    };
+
+    // Spawn engine collector loop
     tokio::spawn(engines::engine_collector_loop(
         engine_state.clone(),
         overrides,
         api_keys,
     ));
 
-    // Pass engine_state to metrics collector so it includes engines in snapshots
+    // Pass engine_state and history_db to metrics collector
+    let history_for_metrics = history_db.clone();
     tokio::spawn(metrics::metrics_collector(
         tx.clone(),
         args.poll_interval,
         args.gpu_index,
         engine_state.clone(),
+        history_for_metrics,
     ));
 
-    let app = server::create_router(tx);
+    // Background task: roll up 1s→1h and 1h→1d every 30 minutes
+    let history_for_rollup = history_db.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1800));
+        loop {
+            interval.tick().await;
+            if let Err(e) = history_for_rollup.rollup_1s_to_1h().await {
+                tracing::warn!("History 1s→1h rollup failed: {}", e);
+            }
+            if let Err(e) = history_for_rollup.rollup_1h_to_1d().await {
+                tracing::warn!("History 1h→1d rollup failed: {}", e);
+            }
+        }
+    });
+
+    let app_state = Arc::new(AppState {
+        tx,
+        history: history_db,
+    });
+
+    let app = server::create_router(app_state);
 
     let addr = format!("{}:{}", args.bind, args.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;

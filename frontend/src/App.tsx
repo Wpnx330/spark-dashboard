@@ -1,16 +1,29 @@
-import { useMemo } from 'react'
+import { useState, useMemo, useEffect } from 'react'
 import { useMetrics } from './hooks/useMetrics'
 import { useMetricsHistory } from './hooks/useMetricsHistory'
 import { ConnectionBadge } from './components/ConnectionBadge'
 import { Dashboard } from './components/views/Dashboard'
+import { HistoryView } from './components/HistoryView'
 import type { GpuEvent, InferenceRequest } from './types/events'
+
+type MobileView = 'both' | 'model' | 'hardware' | 'historical'
 
 function App() {
   const { metrics, connectionStatus, isStale } = useMetrics()
+  const [mobileView, setMobileView] = useState<MobileView>('both')
 
   const history = useMetricsHistory(metrics)
 
   const { getEvents, getRequests } = history
+
+  // Track narrow screen for layout adjustments. Both view on mobile
+  // shouldn't force flex-1 so the console doesn't overlap content.
+  const [isNarrow, setIsNarrow] = useState(() => window.innerWidth < 768)
+  useEffect(() => {
+    const onResize = () => setIsNarrow(window.innerWidth < 768)
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
 
   const events = useMemo((): GpuEvent[] =>
     getEvents().map((e) => ({
@@ -31,18 +44,65 @@ function App() {
     [getRequests],
   )
 
+  const isHistorical = mobileView === 'historical'
+
   return (
     <div className="h-dvh flex flex-col bg-[#08080a] overflow-hidden">
-      <header className="shrink-0 border-b border-white/[0.04] px-4 py-1.5 flex justify-between items-center">
-        <h1 className="text-xl font-semibold text-zinc-100 tracking-tight" style={{ fontFamily: 'Inter, sans-serif' }}>
+      <header className="shrink-0 border-b border-white/[0.04] px-4 py-1.5 flex justify-between items-center gap-3">
+        <h1 className="text-xl font-semibold text-zinc-100 tracking-tight shrink-0" style={{ fontFamily: 'Inter, sans-serif' }}>
           <span className="text-[#76B900]">Spark</span>{' '}
           <span className="text-zinc-500 font-normal">Dashboard</span>
         </h1>
+
+        {/* View toggle */}
+        <div className="flex bg-[#1a1a1f] rounded-lg p-0.5 border border-white/[0.05]">
+          <button
+            onClick={() => setMobileView('both')}
+            className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors ${
+              mobileView === 'both'
+                ? 'bg-[#76B900] text-black shadow-sm'
+                : 'text-zinc-400 hover:text-zinc-200'
+            }`}
+          >
+            Both
+          </button>
+          <button
+            onClick={() => setMobileView('model')}
+            className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors ${
+              mobileView === 'model'
+                ? 'bg-[#76B900] text-black shadow-sm'
+                : 'text-zinc-400 hover:text-zinc-200'
+            }`}
+          >
+            Model
+          </button>
+          <button
+            onClick={() => setMobileView('hardware')}
+            className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors ${
+              mobileView === 'hardware'
+                ? 'bg-[#76B900] text-black shadow-sm'
+                : 'text-zinc-400 hover:text-zinc-200'
+            }`}
+          >
+            Hardware
+          </button>
+          <button
+            onClick={() => setMobileView('historical')}
+            className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors ${
+              mobileView === 'historical'
+                ? 'bg-[#76B900] text-black shadow-sm'
+                : 'text-zinc-400 hover:text-zinc-200'
+            }`}
+          >
+            Historical
+          </button>
+        </div>
+
         <ConnectionBadge status={connectionStatus} isStale={isStale} />
       </header>
 
-      <main className={`flex-1 min-h-0 flex flex-col p-3 lg:p-4 2xl:p-5 min-[1920px]:p-6 ${isStale ? 'opacity-50' : ''}`}>
-        {!metrics && connectionStatus !== 'connected' && (
+      <main className={`flex-1 min-h-0 flex flex-col overflow-y-auto p-3 lg:p-4 2xl:p-5 min-[1920px]:p-6 ${isStale ? 'opacity-50' : ''}`}>
+        {!metrics && connectionStatus !== 'connected' && !isHistorical && (
           <div className="flex-1 flex items-center justify-center">
             <div className="text-center">
               <h2 className="text-xl font-bold text-zinc-50 mb-2">Waiting for metrics</h2>
@@ -53,12 +113,27 @@ function App() {
           </div>
         )}
 
-        <Dashboard
-          metrics={metrics}
-          history={history}
-          events={events}
-          requests={requests}
-        />
+        {isHistorical ? (
+          <HistoryView />
+        ) : (
+          <>
+            {(() => {
+              const filter = mobileView === 'hardware' ? 'hardware' : mobileView === 'model' ? 'model' : undefined
+              return (
+                <>
+                  <Dashboard
+                    metrics={metrics}
+                    history={history}
+                    events={events}
+                    requests={requests}
+                    filterView={filter}
+                    fillHeight={!isNarrow || filter !== undefined}
+                  />
+                </>
+              )
+            })()}
+          </>
+        )}
       </main>
     </div>
   )
