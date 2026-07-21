@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
 import { Dashboard } from '../components/views/Dashboard'
-import type { GpuMetrics, MetricsSnapshot } from '../types/metrics'
+import type { EngineSnapshot, GpuMetrics, MetricsSnapshot } from '../types/metrics'
 import type { GpuEvent } from '../types/events'
 
 // Stub out recharts so event overlays are assertable: the real chart renders
@@ -48,7 +48,7 @@ const gpu1 = makeGpu(1, {
   clock_graphics_mhz: 2100,
 })
 
-function makeSnapshot(gpus: GpuMetrics[] | undefined): MetricsSnapshot {
+function makeSnapshot(gpus: GpuMetrics[] | undefined, engines: EngineSnapshot[] = []): MetricsSnapshot {
   return {
     timestamp_ms: 1000,
     gpu: gpus?.[0] ?? gpu0,
@@ -67,11 +67,31 @@ function makeSnapshot(gpus: GpuMetrics[] | undefined): MetricsSnapshot {
     },
     disk: { name: 'disk', read_bytes_per_sec: 1, write_bytes_per_sec: 2 },
     network: { name: 'net', rx_bytes_per_sec: 3, tx_bytes_per_sec: 4 },
-    engines: [],
+    engines,
     gpu_events: [],
   }
 }
 
+function makeEngine(gpuIndexes?: number[]): EngineSnapshot {
+  return {
+    engine_type: 'Vllm',
+    endpoint: 'http://localhost:8000',
+    status: { type: 'Running' },
+    model: {
+      name: 'test-model',
+      parameter_size: null,
+      precision: null,
+      quantization: null,
+      tensor_type: null,
+      model_type: null,
+      pipeline_tag: null,
+    },
+    metrics: null,
+    recent_requests: [],
+    deployment_mode: 'Native',
+    gpu_indexes: gpuIndexes,
+  }
+}
 function stubHistory() {
   const calls: string[] = []
   return {
@@ -134,10 +154,10 @@ describe('Dashboard multi-GPU selection', () => {
     expect(details).not.toContain('gpu0 thermal')
   })
 
-  it('survives the metrics null → first-snapshot transition (initial WebSocket connect)', () => {
+  it('survives the metrics null â†’ first-snapshot transition (initial WebSocket connect)', () => {
     // Regression: with hooks split across the `if (!metrics) return null` early
     // return, the first snapshot changed the hook count mid-life and React threw
-    // "Rendered more hooks than during the previous render" — a white screen.
+    // "Rendered more hooks than during the previous render" â€” a white screen.
     const history = stubHistory()
     const { rerender } = render(<Dashboard metrics={null} history={history} events={[]} requests={[]} />)
 
@@ -180,6 +200,46 @@ describe('Dashboard multi-GPU selection', () => {
   })
 })
 
+describe('Dashboard engine GPU binding', () => {
+  it('automatically follows the selected engine GPU', () => {
+    const history = stubHistory()
+    const engine0 = makeEngine([0])
+    const engine1 = { ...makeEngine([1]), endpoint: 'http://localhost:8001', model: { ...makeEngine([1]).model!, name: 'second-model' } }
+    render(
+      <Dashboard
+        metrics={makeSnapshot([gpu0, gpu1], [engine0, engine1])}
+        history={history}
+        events={[]}
+        requests={[]}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('tab', { name: /second-model/ }))
+
+    expect(screen.getByRole('button', { name: /GPU 1/ }).getAttribute('aria-pressed')).toBe('true')
+    expect(screen.getByText('77')).toBeTruthy()
+  })
+
+  it('keeps the manual GPU when the selected engine spans it', () => {
+    const history = stubHistory()
+    const engine0 = makeEngine([0])
+    const engineBoth = { ...makeEngine([0, 1]), endpoint: 'http://localhost:8001', model: { ...makeEngine([0, 1]).model!, name: 'parallel-model' } }
+    render(
+      <Dashboard
+        metrics={makeSnapshot([gpu0, gpu1], [engine0, engineBoth])}
+        history={history}
+        events={[]}
+        requests={[]}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: /GPU 1/ }))
+    fireEvent.click(screen.getByRole('tab', { name: /parallel-model/ }))
+
+    expect(screen.getByRole('button', { name: /GPU 1/ }).getAttribute('aria-pressed')).toBe('true')
+  })
+})
+
 describe('Dashboard single-GPU regression', () => {
   it.each<[string, MetricsSnapshot]>([
     ['single-entry gpus array', makeSnapshot([gpu0])],
@@ -195,9 +255,9 @@ describe('Dashboard single-GPU regression', () => {
     expect(screen.queryByText('GPU 0')).toBeNull()
     expect(container.querySelector('[aria-pressed]')).toBeNull()
 
-    // Card subtitles carry the plain GPU name, not the multi-GPU "GPU n · name" form
+    // Card subtitles carry the plain GPU name, not the multi-GPU "GPU n Â· name" form
     expect(screen.getAllByText('NVIDIA Alpha 0').length).toBeGreaterThan(0)
-    expect(screen.queryByText(/GPU 0 · /)).toBeNull()
+    expect(screen.queryByText(/GPU 0 Â· /)).toBeNull()
 
     // Charts read the legacy un-prefixed history keys
     for (const key of ['gpuUtil', 'gpuTemp', 'gpuPower', 'gpuClockGraphics']) {

@@ -124,6 +124,8 @@ interface EngineSectionProps {
   /** Number of GPUs in the host snapshot. The per-engine GPU badge renders
    *  only when there are 2+ — on single-GPU hosts the placement is trivial. */
   gpuCount?: number
+  /** Notify the hardware dashboard when the selected engine has known GPU placement. */
+  onActiveEngineGpuChange?: (gpuIndexes?: number[]) => void
 }
 
 export function EngineSection({
@@ -132,6 +134,7 @@ export function EngineSection({
   getChartData,
   requests,
   gpuCount = 0,
+  onActiveEngineGpuChange,
 }: EngineSectionProps) {
   const [activeTab, setActiveTab] = useState<string>(() => {
     if (typeof window === 'undefined') return GLOBAL_TAB_VALUE
@@ -233,6 +236,19 @@ export function EngineSection({
 
   const showGlobalControls = aggregate.running_count > 1
 
+  const isGlobal = activeTab === GLOBAL_TAB_VALUE
+  const activeEngine = engines.find(
+    (e) => `${e.engine_type}-${e.endpoint}` === activeTab,
+  )
+  const activeEngineGpuIndexesKey = activeEngine?.gpu_indexes?.join(',') ?? ''
+
+  useEffect(() => {
+    if (isGlobal || !onActiveEngineGpuChange) return
+    const gpuIndexes = activeEngineGpuIndexesKey
+      ? activeEngineGpuIndexesKey.split(',').map(Number)
+      : undefined
+    onActiveEngineGpuChange(gpuIndexes)
+  }, [activeEngineGpuIndexesKey, isGlobal, onActiveEngineGpuChange])
   useEffect(() => {
     if (showGlobalControls || engines.length === 0) return
     const onlyEngineKey = `${engines[0].engine_type}-${engines[0].endpoint}`
@@ -290,11 +306,6 @@ export function EngineSection({
     )
   }
 
-  const activeEngine = engines.find(
-    (e) => `${e.engine_type}-${e.endpoint}` === activeTab,
-  )
-
-  const isGlobal = activeTab === GLOBAL_TAB_VALUE
   const headerTitle = isGlobal
     ? 'All Engines'
     : activeEngine?.model?.name ?? 'No Model Loaded'

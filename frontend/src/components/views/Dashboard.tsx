@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useCallback, useState } from 'react'
 import { ArcGauge, type GaugeSegment } from '@/components/gauges/ArcGauge'
 import { HBar } from '@/components/gauges/HBar'
 import { CoreHeatmap } from '@/components/charts/CoreHeatmap'
@@ -65,6 +65,10 @@ export function Dashboard({
   // Which GPU the hardware chart panels show on multi-GPU hosts. Held above
   // the early return so incoming snapshots cannot reset it.
   const [selectedGpuIndex, setSelectedGpuIndex] = useState(0)
+  const handleActiveEngineGpuChange = useCallback((gpuIndexes?: number[]) => {
+    if (!gpuIndexes || gpuIndexes.length === 0) return
+    setSelectedGpuIndex((current) => gpuIndexes.includes(current) ? current : gpuIndexes[0])
+  }, [])
 
   // Measure the hardware grid to adapt to available *vertical* space. The grid
   // uses auto-rows-fr, so per-card height depends only on the container height
@@ -171,6 +175,7 @@ export function Dashboard({
           getChartData={history.getChartData}
           requests={requests}
           gpuCount={gpus.length}
+          onActiveEngineGpuChange={handleActiveEngineGpuChange}
         />
       </div>
 
