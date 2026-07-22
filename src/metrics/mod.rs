@@ -206,29 +206,39 @@ pub async fn metrics_collector(
                     (Some(&prev), Some(cur)) if cur >= prev => Some(cur - prev),
                     _ => None,
                 };
-                if let Some(v) = cur_prompt { prev_prompt.insert(eng.endpoint.clone(), v); }
-                if let Some(v) = cur_gen { prev_gen.insert(eng.endpoint.clone(), v); }
-                if let Some(v) = cur_reqs { prev_reqs.insert(eng.endpoint.clone(), v); }
-                history_db.insert_1s(
-                    &eng.endpoint, ts,
-                    delta_prompt,
-                    delta_gen,
-                    delta_reqs,
-                    m.prompt_tokens_per_sec,
-                    m.tokens_per_sec,
-                    m.ttft_ms,
-                    m.inter_token_latency_ms,
-                    m.e2e_latency_ms,
-                    snapshot.gpu.power_watts,
-                    snapshot.gpu.utilization_percent.map(|v| v as f64),
-                    snapshot.gpu.temperature_celsius.map(|v| v as f64),
-                    m.active_requests.map(|v| v as i64),
-                    m.queued_requests.map(|v| v as i64),
-                    m.kv_cache_percent,
-                    m.prefix_cache_hit_rate,
-                    Some(snapshot.cpu.aggregate_percent as f64),
-                    None, // mem_used_pct - not directly available
-                ).await.ok();
+                if let Some(v) = cur_prompt {
+                    prev_prompt.insert(eng.endpoint.clone(), v);
+                }
+                if let Some(v) = cur_gen {
+                    prev_gen.insert(eng.endpoint.clone(), v);
+                }
+                if let Some(v) = cur_reqs {
+                    prev_reqs.insert(eng.endpoint.clone(), v);
+                }
+                history_db
+                    .insert_1s(
+                        &eng.endpoint,
+                        ts,
+                        delta_prompt,
+                        delta_gen,
+                        delta_reqs,
+                        m.prompt_tokens_per_sec,
+                        m.tokens_per_sec,
+                        m.ttft_ms,
+                        m.inter_token_latency_ms,
+                        m.e2e_latency_ms,
+                        snapshot.gpu.power_watts,
+                        snapshot.gpu.utilization_percent.map(|v| v as f64),
+                        snapshot.gpu.temperature_celsius.map(|v| v as f64),
+                        m.active_requests.map(|v| v as i64),
+                        m.queued_requests.map(|v| v as i64),
+                        m.kv_cache_percent,
+                        m.prefix_cache_hit_rate,
+                        Some(snapshot.cpu.aggregate_percent as f64),
+                        None, // mem_used_pct - not directly available
+                    )
+                    .await
+                    .ok();
             }
         }
     }

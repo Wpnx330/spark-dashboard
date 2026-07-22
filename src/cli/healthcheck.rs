@@ -50,7 +50,8 @@ mod tests {
         let (tx, _rx) = broadcast::channel::<String>(16);
         let history = crate::history::HistoryDb::open(":memory:").unwrap();
         let state = Arc::new(AppState { tx, history });
-        let app = crate::server::create_router(state);
+        // History routes aren't needed for a /healthz probe; leave them off.
+        let app = crate::server::create_router(state, false);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();

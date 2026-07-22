@@ -9,6 +9,7 @@ use clap::{Args, Parser, Subcommand};
 use cli::service::ServiceCommand;
 use engines::{ApiKeyResolver, EngineOverride, EngineType};
 use server::AppState;
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
@@ -103,6 +104,23 @@ struct RunArgs {
     /// --engine-api-key (also covers auto-detected engines).
     #[arg(long, env = "SPARK_DASHBOARD_PROVIDER_API_KEY")]
     provider_api_key: Option<String>,
+
+    /// Enable the historical metrics API (`/api/history/*`) and recording.
+    /// Off by default: the history endpoints include destructive (`prune`) and
+    /// write (`settings`, `toggle`) operations that must not be exposed
+    /// unauthenticated on `0.0.0.0`. Enable only on trusted networks.
+    #[arg(long, env = "SPARK_DASHBOARD_ENABLE_HISTORY", default_value_t = false)]
+    enable_history: bool,
+
+    /// Path to the SQLite history database. The directory must exist and be
+    /// writable by the running user. The process fails loudly if the file
+    /// cannot be opened — there is no silent fallback.
+    #[arg(
+        long,
+        env = "SPARK_DASHBOARD_HISTORY_DB",
+        default_value = "/data/history.db"
+    )]
+    history_db_path: String,
 }
 
 fn main() -> ExitCode {
@@ -175,40 +193,40 @@ async fn run_server_inner(args: RunArgs) -> Result<(), Box<dyn std::error::Error
     // Shared engine state: engine collector writes, metrics collector reads
     let engine_state: Arc<RwLock<Vec<engines::EngineSnapshot>>> = Arc::new(RwLock::new(Vec::new()));
 
-    // Initialize history database
-    // Use /tmp/ by default (always writable by the spark-dashboard system user).
-    // Try /var/lib/ only if the directory already exists and is writable.
-    let history_db = {
-        let var_path = "/var/lib/spark-dashboard/history.db";
-        let var_dir = std::path::Path::new("/var/lib/spark-dashboard");
-        let use_var = var_dir.exists()
-            && var_dir.is_dir()
-            && !var_dir.metadata().map(|m| m.permissions().readonly()).unwrap_or(true);
-        let path = if use_var {
-            var_path
-        } else {
-            "/tmp/spark-dashboard-history.db"
-        };
-        match history::HistoryDb::open(path) {
-            Ok(db) => {
-                tracing::info!("History database at {}", path);
-                db
-            }
-            Err(e) => {
-                tracing::warn!("History database at {} failed ({}), using :memory:", path, e);
-                history::HistoryDb::open(":memory:")?
-            }
-        }
-    };
+    // Initialize history database.
+    //
+    // We always open a database (even when history is disabled) so the
+    // metrics collector has somewhere to no-op into and so the `--enable-history`
+    // toggle can flip recording on at runtime without a restart. Recording is
+    // gated by `HistoryDb::is_enabled()`, which defaults to false.
+    //
+    // Persistence: the path comes from `--history-db-path` /
+    // `SPARK_DASHBOARD_HISTORY_DB` (default `/data/history.db`). We fail loudly
+    // if the file cannot be opened — no silent fallback to `/tmp` (ephemeral
+    // under containers) or `:memory:` (lost on restart). The parent directory
+    // must exist and be writable by the running user; in the distroless
+    // `nonroot` image (uid 65532) this means mounting a volume at `/data`
+    // (see deploy/docker/docker-compose.yml).
+    let history_db = open_history_db(Path::new(&args.history_db_path))?;
 
-    // Spawn engine collector loop
+    if args.enable_history {
+        tracing::warn!(
+            "History API enabled: /api/history/* routes are registered. \
+             These endpoints include destructive/write operations — only enable \
+             on trusted networks."
+        );
+    }
+
+    // Spawn engine collector loop as separate tokio task (Research Pitfall 7:
+    // separate task so slow engine API calls don't block hardware metrics)
     tokio::spawn(engines::engine_collector_loop(
         engine_state.clone(),
         overrides,
         api_keys,
     ));
 
-    // Pass engine_state and history_db to metrics collector
+    // Pass engine_state and history_db to metrics collector so it includes
+    // engines in snapshots and records per-engine history.
     let history_for_metrics = history_db.clone();
     tokio::spawn(metrics::metrics_collector(
         tx.clone(),
@@ -239,7 +257,7 @@ async fn run_server_inner(args: RunArgs) -> Result<(), Box<dyn std::error::Error
         history: history_db,
     });
 
-    let app = server::create_router(app_state);
+    let app = server::create_router(app_state, args.enable_history);
 
     let addr = format!("{}:{}", args.bind, args.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -248,4 +266,40 @@ async fn run_server_inner(args: RunArgs) -> Result<(), Box<dyn std::error::Error
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+/// Open the history database, failing loudly on I/O errors.
+///
+/// There is deliberately no silent fallback to `/tmp` or `:memory:`: a silent
+/// fallback would hide a misconfigured volume mount and lose data on restart.
+/// If you need an ephemeral DB (e.g. for tests), pass `:memory:` explicitly
+/// via `--history-db-path`.
+fn open_history_db(path: &Path) -> Result<history::HistoryDb, Box<dyn std::error::Error>> {
+    // For `:memory:` SQLite ignores the path, so skip the parent-dir check.
+    if path != Path::new(":memory:") {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                return Err(format!(
+                    "history database directory {} does not exist — create it and ensure it is \
+                     writable by the running user (mount a volume at /data in containers; \
+                     see deploy/docker/docker.md)",
+                    parent.display()
+                )
+                .into());
+            }
+        }
+    }
+    match history::HistoryDb::open(&path.to_string_lossy()) {
+        Ok(db) => {
+            tracing::info!("History database at {}", path.display());
+            Ok(db)
+        }
+        Err(e) => Err(format!(
+            "failed to open history database at {}: {} — ensure the directory exists and is \
+             writable (mount a volume at /data in containers)",
+            path.display(),
+            e
+        )
+        .into()),
+    }
 }

@@ -16,13 +16,17 @@ interface HistorySummary {
 
 interface HistorySettings {
   enabled: boolean
-  cloud_prompt_rate: string
-  cloud_gen_rate: string
-  electricity_rate: string
   utc_offset: string
 }
 
-type WindowPreset = 'today' | 'this_week' | 'this_month' | 'last_month' | 'this_year' | 'all_time' | 'custom'
+type WindowPreset =
+  | 'today'
+  | 'this_week'
+  | 'this_month'
+  | 'last_month'
+  | 'this_year'
+  | 'all_time'
+  | 'custom'
 
 interface DateRange {
   since_ms: number
@@ -48,7 +52,13 @@ function presetRange(preset: WindowPreset, utcOffsetHours: number): DateRange {
 
   const fmtFull = (ms: number) => {
     const d = new Date(ms)
-    return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' })
+    return d.toLocaleDateString('en-US', {
+      weekday: 'short',
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+      timeZone: 'UTC',
+    })
   }
 
   switch (preset) {
@@ -136,8 +146,8 @@ export function HistoryView() {
   // Load settings on mount, add utcOffset
   useEffect(() => {
     fetch('/api/history/settings')
-      .then(r => r.json())
-      .then(data => {
+      .then((r) => r.json())
+      .then((data) => {
         setSettings(data)
         setUtcOffset(parseInt(data.utc_offset) || 0)
       })
@@ -146,59 +156,35 @@ export function HistoryView() {
 
   const [utcOffset, setUtcOffset] = useState(0)
 
-  // Derive the engine key and model name from live metrics
+  // Derive the engine key from live metrics (first engine's endpoint).
   const { metrics: liveMetrics } = useMetrics()
   const engineKey = liveMetrics?.engines?.[0]?.endpoint ?? 'vllm'
-  const modelName = liveMetrics?.engines?.[0]?.model?.name ?? ''
-
-  // Look up pricing from OpenRouter
-  const [pricingStatus, setPricingStatus] = useState<'idle' | 'loading' | 'done' | 'error'>('idle')
-  const lookupPricing = async () => {
-    if (!modelName) return
-    setPricingStatus('loading')
-    try {
-      const res = await fetch('/api/history/lookup-pricing', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: modelName }),
-      })
-      const data = await res.json()
-      if (data.prompt_rate && data.gen_rate) {
-        setSettings(s => ({ ...s!, cloud_prompt_rate: data.prompt_rate, cloud_gen_rate: data.gen_rate }))
-        await fetch('/api/history/settings', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ cloud_prompt_rate: data.prompt_rate, cloud_gen_rate: data.gen_rate }),
-        })
-        setPricingStatus('done')
-      } else {
-        setPricingStatus('error')
-      }
-    } catch {
-      setPricingStatus('error')
-    }
-  }
 
   // Fetch summary when preset or custom range changes
-  const fetchSummary = useCallback(async (s: number, u: number, eng?: string) => {
-    const key = eng ?? engineKey
-    setLoading(true)
-    setError(null)
-    try {
-      const res = await fetch(`/api/history/summary?engine=${encodeURIComponent(key)}&since_ms=${s}&until_ms=${u}`)
-      const data = await res.json()
-      if (data.error) {
-        setError(data.error)
-        setSummary(null)
-      } else {
-        setSummary(data as HistorySummary)
+  const fetchSummary = useCallback(
+    async (s: number, u: number, eng?: string) => {
+      const key = eng ?? engineKey
+      setLoading(true)
+      setError(null)
+      try {
+        const res = await fetch(
+          `/api/history/summary?engine=${encodeURIComponent(key)}&since_ms=${s}&until_ms=${u}`,
+        )
+        const data = await res.json()
+        if (data.error) {
+          setError(data.error)
+          setSummary(null)
+        } else {
+          setSummary(data as HistorySummary)
+        }
+      } catch {
+        setError('Failed to fetch history')
+      } finally {
+        setLoading(false)
       }
-    } catch {
-      setError('Failed to fetch history')
-    } finally {
-      setLoading(false)
-    }
-  }, [engineKey])
+    },
+    [engineKey],
+  )
 
   // Auto-refresh the summary every 10 seconds while this view is active
   useEffect(() => {
@@ -225,15 +211,6 @@ export function HistoryView() {
     }
   }
 
-  // Compute cost savings
-  const cloudPromptRate = parseFloat(settings?.cloud_prompt_rate || '0') || 0
-  const cloudGenRate = parseFloat(settings?.cloud_gen_rate || '0') || 0
-  const electRate = parseFloat(settings?.electricity_rate || '0') || 0
-  const cloudCost = (summary ? (summary.delta_prompt_tokens / 1_000_000) * cloudPromptRate : 0)
-    + (summary ? (summary.delta_gen_tokens / 1_000_000) * cloudGenRate : 0)
-  const powerCost = summary ? summary.power_kwh * electRate : 0
-  const netSavings = cloudCost - powerCost
-
   const hours = summary?.total_seconds ? (summary.total_seconds / 3600).toFixed(1) : '—'
 
   return (
@@ -242,12 +219,23 @@ export function HistoryView() {
       <div className="flex items-center gap-2 flex-wrap">
         <h2 className="text-sm font-semibold text-zinc-200 mr-2">Historical</h2>
         <div className="flex bg-[#1a1a1f] rounded-lg p-0.5 border border-white/[0.05] flex-wrap">
-          {(['today', 'this_week', 'this_month', 'last_month', 'this_year', 'all_time'] as WindowPreset[]).map((p) => (
+          {(
+            [
+              'today',
+              'this_week',
+              'this_month',
+              'last_month',
+              'this_year',
+              'all_time',
+            ] as WindowPreset[]
+          ).map((p) => (
             <button
               key={p}
               onClick={() => setPreset(p)}
               className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors ${
-                preset === p ? 'bg-[#76B900] text-black shadow-sm' : 'text-zinc-400 hover:text-zinc-200'
+                preset === p
+                  ? 'bg-[#76B900] text-black shadow-sm'
+                  : 'text-zinc-400 hover:text-zinc-200'
               }`}
             >
               {presetRange(p, utcOffset).label}
@@ -256,7 +244,9 @@ export function HistoryView() {
           <button
             onClick={() => setPreset('custom')}
             className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors ${
-              preset === 'custom' ? 'bg-[#76B900] text-black shadow-sm' : 'text-zinc-400 hover:text-zinc-200'
+              preset === 'custom'
+                ? 'bg-[#76B900] text-black shadow-sm'
+                : 'text-zinc-400 hover:text-zinc-200'
             }`}
           >
             Custom
@@ -302,7 +292,7 @@ export function HistoryView() {
         </div>
       )}
 
-      {/* Settings modal */}
+      {/* Settings panel */}
       {showSettings && (
         <div className="bg-[#111115] rounded-lg border border-white/[0.06] p-4 space-y-3">
           <div className="flex items-center justify-between">
@@ -321,78 +311,25 @@ export function HistoryView() {
                   setSettings({ ...settings!, enabled: next })
                 }}
               >
-                <div className={`w-3.5 h-3.5 rounded-full bg-white mt-0.5 transition-transform ${settings?.enabled ? 'translate-x-4' : 'translate-x-0.5'}`} />
+                <div
+                  className={`w-3.5 h-3.5 rounded-full bg-white mt-0.5 transition-transform ${settings?.enabled ? 'translate-x-4' : 'translate-x-0.5'}`}
+                />
               </div>
             </label>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
-              <label className="text-[10px] text-zinc-500 uppercase tracking-wider">$/1M Prompt Tokens</label>
-              <input
-                type="number"
-                step="0.01"
-                value={settings?.cloud_prompt_rate || ''}
-                onChange={async (e) => {
-                  const v = e.target.value
-                  setSettings({ ...settings!, cloud_prompt_rate: v })
-                  await fetch('/api/history/settings', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ cloud_prompt_rate: v }),
-                  })
-                }}
-                className="w-full bg-[#0d0d11] border border-white/[0.06] rounded px-2 py-1 text-[11px] text-zinc-300 mt-1"
-                placeholder="0.00"
-              />
-            </div>
-            <div>
-              <label className="text-[10px] text-zinc-500 uppercase tracking-wider">$/1M Gen Tokens</label>
-              <input
-                type="number"
-                step="0.01"
-                value={settings?.cloud_gen_rate || ''}
-                onChange={async (e) => {
-                  const v = e.target.value
-                  setSettings({ ...settings!, cloud_gen_rate: v })
-                  await fetch('/api/history/settings', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ cloud_gen_rate: v }),
-                  })
-                }}
-                className="w-full bg-[#0d0d11] border border-white/[0.06] rounded px-2 py-1 text-[11px] text-zinc-300 mt-1"
-                placeholder="0.00"
-              />
-            </div>
-            <div>
-              <label className="text-[10px] text-zinc-500 uppercase tracking-wider">$/kWh Electricity</label>
-              <input
-                type="number"
-                step="0.001"
-                value={settings?.electricity_rate || ''}
-                onChange={async (e) => {
-                  const v = e.target.value
-                  setSettings({ ...settings!, electricity_rate: v })
-                  await fetch('/api/history/settings', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ electricity_rate: v }),
-                  })
-                }}
-                className="w-full bg-[#0d0d11] border border-white/[0.06] rounded px-2 py-1 text-[11px] text-zinc-300 mt-1"
-                placeholder="0.12"
-              />
-            </div>
-            <div>
-              <label className="text-[10px] text-zinc-500 uppercase tracking-wider">UTC Offset</label>
+              <label className="text-[10px] text-zinc-500 uppercase tracking-wider">
+                UTC Offset
+              </label>
               <input
                 type="number"
                 step="1"
                 value={settings?.utc_offset !== undefined ? settings.utc_offset : '-4'}
                 onChange={async (e) => {
                   const v = e.target.value
-                  setSettings(s => ({ ...s!, utc_offset: v }))
+                  setSettings((s) => ({ ...s!, utc_offset: v }))
                   setUtcOffset(parseInt(v) || 0)
                   await fetch('/api/history/settings', {
                     method: 'POST',
@@ -404,42 +341,24 @@ export function HistoryView() {
                 placeholder="-5"
               />
               <div className="text-[9px] text-zinc-500 mt-1 space-y-0.5">
-                <div>Server (UTC): {new Date().toISOString().slice(0,19).replace("T", " ")}</div>
-                <div>Your time (UTC{utcOffset > 0 ? "+" : ""}{utcOffset}h): {new Date(Date.now() + utcOffset * 3600000).toISOString().slice(0, 19).replace("T", " ")}</div>
+                <div>
+                  Server (UTC): {new Date().toISOString().slice(0, 19).replace('T', ' ')}
+                </div>
+                <div>
+                  Your time (UTC{utcOffset > 0 ? '+' : ''}
+                  {utcOffset}h):{' '}
+                  {new Date(Date.now() + utcOffset * 3600000)
+                    .toISOString()
+                    .slice(0, 19)
+                    .replace('T', ' ')}
+                </div>
               </div>
             </div>
           </div>
 
-          {/* Look up pricing from OpenRouter */}
-          <div className="flex items-center gap-3">
-            <button
-              onClick={lookupPricing}
-              disabled={pricingStatus === 'loading' || !modelName}
-              className={`text-[11px] font-medium px-2.5 py-1 rounded border transition-colors ${
-                pricingStatus === 'loading'
-                  ? 'bg-zinc-800 text-zinc-500 border-zinc-700 cursor-wait'
-                  : pricingStatus === 'done'
-                    ? 'bg-[#76B900]/15 text-[#76B900] border-[#76B900]/30'
-                    : 'bg-[#0d0d11] text-zinc-400 border-white/[0.06] hover:text-zinc-200 hover:border-zinc-600'
-              }`}
-            >
-              {pricingStatus === 'loading' ? '⟳ Looking up...' :
-               pricingStatus === 'done' ? '✓ Filled from OpenRouter' :
-               '⟳ Look up pricing'}
-            </button>
-            {pricingStatus === 'error' && (
-              <span className="text-[10px] text-red-400">Could not find pricing for this model</span>
-            )}
-            {pricingStatus === 'done' && (
-              <span className="text-[10px] text-zinc-500">Rates auto-filled for {modelName}</span>
-            )}
-            {pricingStatus === 'idle' && modelName && (
-              <span className="text-[10px] text-zinc-600">Auto-fill rates for {modelName}</span>
-            )}
-          </div>
-
           <p className="text-[10px] text-zinc-600 italic">
-            Historical logging is off by default. Toggle it on above to start recording metrics. Data is auto-rolled up from 1s → hourly → daily — storage is minimal.
+            Historical logging is off by default. Toggle it on above to start recording metrics.
+            Data is auto-rolled up from 1s → hourly → daily — storage is minimal.
           </p>
         </div>
       )}
@@ -450,68 +369,69 @@ export function HistoryView() {
       )}
       {error && (
         <div className="text-xs text-yellow-400 py-8 text-center">
-          {error === 'no data' ? 'No historical data yet. Enable logging in Settings and wait a moment.' : error}
+          {error === 'no data'
+            ? 'No historical data yet. Enable logging in Settings and wait a moment.'
+            : error}
         </div>
       )}
 
       {summary && (
         <>
-          {/* Cost savings */}
-          <div className="bg-[#111115] rounded-lg border border-white/[0.06] p-4">
-            <h3 className="text-xs font-semibold text-zinc-300 mb-3">Cost Savings</h3>
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-              <div>
-                <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Cloud Cost Avoided</span>
-                <div className="text-lg font-bold text-[#76B900] font-mono">${cloudCost.toFixed(4)}</div>
-              </div>
-              <div>
-                <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Electricity Cost</span>
-                <div className="text-lg font-bold text-yellow-400 font-mono">${powerCost.toFixed(4)}</div>
-              </div>
-              <div>
-                <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Net Savings</span>
-                <div className={`text-lg font-bold font-mono ${netSavings >= 0 ? 'text-[#76B900]' : 'text-red-400'}`}>
-                  ${netSavings.toFixed(4)}
-                </div>
-              </div>
-              <div>
-                <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Energy Used</span>
-                <div className="text-lg font-bold text-zinc-100 font-mono">{summary.power_kwh.toFixed(4)} kWh</div>
-              </div>
-            </div>
-          </div>
-
           {/* Token metrics */}
           <div className="bg-[#111115] rounded-lg border border-white/[0.06] p-4">
             <h3 className="text-xs font-semibold text-zinc-300 mb-3">Token Throughput</h3>
             <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4">
               <div>
-                <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Prompt Tokens</span>
-                <div className="text-base font-bold text-zinc-100 font-mono">{summary.delta_prompt_tokens.toLocaleString()}</div>
+                <span className="text-[10px] text-zinc-500 uppercase tracking-wider">
+                  Prompt Tokens
+                </span>
+                <div className="text-base font-bold text-zinc-100 font-mono">
+                  {summary.delta_prompt_tokens.toLocaleString()}
+                </div>
               </div>
               <div>
-                <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Generated Tokens</span>
-                <div className="text-base font-bold text-zinc-100 font-mono">{summary.delta_gen_tokens.toLocaleString()}</div>
+                <span className="text-[10px] text-zinc-500 uppercase tracking-wider">
+                  Generated Tokens
+                </span>
+                <div className="text-base font-bold text-zinc-100 font-mono">
+                  {summary.delta_gen_tokens.toLocaleString()}
+                </div>
               </div>
               <div>
-                <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Avg Prompt Tok/s</span>
-                <div className="text-base font-bold text-zinc-100 font-mono">{summary.avg_prompt_tps.toFixed(1)}</div>
+                <span className="text-[10px] text-zinc-500 uppercase tracking-wider">
+                  Avg Prompt Tok/s
+                </span>
+                <div className="text-base font-bold text-zinc-100 font-mono">
+                  {summary.avg_prompt_tps.toFixed(1)}
+                </div>
               </div>
               <div>
-                <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Avg Decode Tok/s</span>
-                <div className="text-base font-bold text-zinc-100 font-mono">{summary.avg_decode_tps.toFixed(1)}</div>
+                <span className="text-[10px] text-zinc-500 uppercase tracking-wider">
+                  Avg Decode Tok/s
+                </span>
+                <div className="text-base font-bold text-zinc-100 font-mono">
+                  {summary.avg_decode_tps.toFixed(1)}
+                </div>
               </div>
               <div>
-                <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Total Requests</span>
-                <div className="text-base font-bold text-zinc-100 font-mono">{summary.total_requests.toLocaleString()}</div>
+                <span className="text-[10px] text-zinc-500 uppercase tracking-wider">
+                  Total Requests
+                </span>
+                <div className="text-base font-bold text-zinc-100 font-mono">
+                  {summary.total_requests.toLocaleString()}
+                </div>
               </div>
               <div>
                 <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Uptime</span>
                 <div className="text-base font-bold text-zinc-100 font-mono">{hours}h</div>
               </div>
               <div>
-                <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Data Source</span>
-                <div className="text-base font-bold text-zinc-100 font-mono">{summary.source_table}</div>
+                <span className="text-[10px] text-zinc-500 uppercase tracking-wider">
+                  Data Source
+                </span>
+                <div className="text-base font-bold text-zinc-100 font-mono">
+                  {summary.source_table}
+                </div>
               </div>
             </div>
           </div>
@@ -521,12 +441,28 @@ export function HistoryView() {
             <h3 className="text-xs font-semibold text-zinc-300 mb-3">Peak Load</h3>
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
               <div>
-                <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Peak Active Requests</span>
-                <div className="text-base font-bold text-zinc-100 font-mono">{summary.peak_active_requests}</div>
+                <span className="text-[10px] text-zinc-500 uppercase tracking-wider">
+                  Peak Active Requests
+                </span>
+                <div className="text-base font-bold text-zinc-100 font-mono">
+                  {summary.peak_active_requests}
+                </div>
               </div>
               <div>
-                <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Peak Queued Requests</span>
-                <div className="text-base font-bold text-zinc-100 font-mono">{summary.peak_queued_requests}</div>
+                <span className="text-[10px] text-zinc-500 uppercase tracking-wider">
+                  Peak Queued Requests
+                </span>
+                <div className="text-base font-bold text-zinc-100 font-mono">
+                  {summary.peak_queued_requests}
+                </div>
+              </div>
+              <div>
+                <span className="text-[10px] text-zinc-500 uppercase tracking-wider">
+                  Energy Used
+                </span>
+                <div className="text-base font-bold text-zinc-100 font-mono">
+                  {summary.power_kwh.toFixed(4)} kWh
+                </div>
               </div>
             </div>
           </div>

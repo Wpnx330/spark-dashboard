@@ -62,6 +62,12 @@ interface TimeSeriesChartProps {
   seriesLabel?: string
   /** Extra classes applied to the outer wrapper (e.g. grid column placement). */
   className?: string
+  /**
+   * Compact layout hint for embedded (e.g. engine card) usage. Currently a
+   * no-op marker accepted for forward compatibility; the chart renders the
+   * same either way.
+   */
+  compact?: boolean
 }
 
 function formatTime(timestamp: number): string {
