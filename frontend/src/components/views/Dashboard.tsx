@@ -166,55 +166,55 @@ export function Dashboard({
   const NET_TX_COLOR = '#A855F7'
 
   return (
-    <div ref={rootRef} className="flex flex-col flex-1 min-h-0 gap-2">
+    <div ref={rootRef} className="flex flex-col gap-2 w-full md:flex-1 md:min-h-0">
       {/* ── LLM Engines — auto-height, fits content; hardware fills remainder ── */}
       <div className="shrink-0 min-h-0">
-        <EngineSection
-          engines={metrics.engines}
-          showCharts={showEngineCharts}
-          getChartData={history.getChartData}
-          requests={requests}
-          gpuCount={gpus.length}
-          onActiveEngineGpuChange={handleActiveEngineGpuChange}
-        />
-      </div>
+          <EngineSection
+            engines={metrics.engines}
+            showCharts={showEngineCharts}
+            getChartData={history.getChartData}
+            requests={requests}
+            gpuCount={gpus.length}
+            onActiveEngineGpuChange={handleActiveEngineGpuChange}
+          />
+        </div>
 
       {/* ── Hardware Overview — fills the rest of the viewport ── */}
-      <div className="flex-1 min-h-0 bg-[#0a0a0d]/80 rounded-xl border border-white/[0.03] p-1 lg:p-1.5 2xl:p-2 flex flex-col">
-        {multiGpu && (
-          <div role="group" aria-label="GPU selector" className="shrink-0 grid grid-cols-2 lg:grid-cols-4 gap-1 lg:gap-1.5 mb-1 lg:mb-1.5">
-            {gpus.map((gpu) => {
-              const isActive = gpuIndexOf(gpu) === activeGpuIndex
-              return (
-                <button
-                  key={gpu.index ?? 'primary'}
-                  type="button"
-                  onClick={() => setSelectedGpuIndex(gpuIndexOf(gpu))}
-                  aria-pressed={isActive}
-                  className={`min-w-0 rounded-md border px-2 py-1 text-left cursor-pointer transition-colors duration-150 ${
-                    isActive
-                      ? 'border-[#76B900]/50 bg-[#76B900]/[0.06]'
-                      : 'border-white/[0.04] bg-[#151519] hover:border-white/[0.12]'
-                  }`}
-                >
-                  <div className="flex items-baseline justify-between gap-2 min-w-0">
-                    <span className="text-[10px] lg:text-[11px] font-semibold text-zinc-200 truncate">
-                      {gpu.index !== null && gpu.index !== undefined ? `GPU ${gpu.index}` : 'GPU'}
-                    </span>
-                    <span className="text-[10px] text-zinc-500 truncate">{gpu.name}</span>
-                  </div>
-                  <div className="mt-0.5 grid grid-cols-3 gap-2 text-[10px] lg:text-[11px] font-mono tabular-nums text-zinc-300">
-                    <span>{gpu.utilization_percent ?? 0}%</span>
-                    <span>{gpu.temperature_celsius ?? 0}C</span>
-                    <span>{gpu.power_watts !== null ? `${Math.round(gpu.power_watts)}W` : '--'}</span>
-                  </div>
-                </button>
-              )
-            })}
-          </div>
-        )}
+        <div className="bg-[#0a0a0d]/80 rounded-xl border border-white/[0.03] p-1 lg:p-1.5 2xl:p-2 flex flex-col md:flex-1 md:min-h-0">
+          {multiGpu && (
+            <div role="group" aria-label="GPU selector" className="shrink-0 grid grid-cols-2 lg:grid-cols-4 gap-1 lg:gap-1.5 mb-1 lg:mb-1.5">
+              {gpus.map((gpu) => {
+                const isActive = gpuIndexOf(gpu) === activeGpuIndex
+                return (
+                  <button
+                    key={gpu.index ?? 'primary'}
+                    type="button"
+                    onClick={() => setSelectedGpuIndex(gpuIndexOf(gpu))}
+                    aria-pressed={isActive}
+                    className={`min-w-0 rounded-md border px-2 py-1 text-left cursor-pointer transition-colors duration-150 ${
+                      isActive
+                        ? 'border-[#76B900]/50 bg-[#76B900]/[0.06]'
+                        : 'border-white/[0.04] bg-[#151519] hover:border-white/[0.12]'
+                    }`}
+                  >
+                    <div className="flex items-baseline justify-between gap-2 min-w-0">
+                      <span className="text-[10px] lg:text-[11px] font-semibold text-zinc-200 truncate">
+                        {gpu.index !== null && gpu.index !== undefined ? `GPU ${gpu.index}` : 'GPU'}
+                      </span>
+                      <span className="text-[10px] text-zinc-500 truncate">{gpu.name}</span>
+                    </div>
+                    <div className="mt-0.5 grid grid-cols-3 gap-2 text-[10px] lg:text-[11px] font-mono tabular-nums text-zinc-300">
+                      <span>{gpu.utilization_percent ?? 0}%</span>
+                      <span>{gpu.temperature_celsius ?? 0}C</span>
+                      <span>{gpu.power_watts !== null ? `${Math.round(gpu.power_watts)}W` : '--'}</span>
+                    </div>
+                  </button>
+                )
+              })}
+            </div>
+          )}
 
-        <div ref={hwGridRef} className="flex-1 min-h-0 grid grid-cols-2 sm:grid-cols-4 gap-1 lg:gap-1.5 auto-rows-fr">
+        <div ref={hwGridRef} className="grid grid-cols-2 sm:grid-cols-4 gap-1 lg:gap-1.5 auto-rows-fr md:flex-1 md:min-h-0">
 
           {/* GPU Utilization */}
           <HwCard title="GPU Utilization" subtitle={gpuSubtitle}>
