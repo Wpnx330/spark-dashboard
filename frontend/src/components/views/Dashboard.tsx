@@ -168,7 +168,7 @@ export function Dashboard({
   return (
     <div ref={rootRef} className="flex flex-col gap-2 w-full md:flex-1 md:min-h-0">
       {/* ── LLM Engines — auto-height, fits content; hardware fills remainder ── */}
-      <div className="shrink-0 min-h-0">
+      <div className="shrink-0 md:flex-1 md:min-h-0">
           <EngineSection
             engines={metrics.engines}
             showCharts={showEngineCharts}
@@ -180,7 +180,7 @@ export function Dashboard({
         </div>
 
       {/* ── Hardware Overview — fills the rest of the viewport ── */}
-        <div className="bg-[#0a0a0d]/80 rounded-xl border border-white/[0.03] p-1 lg:p-1.5 2xl:p-2 flex flex-col md:flex-1 md:min-h-0">
+        <div className="bg-[#0a0a0d]/80 rounded-xl border border-white/[0.03] p-1 lg:p-1.5 2xl:p-2 flex flex-col md:shrink-0">
           {multiGpu && (
             <div role="group" aria-label="GPU selector" className="shrink-0 grid grid-cols-2 lg:grid-cols-4 gap-1 lg:gap-1.5 mb-1 lg:mb-1.5">
               {gpus.map((gpu) => {
@@ -214,7 +214,7 @@ export function Dashboard({
             </div>
           )}
 
-        <div ref={hwGridRef} className="grid grid-cols-2 sm:grid-cols-4 gap-1 lg:gap-1.5 auto-rows-fr md:flex-1 md:min-h-0">
+        <div ref={hwGridRef} className="grid grid-cols-2 sm:grid-cols-4 gap-1 lg:gap-1.5 auto-rows-fr">
 
           {/* GPU Utilization */}
           <HwCard title="GPU Utilization" subtitle={gpuSubtitle}>
