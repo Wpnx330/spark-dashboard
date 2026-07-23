@@ -62,6 +62,13 @@ interface TimeSeriesChartProps {
   seriesLabel?: string
   /** Extra classes applied to the outer wrapper (e.g. grid column placement). */
   className?: string
+  /**
+   * Compact mode for embeds that supply their own title/legend (e.g. FlipCard
+   * backs). Suppresses the chart's header band so the plot area can fill the
+   * available height. Multi-series legends are also dropped since the host
+   * renders its own label row.
+   */
+  compact?: boolean
 }
 
 function formatTime(timestamp: number): string {
@@ -139,6 +146,7 @@ export const TimeSeriesChart = React.memo(function TimeSeriesChart({
   hideTooltipLabel = false,
   seriesLabel,
   className,
+  compact = false,
 }: TimeSeriesChartProps) {
   const isMulti = series && series.length > 0
 
@@ -173,25 +181,29 @@ export const TimeSeriesChart = React.memo(function TimeSeriesChart({
       {/* Reserve a fixed header band so charts with wrapping multi-series
           legends (Prefill / Decode / Latency) line up with single-title
           charts (KV / E2E) along the bottom. Legend always sits on its own
-          line below the title for consistent layout across charts. */}
-      <div className="flex flex-col gap-1 mb-1 min-h-[2.25rem]">
-        {title && (
-          <h3 className="text-xs font-medium text-zinc-500">{title}</h3>
-        )}
-        {isMulti && (
-          <div className="flex items-center gap-3 flex-wrap">
-            {series.map((s, i) => (
-              <div key={i} className="flex items-center gap-1.5">
-                <span
-                  className="inline-block w-2.5 h-[2px] rounded-full"
-                  style={{ backgroundColor: s.color }}
-                />
-                <span className="text-[11px] text-zinc-500">{s.label}</span>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
+          line below the title for consistent layout across charts.
+          Dropped entirely in `compact` mode (FlipCard backs supply their own
+          header/legend), so the plot area fills the available height. */}
+      {!compact && (
+        <div className="flex flex-col gap-1 mb-1 min-h-[2.25rem]">
+          {title && (
+            <h3 className="text-xs font-medium text-zinc-500">{title}</h3>
+          )}
+          {isMulti && (
+            <div className="flex items-center gap-3 flex-wrap">
+              {series.map((s, i) => (
+                <div key={i} className="flex items-center gap-1.5">
+                  <span
+                    className="inline-block w-2.5 h-[2px] rounded-full"
+                    style={{ backgroundColor: s.color }}
+                  />
+                  <span className="text-[11px] text-zinc-500">{s.label}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
       <ChartContainer
         config={chartConfig}
         style={{ height: typeof height === 'number' ? `${height}px` : height }}
