@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 
 /// A complete snapshot of all hardware metrics at a point in time.
-#[derive(Clone, serde::Serialize, Debug)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 pub struct MetricsSnapshot {
     pub timestamp_ms: u64,
     /// Backwards-compatible primary GPU metric. Mirrors the first entry in
@@ -333,7 +333,7 @@ pub async fn metrics_collector(
 
 /// GPU metrics collected via NVML.
 /// Fields are `Option` because some queries may return `NotSupported` depending on the GPU.
-#[derive(Clone, serde::Serialize, Debug)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 pub struct GpuMetrics {
     pub index: Option<u32>,
     pub name: Option<String>,
@@ -350,7 +350,7 @@ pub struct GpuMetrics {
 }
 
 /// CPU metrics with aggregate and per-core breakdown.
-#[derive(Clone, serde::Serialize, Debug)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 pub struct CpuMetrics {
     pub name: Option<String>,
     pub aggregate_percent: f32,
@@ -358,7 +358,7 @@ pub struct CpuMetrics {
 }
 
 /// Per-core CPU usage.
-#[derive(Clone, serde::Serialize, Debug)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 pub struct CoreMetrics {
     pub id: usize,
     pub usage_percent: f32,
@@ -374,7 +374,7 @@ pub struct CoreMetrics {
 /// marketed capacity. NVML reports the full hardware-addressable unified pool,
 /// so we prefer it when available. Used/available stay sourced from the kernel
 /// view to keep utilisation percentages honest.
-#[derive(Clone, serde::Serialize, Debug)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 pub struct MemoryMetrics {
     pub total_bytes: u64,
     pub display_total_bytes: u64,
@@ -388,7 +388,7 @@ pub struct MemoryMetrics {
 }
 
 /// Disk I/O throughput rates.
-#[derive(Clone, serde::Serialize, Debug)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 pub struct DiskMetrics {
     pub name: Option<String>,
     pub read_bytes_per_sec: u64,
@@ -396,7 +396,7 @@ pub struct DiskMetrics {
 }
 
 /// Network I/O throughput rates.
-#[derive(Clone, serde::Serialize, Debug)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 pub struct NetworkMetrics {
     pub name: Option<String>,
     pub rx_bytes_per_sec: u64,

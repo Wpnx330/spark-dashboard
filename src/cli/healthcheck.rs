@@ -49,7 +49,11 @@ mod tests {
     async fn probe_succeeds_against_running_server() {
         let (tx, _rx) = broadcast::channel::<String>(16);
         let history = crate::history::HistoryDb::open(":memory:").unwrap();
-        let state = Arc::new(AppState { tx, history });
+        let state = Arc::new(AppState {
+            tx,
+            history,
+            node_snapshots: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+        });
         // History routes aren't needed for a /healthz probe; leave them off.
         let app = crate::server::create_router(state, false);
 
