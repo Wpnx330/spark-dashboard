@@ -11,7 +11,7 @@ import { useState, useEffect, useRef, useMemo } from 'react'
  * - Auto-scroll to newest lines (pauses when scrolled up manually)
  * - Error/warning color highlighting
  */
-export function LogViewer() {
+export function LogViewer({ onExpandChange }: { onExpandChange?: (expanded: boolean) => void }) {
   const [logs, setLogs] = useState<string[]>([])
   const [connected, setConnected] = useState(false)
   const [collapsed, setCollapsed] = useState(true)
@@ -104,7 +104,7 @@ export function LogViewer() {
     return (
       <div className="shrink-0 mt-2">
         <button
-          onClick={() => setCollapsed(false)}
+          onClick={() => { setCollapsed(false); onExpandChange?.(true) }}
           className="w-full flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-zinc-400 
                      bg-[#111115] rounded-md border border-white/[0.04] hover:border-zinc-700 
                      transition-colors duration-200"
@@ -124,7 +124,7 @@ export function LogViewer() {
       {/* Header bar */}
       <div className="flex items-center gap-2 px-3 py-1.5 bg-[#111115] rounded-t-md border border-white/[0.04] border-b-0 flex-wrap">
         <button
-          onClick={() => setCollapsed(true)}
+          onClick={() => { setCollapsed(true); onExpandChange?.(false) }}
           className="text-xs font-medium text-zinc-400 hover:text-zinc-200 transition-colors shrink-0"
         >
           ▼ Console Logs
