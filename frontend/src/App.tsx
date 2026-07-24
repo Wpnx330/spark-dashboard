@@ -4,11 +4,13 @@ import { useMetricsHistory } from './hooks/useMetricsHistory'
 import { ConnectionBadge } from './components/ConnectionBadge'
 import { Dashboard } from './components/views/Dashboard'
 import { LogViewer } from './components/LogViewer'
+import { HistoryView } from './components/HistoryView'
 import type { GpuEvent, InferenceRequest } from './types/events'
 
 function App() {
   const { metrics, connectionStatus, isStale } = useMetrics()
   const [consoleExpanded, setConsoleExpanded] = useState(false)
+  const [view, setView] = useState<'metrics' | 'historical'>('metrics')
 
   const history = useMetricsHistory(metrics)
 
@@ -37,34 +39,64 @@ function App() {
   return (
     <div className="h-dvh flex flex-col bg-[#08080a] overflow-hidden">
       <header className="shrink-0 border-b border-white/[0.04] px-4 py-1.5 flex justify-between items-center">
-        <h1 className="text-xl font-semibold text-zinc-100 tracking-tight" style={{ fontFamily: 'Inter, sans-serif' }}>
-          <span className="text-[#76B900]">Spark</span>{' '}
-          <span className="text-zinc-500 font-normal">Dashboard</span>
-        </h1>
+        <div className="flex items-center gap-3">
+          <h1 className="text-xl font-semibold text-zinc-100 tracking-tight" style={{ fontFamily: 'Inter, sans-serif' }}>
+            <span className="text-[#76B900]">Spark</span>{' '}
+            <span className="text-zinc-500 font-normal">Dashboard</span>
+          </h1>
+          <div className="flex bg-[#1a1a1f] rounded-lg p-0.5 border border-white/[0.05]">
+            <button
+              onClick={() => setView('metrics')}
+              className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors ${
+                view === 'metrics'
+                  ? 'bg-[#76B900] text-black'
+                  : 'text-zinc-400 hover:text-zinc-200'
+              }`}
+            >
+              Metrics
+            </button>
+            <button
+              onClick={() => setView('historical')}
+              className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors ${
+                view === 'historical'
+                  ? 'bg-[#76B900] text-black'
+                  : 'text-zinc-400 hover:text-zinc-200'
+              }`}
+            >
+              Historical
+            </button>
+          </div>
+        </div>
         <ConnectionBadge status={connectionStatus} isStale={isStale} />
       </header>
 
-      <main className={`flex-1 min-h-0 overflow-y-auto flex flex-col p-3 lg:p-4 2xl:p-5 min-[1920px]:p-6 ${isStale ? 'opacity-50' : ''}`}>
-        {!metrics && connectionStatus !== 'connected' && (
-          <div className="flex-1 flex items-center justify-center">
-            <div className="text-center">
-              <h2 className="text-xl font-bold text-zinc-50 mb-2">Waiting for metrics</h2>
-              <p className="text-zinc-400">
-                Connecting to the metrics server at {window.location.origin}. Make sure spark-dashboard is running.
-              </p>
-            </div>
-          </div>
+      <main className={`flex-1 min-h-0 overflow-y-auto flex flex-col p-3 lg:p-4 2xl:p-5 min-[1920px]:p-6 ${isStale && view === 'metrics' ? 'opacity-50' : ''}`}>
+        {view === 'historical' ? (
+          <HistoryView />
+        ) : (
+          <>
+            {!metrics && connectionStatus !== 'connected' && (
+              <div className="flex-1 flex items-center justify-center">
+                <div className="text-center">
+                  <h2 className="text-xl font-bold text-zinc-50 mb-2">Waiting for metrics</h2>
+                  <p className="text-zinc-400">
+                    Connecting to the metrics server at {window.location.origin}. Make sure spark-dashboard is running.
+                  </p>
+                </div>
+              </div>
+            )}
+
+            <Dashboard
+              metrics={metrics}
+              history={history}
+              events={events}
+              requests={requests}
+              collapseCharts={consoleExpanded}
+            />
+
+            <LogViewer onExpandChange={setConsoleExpanded} />
+          </>
         )}
-
-        <Dashboard
-          metrics={metrics}
-          history={history}
-          events={events}
-          requests={requests}
-          collapseCharts={consoleExpanded}
-        />
-
-        <LogViewer onExpandChange={setConsoleExpanded} />
       </main>
     </div>
   )

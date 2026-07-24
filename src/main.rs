@@ -1,5 +1,6 @@
 mod cli;
 mod engines;
+mod history;
 mod metrics;
 mod server;
 mod ws;
@@ -10,6 +11,7 @@ mod logs;
 use clap::{Args, Parser, Subcommand};
 use cli::service::ServiceCommand;
 use engines::{ApiKeyResolver, EngineOverride, EngineType};
+use server::AppState;
 use std::process::ExitCode;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
@@ -118,6 +120,24 @@ struct RunArgs {
         default_value_t = false
     )]
     enable_log_viewer: bool,
+
+    /// Enable the historical metrics API (`/api/history/*`) and recording.
+    /// Off by default: the history endpoints include destructive (`prune`) and
+    /// write (`settings`, `toggle`) operations that must not be exposed
+    /// unauthenticated on `0.0.0.0`. Enable only on trusted networks.
+    #[arg(long, env = "SPARK_DASHBOARD_ENABLE_HISTORY", default_value_t = false)]
+    enable_history: bool,
+
+    /// Path to the SQLite history database. If the path cannot be opened the
+    /// dashboard falls back gracefully: it tries `/var/lib/spark-dashboard/`,
+    /// then `/tmp/`, then `:memory:` — so a missing volume never crashes boot.
+    /// Pass `:memory:` explicitly for an ephemeral DB (e.g. tests).
+    #[arg(
+        long,
+        env = "SPARK_DASHBOARD_HISTORY_DB",
+        default_value = "/data/history.db"
+    )]
+    history_db_path: String,
 }
 
 fn main() -> ExitCode {
@@ -190,6 +210,28 @@ async fn run_server_inner(args: RunArgs) -> Result<(), Box<dyn std::error::Error
     // Shared engine state: engine collector writes, metrics collector reads
     let engine_state: Arc<RwLock<Vec<engines::EngineSnapshot>>> = Arc::new(RwLock::new(Vec::new()));
 
+    // Initialize history database.
+    //
+    // We always open a database (even when history is disabled) so the
+    // metrics collector has somewhere to no-op into and so the `--enable-history`
+    // toggle can flip recording on at runtime without a restart. Recording is
+    // gated by `HistoryDb::is_enabled()`, which defaults to false.
+    //
+    // Path resolution: if the caller passed an explicit `--history-db-path`
+    // (other than the default), honor it. Otherwise try `/var/lib/spark-dashboard`
+    // (if the directory exists and is writable), fall back to `/tmp`, and
+    // finally to `:memory:` so the dashboard always starts — losing history on
+    // restart is preferable to crashing on boot.
+    let history_db = open_history_db(&args.history_db_path)?;
+
+    if args.enable_history {
+        tracing::warn!(
+            "History API enabled: /api/history/* routes are registered. \
+             These endpoints include destructive/write operations — only enable \
+             on trusted networks."
+        );
+    }
+
     // Spawn engine collector loop as separate tokio task (Research Pitfall 7:
     // separate task so slow engine API calls don't block hardware metrics)
     tokio::spawn(engines::engine_collector_loop(
@@ -198,14 +240,32 @@ async fn run_server_inner(args: RunArgs) -> Result<(), Box<dyn std::error::Error
         api_keys,
     ));
 
-    // Pass engine_state to metrics collector so it includes engines in snapshots
+    // Pass engine_state and history_db to metrics collector so it includes
+    // engines in snapshots and records per-engine history.
+    let history_for_metrics = history_db.clone();
     tokio::spawn(metrics::metrics_collector(
         tx.clone(),
         args.poll_interval,
         args.gpu_index,
         args.simulate_gpus,
         engine_state.clone(),
+        history_for_metrics,
     ));
+
+    // Background task: roll up 1s→1h and 1h→1d every 30 minutes
+    let history_for_rollup = history_db.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1800));
+        loop {
+            interval.tick().await;
+            if let Err(e) = history_for_rollup.rollup_1s_to_1h().await {
+                tracing::warn!("History 1s→1h rollup failed: {}", e);
+            }
+            if let Err(e) = history_for_rollup.rollup_1h_to_1d().await {
+                tracing::warn!("History 1h→1d rollup failed: {}", e);
+            }
+        }
+    });
 
     // Enable the log viewer if the opt-in flag was passed (Linux only).
     // This registers /ws/logs in the router; nothing is exposed by default.
@@ -217,7 +277,12 @@ async fn run_server_inner(args: RunArgs) -> Result<(), Box<dyn std::error::Error
         );
     }
 
-    let app = server::create_router(tx);
+    let app_state = Arc::new(AppState {
+        tx,
+        history: history_db,
+    });
+
+    let app = server::create_router(app_state, args.enable_history);
 
     let addr = format!("{}:{}", args.bind, args.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -226,4 +291,80 @@ async fn run_server_inner(args: RunArgs) -> Result<(), Box<dyn std::error::Error
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+/// Open the history database, with graceful fallback.
+///
+/// Path resolution order:
+/// 1. If `requested` is non-empty and not the default (`/data/history.db`),
+///    honor it literally (caller asked for something specific).
+/// 2. Try `/var/lib/spark-dashboard/history.db` if that directory exists and
+///    is writable.
+/// 3. Fall back to `/tmp/spark-dashboard-history.db` (always writable).
+/// 4. Final fallback: `:memory:` with a warning — the dashboard stays up but
+///    history is lost on restart.
+fn open_history_db(requested: &str) -> Result<history::HistoryDb, Box<dyn std::error::Error>> {
+    // If the caller passed an explicit non-default path, honor it directly.
+    if !requested.is_empty() && requested != "/data/history.db" && requested != ":memory:" {
+        match history::HistoryDb::open(requested) {
+            Ok(db) => {
+                tracing::info!("History database at {}", requested);
+                return Ok(db);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "History database at {} failed ({}), falling back",
+                    requested,
+                    e
+                );
+            }
+        }
+    }
+
+    if requested == ":memory:" {
+        tracing::info!("History database at :memory: (explicit)");
+        return Ok(history::HistoryDb::open(":memory:")?);
+    }
+
+    // Try /var/lib/spark-dashboard/history.db if the directory exists and is writable.
+    let var_path = "/var/lib/spark-dashboard/history.db";
+    let var_dir = std::path::Path::new("/var/lib/spark-dashboard");
+    let use_var = var_dir.exists()
+        && var_dir.is_dir()
+        && !var_dir
+            .metadata()
+            .map(|m| m.permissions().readonly())
+            .unwrap_or(true);
+    if use_var {
+        match history::HistoryDb::open(var_path) {
+            Ok(db) => {
+                tracing::info!("History database at {}", var_path);
+                return Ok(db);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "History database at {} failed ({}), falling back to /tmp",
+                    var_path,
+                    e
+                );
+            }
+        }
+    }
+
+    // Fall back to /tmp (always writable).
+    let tmp_path = "/tmp/spark-dashboard-history.db";
+    match history::HistoryDb::open(tmp_path) {
+        Ok(db) => {
+            tracing::info!("History database at {}", tmp_path);
+            Ok(db)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "History database at {} failed ({}), using :memory:",
+                tmp_path,
+                e
+            );
+            Ok(history::HistoryDb::open(":memory:")?)
+        }
+    }
 }

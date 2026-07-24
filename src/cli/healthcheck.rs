@@ -41,12 +41,17 @@ pub fn run(port: u16) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::AppState;
+    use std::sync::Arc;
     use tokio::sync::broadcast;
 
     #[tokio::test]
     async fn probe_succeeds_against_running_server() {
         let (tx, _rx) = broadcast::channel::<String>(16);
-        let app = crate::server::create_router(tx);
+        let history = crate::history::HistoryDb::open(":memory:").unwrap();
+        let state = Arc::new(AppState { tx, history });
+        // History routes aren't needed for a /healthz probe; leave them off.
+        let app = crate::server::create_router(state, false);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
