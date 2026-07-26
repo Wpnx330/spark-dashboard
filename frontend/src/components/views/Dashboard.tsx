@@ -212,7 +212,9 @@ export function Dashboard({
               When a node is selected, the hardware cards below render from
               that node's snapshot with a back button to return here. */}
           {multiNode && selectedNode === null ? (
-            <NodeOverview nodes={nodes!} onSelect={(i) => onNodeSelect?.(i)} />
+            <div className="flex-1 min-h-0 flex flex-col">
+              <NodeOverview nodes={nodes!} onSelect={(i) => onNodeSelect?.(i)} />
+            </div>
           ) : (
           <>
           {multiNode && selectedNode !== null && (
