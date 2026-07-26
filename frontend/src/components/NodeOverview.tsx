@@ -6,7 +6,8 @@ interface NodeOverviewProps {
   onSelect: (index: number) => void
 }
 
-/** Circular gauge for a single metric — fills its container. */
+/** Circular gauge for a single metric — scales to fill its container.
+ *  Uses relative sizing so it never overflows on narrow mobile cards. */
 function MiniGauge({ value, max, unit, label, color }: { value: number; max: number; unit: string; label: string; color: string }) {
   const pct = Math.min(100, (value / max) * 100)
   const radius = 26
@@ -14,8 +15,8 @@ function MiniGauge({ value, max, unit, label, color }: { value: number; max: num
   const offset = circumference - (pct / 100) * circumference
 
   return (
-    <div className="flex flex-col items-center gap-0.5">
-      <div className="relative w-16 h-16 lg:w-[72px] lg:h-[72px]">
+    <div className="flex flex-col items-center gap-0.5 min-w-0 flex-1">
+      <div className="relative w-full aspect-square max-w-[64px] lg:max-w-[72px] mx-auto">
         <svg className="w-full h-full -rotate-90" viewBox="0 0 64 64">
           <circle cx="32" cy="32" r={radius} fill="none" stroke="rgba(255,255,255,0.06)" strokeWidth="5" />
           <circle
@@ -26,7 +27,7 @@ function MiniGauge({ value, max, unit, label, color }: { value: number; max: num
           />
         </svg>
         <div className="absolute inset-0 flex flex-col items-center justify-center">
-          <span className="text-sm lg:text-base font-mono font-bold tabular-nums text-zinc-100">
+          <span className="text-xs sm:text-sm lg:text-base font-mono font-bold tabular-nums text-zinc-100">
             {Math.round(value)}{unit}
           </span>
         </div>
@@ -58,7 +59,7 @@ function NodeCard({ node, index, onSelect }: { node: NodeInfo; index: number; on
       type="button"
       onClick={() => onSelect(index)}
       aria-label={`${node.hostname} details`}
-      className={`bg-[#111115] rounded-lg border border-white/[0.04] p-3 lg:p-4 text-left cursor-pointer transition-all duration-150 hover:border-[#76B900]/30 hover:bg-[#131318] flex flex-col gap-3 min-w-0 overflow-hidden h-full ${
+      className={`bg-[#111115] rounded-lg border border-white/[0.04] p-2 sm:p-3 lg:p-4 text-left cursor-pointer transition-all duration-150 hover:border-[#76B900]/30 hover:bg-[#131318] flex flex-col gap-2 sm:gap-3 min-w-0 overflow-hidden h-full ${
         node.online ? '' : 'opacity-50'
       }`}
     >
