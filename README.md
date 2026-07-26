@@ -10,6 +10,9 @@ vLLM engine statistics and streams them over WebSocket to a React frontend.
 
 ![Spark Dashboard](./docs/spark-dashboard-demo-0-11-0.gif)
 
+Now with multi-node GPU support
+<img width="3778" height="1872" alt="image" src="https://github.com/user-attachments/assets/72986acd-21e7-4e1c-81e2-fdd1d45e924f" />
+
 ## Quick Start
 
 ### Install on your Linux host
