@@ -263,6 +263,12 @@ async fn run_server_inner(args: RunArgs) -> Result<(), Box<dyn std::error::Error
         api_keys,
     ));
 
+    // Shared node-snapshots collection for multi-node monitoring.
+    // Created early so both the metrics collector (which sums power across
+    // online nodes) and the node poller can share the same Arc.
+    let node_snapshots: crate::nodes::NodeSnapshots =
+        Arc::new(tokio::sync::RwLock::new(Vec::new()));
+
     // Pass engine_state and history_db to metrics collector so it includes
     // engines in snapshots and records per-engine history.
     let history_for_metrics = history_db.clone();
@@ -273,6 +279,7 @@ async fn run_server_inner(args: RunArgs) -> Result<(), Box<dyn std::error::Error
         args.simulate_gpus,
         engine_state.clone(),
         history_for_metrics,
+        node_snapshots.clone(),
     ));
 
     // Background task: roll up 1s→1h and 1h→1d every 30 minutes
@@ -303,7 +310,7 @@ async fn run_server_inner(args: RunArgs) -> Result<(), Box<dyn std::error::Error
     let app_state = Arc::new(AppState {
         tx,
         history: history_db,
-        node_snapshots: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+        node_snapshots,
     });
 
     // Spawn the remote node-polling loop when --nodes is provided.
@@ -356,6 +363,8 @@ async fn run_node_agent(args: RunArgs) -> Result<(), Box<dyn std::error::Error>>
         let (collector_tx, mut collector_rx) = broadcast::channel::<String>(16);
         let engine_state = engine_state.clone();
         let history = history_db.clone();
+        let node_snapshots: crate::nodes::NodeSnapshots =
+            Arc::new(tokio::sync::RwLock::new(Vec::new()));
         tokio::spawn(metrics::metrics_collector(
             collector_tx,
             poll_interval,
@@ -363,6 +372,7 @@ async fn run_node_agent(args: RunArgs) -> Result<(), Box<dyn std::error::Error>>
             simulate_gpus,
             engine_state,
             history,
+            node_snapshots,
         ));
         while let Ok(json) = collector_rx.recv().await {
             if let Ok(snap) = serde_json::from_str::<metrics::MetricsSnapshot>(&json) {

@@ -39,6 +39,7 @@ pub async fn metrics_collector(
     simulate_gpus: u32,
     engine_state: std::sync::Arc<tokio::sync::RwLock<Vec<EngineSnapshot>>>,
     history_db: crate::history::HistoryDb,
+    node_snapshots: crate::nodes::NodeSnapshots,
 ) {
     let mut interval = tokio::time::interval(Duration::from_millis(poll_interval_ms));
 
@@ -215,6 +216,40 @@ pub async fn metrics_collector(
                 if let Some(v) = cur_reqs {
                     prev_reqs.insert(eng.endpoint.clone(), v);
                 }
+                // Sum power across ALL local GPUs (TP1=1x, TP2=2x, TP4=4x, etc.)
+                // Falls back to the primary GPU when the full list is empty.
+                let local_power_watts: Option<f64> = if snapshot.gpus.is_empty() {
+                    snapshot.gpu.power_watts
+                } else {
+                    Some(
+                        snapshot
+                            .gpus
+                            .iter()
+                            .filter_map(|g| g.power_watts)
+                            .sum::<f64>(),
+                    )
+                    .filter(|v: &f64| *v > 0.0)
+                    .or(snapshot.gpu.power_watts)
+                };
+
+                // Add power from every online remote node so the recorded
+                // value reflects the *actual* total cluster draw rather than
+                // just the local node. Falls back to local-only when no node
+                // snapshots are available (single-node deployments).
+                let remote_power_watts: f64 = node_snapshots
+                    .read()
+                    .await
+                    .iter()
+                    .filter(|n| n.online)
+                    .filter_map(|n| n.snapshot.as_ref())
+                    .filter_map(|s| s.gpu.power_watts)
+                    .sum();
+                let power_watts = match (local_power_watts, remote_power_watts) {
+                    (Some(local), remote) if remote > 0.0 => Some(local + remote),
+                    (Some(local), _) => Some(local),
+                    (None, remote) if remote > 0.0 => Some(remote),
+                    (None, _) => None,
+                };
                 history_db
                     .insert_1s(
                         &eng.endpoint,
@@ -227,21 +262,7 @@ pub async fn metrics_collector(
                         m.ttft_ms,
                         m.inter_token_latency_ms,
                         m.e2e_latency_ms,
-                        // Sum power across ALL GPUs (TP1=1x, TP2=2x, TP4=4x, etc.)
-                        // Falls back to the primary GPU when the full list is empty.
-                        if snapshot.gpus.is_empty() {
-                            snapshot.gpu.power_watts
-                        } else {
-                            Some(
-                                snapshot
-                                    .gpus
-                                    .iter()
-                                    .filter_map(|g| g.power_watts)
-                                    .sum::<f64>(),
-                            )
-                            .filter(|v: &f64| *v > 0.0)
-                            .or(snapshot.gpu.power_watts)
-                        },
+                        power_watts,
                         snapshot.gpu.utilization_percent.map(|v| v as f64),
                         snapshot.gpu.temperature_celsius.map(|v| v as f64),
                         m.active_requests.map(|v| v as i64),
@@ -267,6 +288,7 @@ pub async fn metrics_collector(
     simulate_gpus: u32,
     engine_state: std::sync::Arc<tokio::sync::RwLock<Vec<EngineSnapshot>>>,
     _history_db: crate::history::HistoryDb,
+    _node_snapshots: crate::nodes::NodeSnapshots,
 ) {
     let mut interval = tokio::time::interval(Duration::from_millis(poll_interval_ms));
 

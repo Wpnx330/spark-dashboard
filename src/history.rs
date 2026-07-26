@@ -37,7 +37,7 @@ impl HistoryDb {
         })
     }
 
-    fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS settings (
@@ -135,6 +135,48 @@ impl HistoryDb {
             "DELETE FROM snapshots_1d WHERE COALESCE(total_prompt_tokens,0) > 10000000000000",
             [],
         )?;
+
+        // One-time backfill: historical `power_watts` values were recorded
+        // from a single node's GPU(s) only. Now that multi-node monitoring is
+        // active, multiply every existing power value by the cluster size (4
+        // DGX nodes) so old data is comparable to the new total-cluster
+        // recordings. Guarded by the `power_backfill_done` settings key so it
+        // runs exactly once.
+        const CLUSTER_NODE_COUNT: f64 = 4.0;
+        let backfill_done: Option<String> = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'power_backfill_done'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .map(Some)
+            .or::<rusqlite::Error>(Ok(None))?;
+        if backfill_done.is_none() {
+            let updated_1s = conn.execute(
+                "UPDATE snapshots_1s SET power_watts = power_watts * ?1 \
+                 WHERE power_watts IS NOT NULL",
+                params![CLUSTER_NODE_COUNT],
+            )?;
+            let updated_1h = conn.execute(
+                "UPDATE snapshots_1h SET power_watts_sum = power_watts_sum * ?1 \
+                 WHERE power_watts_sum IS NOT NULL",
+                params![CLUSTER_NODE_COUNT],
+            )?;
+            let updated_1d = conn.execute(
+                "UPDATE snapshots_1d SET power_watts_sum = power_watts_sum * ?1 \
+                 WHERE power_watts_sum IS NOT NULL",
+                params![CLUSTER_NODE_COUNT],
+            )?;
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('power_backfill_done', ?1)",
+                params![CLUSTER_NODE_COUNT as i64],
+            )?;
+            info!(
+                "History backfill: multiplied power by {} for {} 1s + {} 1h + {} 1d rows",
+                CLUSTER_NODE_COUNT, updated_1s, updated_1h, updated_1d
+            );
+        }
+
         Ok(())
     }
 
@@ -874,5 +916,93 @@ mod tests {
             s.delta_prompt_tokens, 30,
             "only the newer row should remain"
         );
+    }
+
+    /// The one-time power backfill migration should multiply all existing
+    /// power values by the cluster size (4) when it runs, and be idempotent
+    /// on subsequent runs (guarded by the `power_backfill_done` settings key).
+    #[tokio::test]
+    async fn test_power_backfill_multiplies_and_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+            .unwrap();
+        // First migrate creates the schema and runs the backfill (which is a
+        // no-op on an empty DB but still marks `power_backfill_done`).
+        HistoryDb::migrate(&conn).unwrap();
+
+        // Simulate pre-existing data recorded before the backfill: clear the
+        // marker, insert rows with known power values, then re-run migrate.
+        conn.execute("DELETE FROM settings WHERE key = 'power_backfill_done'", [])
+            .unwrap();
+        // Insert a 1s row with a known power value.
+        conn.execute(
+            "INSERT INTO snapshots_1s (engine_key, ts, power_watts) VALUES ('e1', 1000, 100.0)",
+            [],
+        )
+        .unwrap();
+        // Insert a 1h row with a known power_watts_sum.
+        conn.execute(
+            "INSERT INTO snapshots_1h (engine_key, bucket_ts, power_watts_sum, sample_count) \
+             VALUES ('e1', 3600000, 200.0, 60)",
+            [],
+        )
+        .unwrap();
+        // Insert a 1d row with a known power_watts_sum.
+        conn.execute(
+            "INSERT INTO snapshots_1d (engine_key, bucket_ts, power_watts_sum, sample_count) \
+             VALUES ('e1', 86400000, 300.0, 1440)",
+            [],
+        )
+        .unwrap();
+
+        // Run migrate again — this time the backfill should fire on the data.
+        HistoryDb::migrate(&conn).unwrap();
+
+        // All power values should be multiplied by 4.
+        let p1s: f64 = conn
+            .query_row(
+                "SELECT power_watts FROM snapshots_1s WHERE engine_key='e1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(p1s, 400.0, "1s power should be 100 * 4");
+        let p1h: f64 = conn
+            .query_row(
+                "SELECT power_watts_sum FROM snapshots_1h WHERE engine_key='e1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(p1h, 800.0, "1h power should be 200 * 4");
+        let p1d: f64 = conn
+            .query_row(
+                "SELECT power_watts_sum FROM snapshots_1d WHERE engine_key='e1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(p1d, 1200.0, "1d power should be 300 * 4");
+
+        // The settings key should be set.
+        let done: String = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key='power_backfill_done'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(done, "4");
+
+        // Run migrate a third time — should NOT multiply again.
+        HistoryDb::migrate(&conn).unwrap();
+        let p1s_again: f64 = conn
+            .query_row(
+                "SELECT power_watts FROM snapshots_1s WHERE engine_key='e1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(p1s_again, 400.0, "backfill must be idempotent");
     }
 }

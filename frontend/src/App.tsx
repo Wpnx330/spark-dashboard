@@ -75,7 +75,7 @@ function App() {
 
       <main className={`flex-1 min-h-0 overflow-y-auto flex flex-col p-3 lg:p-4 2xl:p-5 min-[1920px]:p-6 ${isStale && view === 'metrics' ? 'opacity-50' : ''}`}>
         {view === 'historical' ? (
-          <HistoryView />
+          <HistoryView nodeCount={nodes.filter(n => n.online).length || 1} />
         ) : (
           <>
             {!metrics && connectionStatus !== 'connected' && (
