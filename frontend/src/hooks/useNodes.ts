@@ -9,15 +9,13 @@ export interface NodeInfo {
   snapshot: MetricsSnapshot | null
 }
 
-interface NodesResponse {
-  nodes: NodeInfo[]
-}
-
 /**
  * Polls `GET /api/nodes` every second and returns the latest list of nodes.
  *
  * Keeps the last known good data on fetch/parse errors so the UI never blanks
  * out during a transient blip — mirroring the resilience of {@link useMetrics}.
+ *
+ * The API returns a bare JSON array of {@link NodeInfo} objects.
  */
 export function useNodes() {
   const [nodes, setNodes] = useState<NodeInfo[]>([])
@@ -31,9 +29,9 @@ export function useNodes() {
       try {
         const res = await fetch('/api/nodes')
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
-        const data = (await res.json()) as NodesResponse
+        const data = await res.json()
         if (cancelled) return
-        const next = Array.isArray(data.nodes) ? data.nodes : []
+        const next = Array.isArray(data) ? data : []
         lastGoodRef.current = next
         setNodes(next)
         setLoading(false)
