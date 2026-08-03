@@ -9,6 +9,9 @@ interface HistorySummary {
   peak_active_requests: number
   peak_queued_requests: number
   total_requests: number
+  peak_kv_cache_pct: number | null
+  avg_kv_cache_pct: number | null
+  total_preemptions: number | null
   power_kwh: number
   total_seconds: number | null
   source_table: string
@@ -563,6 +566,28 @@ export function HistoryView({ nodeCount = 1 }: { nodeCount?: number }) {
               <div>
                 <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Peak Queued Requests</span>
                 <div className="text-base font-bold text-zinc-100 font-mono">{summary.peak_queued_requests}</div>
+              </div>
+              <div>
+                <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Peak KV Cache</span>
+                <div className="text-base font-bold text-zinc-100 font-mono">
+                  {summary.peak_kv_cache_pct != null ? `${summary.peak_kv_cache_pct.toFixed(1)}%` : '—'}
+                </div>
+              </div>
+              <div>
+                <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Avg KV Cache</span>
+                <div className="text-base font-bold text-zinc-100 font-mono">
+                  {summary.avg_kv_cache_pct != null ? `${summary.avg_kv_cache_pct.toFixed(1)}%` : '—'}
+                </div>
+              </div>
+              <div>
+                <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Preemptions</span>
+                <div className={`text-base font-bold font-mono ${
+                  summary.total_preemptions != null && summary.total_preemptions > 0
+                    ? 'text-amber-400'
+                    : 'text-[#76B900]'
+                }`}>
+                  {summary.total_preemptions != null ? summary.total_preemptions.toLocaleString() : '—'}
+                </div>
               </div>
             </div>
           </div>
