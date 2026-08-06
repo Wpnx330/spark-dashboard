@@ -9,6 +9,9 @@ interface HistorySummary {
   peak_active_requests: number
   peak_queued_requests: number
   total_requests: number
+  peak_kv_cache_pct: number | null
+  avg_kv_cache_pct: number | null
+  total_preemptions: number | null
   power_kwh: number
   total_seconds: number | null
   source_table: string
@@ -124,7 +127,7 @@ function presetRange(preset: WindowPreset, utcOffsetHours: number): DateRange {
   }
 }
 
-export function HistoryView() {
+export function HistoryView({ nodeCount = 1 }: { nodeCount?: number }) {
   const [preset, setPreset] = useState<WindowPreset>('today')
   const [customSince, setCustomSince] = useState('')
   const [customUntil, setCustomUntil] = useState('')
@@ -230,11 +233,13 @@ export function HistoryView() {
   const cloudPromptRate = parseFloat(settings?.cloud_prompt_rate || '0') || 0
   const cloudGenRate = parseFloat(settings?.cloud_gen_rate || '0') || 0
   const electRate = parseFloat(settings?.electricity_rate || '0') || 0
-  const tpGpuCount = Math.max(1, parseInt(settings?.tp_gpu_count || '1') || 1)
   const cloudCost = (summary ? (summary.delta_prompt_tokens / 1_000_000) * cloudPromptRate : 0)
     + (summary ? (summary.delta_gen_tokens / 1_000_000) * cloudGenRate : 0)
-  // Multiply recorded power (single GPU) by TP GPU count for total power draw
-  const totalPowerKwh = summary ? summary.power_kwh * tpGpuCount : 0
+  // Power is now recorded from all online nodes automatically (see
+  // metrics_collector), so no multiplier is needed. The `tp_gpu_count`
+  // setting is retained only as a deprecated/informational field for
+  // historical data recorded before multi-node monitoring was enabled.
+  const totalPowerKwh = summary ? summary.power_kwh : 0
   const powerCost = totalPowerKwh * electRate
   const netSavings = cloudCost - powerCost
 
@@ -413,7 +418,14 @@ export function HistoryView() {
               </div>
             </div>
             <div>
-              <label className="text-[10px] text-zinc-500 uppercase tracking-wider">TP GPU Count</label>
+              <label className="text-[10px] text-zinc-500 uppercase tracking-wider flex items-center gap-1.5">
+                Node Count (historical)
+                {nodeCount > 1 && (
+                  <span className="text-[#76B900] normal-case tracking-normal text-[9px] bg-[#76B900]/10 px-1.5 py-0.5 rounded">
+                    Monitoring {nodeCount} nodes
+                  </span>
+                )}
+              </label>
               <input
                 type="number"
                 step="1"
@@ -431,7 +443,9 @@ export function HistoryView() {
                 className="w-full bg-[#0d0d11] border border-white/[0.06] rounded px-2 py-1 text-[11px] text-zinc-300 mt-1"
                 placeholder="1"
               />
-              <div className="text-[9px] text-zinc-500 mt-1">Multiplies power draw (TP4 = 4 GPUs)</div>
+              <div className="text-[9px] text-zinc-500 mt-1">
+                Deprecated. Power is now recorded from all nodes automatically. This only affects older data before multi-node monitoring.
+              </div>
             </div>
           </div>
 
@@ -552,6 +566,28 @@ export function HistoryView() {
               <div>
                 <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Peak Queued Requests</span>
                 <div className="text-base font-bold text-zinc-100 font-mono">{summary.peak_queued_requests}</div>
+              </div>
+              <div>
+                <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Peak KV Cache</span>
+                <div className="text-base font-bold text-zinc-100 font-mono">
+                  {summary.peak_kv_cache_pct != null ? `${summary.peak_kv_cache_pct.toFixed(1)}%` : '—'}
+                </div>
+              </div>
+              <div>
+                <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Avg KV Cache</span>
+                <div className="text-base font-bold text-zinc-100 font-mono">
+                  {summary.avg_kv_cache_pct != null ? `${summary.avg_kv_cache_pct.toFixed(1)}%` : '—'}
+                </div>
+              </div>
+              <div>
+                <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Preemptions</span>
+                <div className={`text-base font-bold font-mono ${
+                  summary.total_preemptions != null && summary.total_preemptions > 0
+                    ? 'text-amber-400'
+                    : 'text-[#76B900]'
+                }`}>
+                  {summary.total_preemptions != null ? summary.total_preemptions.toLocaleString() : '—'}
+                </div>
               </div>
             </div>
           </div>

@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import { useMetrics } from './hooks/useMetrics'
+import { useNodes } from './hooks/useNodes'
 import { useMetricsHistory } from './hooks/useMetricsHistory'
 import { ConnectionBadge } from './components/ConnectionBadge'
 import { Dashboard } from './components/views/Dashboard'
@@ -9,8 +10,10 @@ import type { GpuEvent, InferenceRequest } from './types/events'
 
 function App() {
   const { metrics, connectionStatus, isStale } = useMetrics()
+  const { nodes } = useNodes()
   const [consoleExpanded, setConsoleExpanded] = useState(false)
   const [view, setView] = useState<'metrics' | 'historical'>('metrics')
+  const [selectedNode, setSelectedNode] = useState<number | null>(null)
 
   const history = useMetricsHistory(metrics)
 
@@ -72,7 +75,7 @@ function App() {
 
       <main className={`flex-1 min-h-0 overflow-y-auto flex flex-col p-3 lg:p-4 2xl:p-5 min-[1920px]:p-6 ${isStale && view === 'metrics' ? 'opacity-50' : ''}`}>
         {view === 'historical' ? (
-          <HistoryView />
+          <HistoryView nodeCount={nodes.filter(n => n.online).length || 1} />
         ) : (
           <>
             {!metrics && connectionStatus !== 'connected' && (
@@ -92,6 +95,9 @@ function App() {
               events={events}
               requests={requests}
               collapseCharts={consoleExpanded}
+              nodes={nodes}
+              selectedNode={selectedNode}
+              onNodeSelect={setSelectedNode}
             />
 
             <LogViewer onExpandChange={setConsoleExpanded} />

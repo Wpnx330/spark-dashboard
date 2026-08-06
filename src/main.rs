@@ -2,6 +2,7 @@ mod cli;
 mod engines;
 mod history;
 mod metrics;
+mod nodes;
 mod server;
 mod ws;
 
@@ -15,6 +16,9 @@ use server::AppState;
 use std::process::ExitCode;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
+
+use axum::routing::get;
+use axum::{Json, Router};
 
 /// Spark Dashboard — Real-time hardware and LLM monitoring for Linux hosts with NVIDIA GPUs.
 #[derive(Parser, Debug)]
@@ -128,6 +132,20 @@ struct RunArgs {
     #[arg(long, env = "SPARK_DASHBOARD_ENABLE_HISTORY", default_value_t = false)]
     enable_history: bool,
 
+    /// Run in node-agent mode: collect local hardware metrics and serve only
+    /// the `GET /api/node/hw` JSON endpoint — no frontend, WebSocket, history,
+    /// or log viewer. Intended for remote nodes polled by a main dashboard
+    /// started with `--nodes`.
+    #[arg(long, env = "SPARK_DASHBOARD_NODE_AGENT", default_value_t = false)]
+    node_agent: bool,
+
+    /// Comma-separated list of node-agent URLs to poll (e.g.
+    /// `http://192.168.10.188:3001,http://192.168.10.189:3001`).
+    /// When set, the main dashboard spawns a background poller and exposes
+    /// `GET /api/nodes` with aggregated snapshots from every listed node.
+    #[arg(long, env = "SPARK_DASHBOARD_NODES", value_name = "URLS")]
+    nodes: Option<String>,
+
     /// Path to the SQLite history database. If the path cannot be opened the
     /// dashboard falls back gracefully: it tries `/var/lib/spark-dashboard/`,
     /// then `/tmp/`, then `:memory:` — so a missing volume never crashes boot.
@@ -172,6 +190,11 @@ async fn run_server_inner(args: RunArgs) -> Result<(), Box<dyn std::error::Error
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    // Node-agent mode: stripped-down server that only serves GET /api/node/hw.
+    if args.node_agent {
+        return run_node_agent(args).await;
+    }
 
     // Parse manual engine overrides: --engine ollama --engine-url http://localhost:11434
     // Both vectors must have the same length. Each pair creates an EngineOverride.
@@ -240,6 +263,12 @@ async fn run_server_inner(args: RunArgs) -> Result<(), Box<dyn std::error::Error
         api_keys,
     ));
 
+    // Shared node-snapshots collection for multi-node monitoring.
+    // Created early so both the metrics collector (which sums power across
+    // online nodes) and the node poller can share the same Arc.
+    let node_snapshots: crate::nodes::NodeSnapshots =
+        Arc::new(tokio::sync::RwLock::new(Vec::new()));
+
     // Pass engine_state and history_db to metrics collector so it includes
     // engines in snapshots and records per-engine history.
     let history_for_metrics = history_db.clone();
@@ -250,6 +279,7 @@ async fn run_server_inner(args: RunArgs) -> Result<(), Box<dyn std::error::Error
         args.simulate_gpus,
         engine_state.clone(),
         history_for_metrics,
+        node_snapshots.clone(),
     ));
 
     // Background task: roll up 1s→1h and 1h→1d every 30 minutes
@@ -280,7 +310,18 @@ async fn run_server_inner(args: RunArgs) -> Result<(), Box<dyn std::error::Error
     let app_state = Arc::new(AppState {
         tx,
         history: history_db,
+        node_snapshots,
     });
+
+    // Spawn the remote node-polling loop when --nodes is provided.
+    if let Some(nodes_str) = &args.nodes {
+        let urls = nodes::parse_node_urls(nodes_str);
+        if !urls.is_empty() {
+            nodes::spawn_node_poller(urls, app_state.node_snapshots.clone());
+        } else {
+            tracing::warn!("--nodes provided but no valid URLs were parsed");
+        }
+    }
 
     let app = server::create_router(app_state, args.enable_history);
 
@@ -288,6 +329,83 @@ async fn run_server_inner(args: RunArgs) -> Result<(), Box<dyn std::error::Error
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("Spark Dashboard running at http://{}", addr);
 
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+/// Run the node-agent server: a stripped-down HTTP server that only exposes
+/// `GET /api/node/hw`, returning the latest local `MetricsSnapshot` as JSON.
+///
+/// The agent reuses the existing `metrics_collector` but writes snapshots into
+/// a shared `RwLock<Option<MetricsSnapshot>>` instead of broadcasting — the
+/// single endpoint reads from that slot on every request.
+async fn run_node_agent(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let hostname = sysinfo::System::host_name().unwrap_or_else(|| "unknown".into());
+    tracing::info!("Starting in node-agent mode (hostname: {hostname})");
+
+    let snapshot: Arc<tokio::sync::RwLock<Option<metrics::MetricsSnapshot>>> =
+        Arc::new(tokio::sync::RwLock::new(None));
+
+    // Spawn a metrics collector that writes the latest snapshot into the shared
+    // slot instead of broadcasting JSON. We still pass a broadcast channel
+    // (required by metrics_collector's signature) but consume the receiver here
+    // to capture snapshots.
+    let engine_state: Arc<RwLock<Vec<engines::EngineSnapshot>>> = Arc::new(RwLock::new(Vec::new()));
+    let history_db = open_history_db(":memory:")?;
+
+    let snapshot_for_collector = snapshot.clone();
+    let poll_interval = args.poll_interval;
+    let gpu_index = args.gpu_index;
+    let simulate_gpus = args.simulate_gpus;
+
+    tokio::spawn(async move {
+        let (collector_tx, mut collector_rx) = broadcast::channel::<String>(16);
+        let engine_state = engine_state.clone();
+        let history = history_db.clone();
+        let node_snapshots: crate::nodes::NodeSnapshots =
+            Arc::new(tokio::sync::RwLock::new(Vec::new()));
+        tokio::spawn(metrics::metrics_collector(
+            collector_tx,
+            poll_interval,
+            gpu_index,
+            simulate_gpus,
+            engine_state,
+            history,
+            node_snapshots,
+        ));
+        while let Ok(json) = collector_rx.recv().await {
+            if let Ok(snap) = serde_json::from_str::<metrics::MetricsSnapshot>(&json) {
+                *snapshot_for_collector.write().await = Some(snap);
+            }
+        }
+    });
+
+    // Build the minimal agent router.
+    let snapshot_state = snapshot.clone();
+    let hostname_state = hostname.clone();
+    let app = Router::new()
+        .route(
+            "/api/node/hw",
+            get(move || {
+                let snapshot = snapshot_state.clone();
+                let hostname = hostname_state.clone();
+                async move {
+                    let snap = snapshot.read().await.clone();
+                    Json(serde_json::json!({
+                        "hostname": hostname,
+                        "snapshot": snap,
+                    }))
+                }
+            }),
+        )
+        .route("/healthz", get(|| async { "ok" }))
+        .layer(tower_http::cors::CorsLayer::permissive());
+
+    let port = if args.port == 3000 { 3001 } else { args.port };
+    let addr = format!("{}:{}", args.bind, port);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    tracing::info!("Node agent listening at http://{}", addr);
     axum::serve(listener, app).await?;
 
     Ok(())

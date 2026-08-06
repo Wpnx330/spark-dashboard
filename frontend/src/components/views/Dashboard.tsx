@@ -3,12 +3,14 @@ import { ArcGauge, type GaugeSegment } from '@/components/gauges/ArcGauge'
 import { HBar } from '@/components/gauges/HBar'
 import { CoreHeatmap } from '@/components/charts/CoreHeatmap'
 import { TimeSeriesChart } from '@/components/charts/TimeSeriesChart'
+import { NodeOverview } from '@/components/NodeOverview'
 import { EngineSection } from '@/components/engines/EngineSection'
 import { useElementSize } from '@/hooks/useElementSize'
 import { THRESHOLDS } from '@/lib/theme'
 import { formatBytes, formatGiB, formatMhz, formatRate } from '@/lib/format'
 import { computePowerScale, powerPeak } from '@/lib/gpuPower'
 import type { MetricsSnapshot } from '@/types/metrics'
+import type { NodeInfo } from '@/hooks/useNodes'
 import type { GpuEvent, InferenceRequest } from '@/types/events'
 
 interface DashboardProps {
@@ -20,6 +22,17 @@ interface DashboardProps {
   events: GpuEvent[]
   requests: InferenceRequest[]
   collapseCharts?: boolean
+  /** Multi-node info. When 2+ nodes are present and none is selected, the
+   *  hardware section shows the {@link NodeOverview} grid instead of the
+   *  per-node hardware cards. Drilling into a node swaps the data source to
+   *  that node's snapshot. When omitted (or ≤1 node) the single-node view is
+   *  unchanged. */
+  nodes?: NodeInfo[]
+  /** Index into `nodes` of the currently drilled-in node, or null when the
+   *  overview grid is showing. Owned by the parent (App) so it survives
+   *  Dashboard re-renders. */
+  selectedNode?: number | null
+  onNodeSelect?: (index: number | null) => void
 }
 
 function HwCard({ title, subtitle, children }: { title?: string; subtitle?: string; children: React.ReactNode }) {
@@ -63,6 +76,9 @@ export function Dashboard({
   events,
   requests,
   collapseCharts = false,
+  nodes,
+  selectedNode = null,
+  onNodeSelect,
 }: DashboardProps) {
   // Which GPU the hardware chart panels show on multi-GPU hosts. Held above
   // the early return so incoming snapshots cannot reset it.
@@ -94,7 +110,15 @@ export function Dashboard({
 
   if (!metrics) return null
 
-  const gpus = metrics.gpus && metrics.gpus.length > 0 ? metrics.gpus : [metrics.gpu]
+  // Multi-node: when a node is drilled in, render the hardware cards from
+  // that node's snapshot instead of the local WebSocket feed. Falls back to
+  // `metrics` (local node) when no node is selected or the selected node has
+  // no snapshot yet. The engine section always uses the local `metrics`.
+  const multiNode = (nodes?.length ?? 0) > 1
+  const drilledNode = multiNode && selectedNode !== null ? nodes![selectedNode] : null
+  const nodeMetrics = drilledNode?.snapshot ?? metrics
+
+  const gpus = nodeMetrics.gpus && nodeMetrics.gpus.length > 0 ? nodeMetrics.gpus : [nodeMetrics.gpu]
   const multiGpu = gpus.length > 1
   const gpuIndexOf = (gpu: MetricsSnapshot['gpu']) => gpu.index ?? 0
   // Fall back to the primary GPU if the selected index vanishes from the feed.
@@ -116,21 +140,21 @@ export function Dashboard({
     powerPeak(powerHistory, activeGpu.power_watts),
   ).percent
 
-  const memUsedPercent = metrics.memory.total_bytes > 0
-    ? (metrics.memory.used_bytes / metrics.memory.total_bytes) * 100
+  const memUsedPercent = nodeMetrics.memory.total_bytes > 0
+    ? (nodeMetrics.memory.used_bytes / nodeMetrics.memory.total_bytes) * 100
     : 0
 
-  const gpuUsed = metrics.memory.gpu_estimated_bytes ?? 0
-  const cpuUsed = Math.max(0, metrics.memory.used_bytes - gpuUsed)
-  const cached = Math.min(metrics.memory.cached_bytes, metrics.memory.available_bytes)
-  const free = Math.max(0, metrics.memory.available_bytes - cached)
-  const totalGB = formatGiB(metrics.memory.display_total_bytes ?? metrics.memory.total_bytes)
+  const gpuUsed = nodeMetrics.memory.gpu_estimated_bytes ?? 0
+  const cpuUsed = Math.max(0, nodeMetrics.memory.used_bytes - gpuUsed)
+  const cached = Math.min(nodeMetrics.memory.cached_bytes, nodeMetrics.memory.available_bytes)
+  const free = Math.max(0, nodeMetrics.memory.available_bytes - cached)
+  const totalGB = formatGiB(nodeMetrics.memory.display_total_bytes ?? nodeMetrics.memory.total_bytes)
 
   const memorySegments: GaugeSegment[] = [
-    { value: gpuUsed, total: metrics.memory.total_bytes, color: '#76B900', label: `GPU: ${formatBytes(gpuUsed)}` },
-    { value: cpuUsed, total: metrics.memory.total_bytes, color: '#3B82F6', label: `CPU: ${formatBytes(cpuUsed)}` },
-    { value: cached, total: metrics.memory.total_bytes, color: '#71717A', label: `Cache: ${formatBytes(cached)}` },
-    { value: free, total: metrics.memory.total_bytes, color: '#27272A', label: `Free: ${formatBytes(free)}` },
+    { value: gpuUsed, total: nodeMetrics.memory.total_bytes, color: '#76B900', label: `GPU: ${formatBytes(gpuUsed)}` },
+    { value: cpuUsed, total: nodeMetrics.memory.total_bytes, color: '#3B82F6', label: `CPU: ${formatBytes(cpuUsed)}` },
+    { value: cached, total: nodeMetrics.memory.total_bytes, color: '#71717A', label: `Cache: ${formatBytes(cached)}` },
+    { value: free, total: nodeMetrics.memory.total_bytes, color: '#27272A', label: `Free: ${formatBytes(free)}` },
   ]
 
   // Un-indexed events apply to all GPUs; indexed events only to their GPU.
@@ -184,6 +208,33 @@ export function Dashboard({
 
       {/* ── Hardware Overview — fills the rest of the viewport ── */}
         <div className="bg-[#0a0a0d]/80 rounded-xl border border-white/[0.03] p-1 lg:p-1.5 2xl:p-2 flex flex-col md:flex-1 md:min-h-0">
+          {/* Multi-node overview: no node drilled in → show the node grid.
+              When a node is selected, the hardware cards below render from
+              that node's snapshot with a back button to return here. */}
+          {multiNode && selectedNode === null ? (
+            <div className="flex-1 min-h-0 flex flex-col">
+              <NodeOverview nodes={nodes!} onSelect={(i) => onNodeSelect?.(i)} />
+            </div>
+          ) : (
+          <>
+          {multiNode && selectedNode !== null && (
+            <div className="shrink-0 flex items-center gap-2 mb-1 lg:mb-1.5">
+              <button
+                type="button"
+                onClick={() => onNodeSelect?.(null)}
+                aria-label={`Back to node overview`}
+                className="shrink-0 w-7 h-7 rounded-full bg-[#151519] border border-white/[0.06] flex items-center justify-center cursor-pointer transition-colors duration-150 hover:border-[#76B900]/30"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-zinc-300">
+                  <path d="M19 12H5" />
+                  <path d="M12 19l-7-7 7-7" />
+                </svg>
+              </button>
+              <span className="text-[11px] lg:text-xs font-semibold text-zinc-200 truncate">
+                {drilledNode?.hostname ?? `Node ${selectedNode}`}
+              </span>
+            </div>
+          )}
           {multiGpu && (
             <div role="group" aria-label="GPU selector" className="shrink-0 grid grid-cols-2 lg:grid-cols-4 gap-1 lg:gap-1.5 mb-1 lg:mb-1.5">
               {gpus.map((gpu) => {
@@ -294,18 +345,18 @@ export function Dashboard({
           </HwCard>
 
           {/* CPU */}
-          <HwCard title="CPU" subtitle={metrics.cpu.name ?? undefined}>
+          <HwCard title="CPU" subtitle={nodeMetrics.cpu.name ?? undefined}>
             {compact ? (
-              <HBar value={metrics.cpu.aggregate_percent} label="CPU" unit="%" thresholds={THRESHOLDS.cpuUsage} />
+              <HBar value={nodeMetrics.cpu.aggregate_percent} label="CPU" unit="%" thresholds={THRESHOLDS.cpuUsage} />
             ) : (
               <div className="flex items-center gap-2 min-w-0 min-h-0 flex-1 overflow-hidden">
-                <ArcGauge value={metrics.cpu.aggregate_percent} label="CPU" unit="%" thresholds={THRESHOLDS.cpuUsage} size={HW_GAUGE_PX} />
+                <ArcGauge value={nodeMetrics.cpu.aggregate_percent} label="CPU" unit="%" thresholds={THRESHOLDS.cpuUsage} size={HW_GAUGE_PX} />
                 <div className="flex-1 min-w-0">
                   <TimeSeriesChart data={history.getChartData('cpuAggregate')} yDomain={[0, 100]} unit="%" height={HW_CHART_HEIGHT} />
                 </div>
               </div>
             )}
-            {!compact && metrics.cpu.per_core.length > 0 && <CoreHeatmap cores={metrics.cpu.per_core} />}
+            {!compact && nodeMetrics.cpu.per_core.length > 0 && <CoreHeatmap cores={nodeMetrics.cpu.per_core} />}
           </HwCard>
 
           {/* Memory */}
@@ -320,16 +371,16 @@ export function Dashboard({
           </HwCard>
 
           {/* Disk I/O */}
-          <HwCard title="Disk I/O" subtitle={metrics.disk.name ?? undefined}>
+          <HwCard title="Disk I/O" subtitle={nodeMetrics.disk.name ?? undefined}>
             {compact ? (
               <div className="flex items-baseline justify-between gap-2 min-w-0 font-mono">
                 <span className="flex items-baseline gap-1 min-w-0">
                   <span className="text-[9px] lg:text-[10px] text-zinc-500">R</span>
-                  <span className="text-xs lg:text-sm font-bold text-zinc-100 tabular-nums truncate">{formatRate(metrics.disk.read_bytes_per_sec)}</span>
+                  <span className="text-xs lg:text-sm font-bold text-zinc-100 tabular-nums truncate">{formatRate(nodeMetrics.disk.read_bytes_per_sec)}</span>
                 </span>
                 <span className="flex items-baseline gap-1 min-w-0">
                   <span className="text-[9px] lg:text-[10px] text-zinc-500">W</span>
-                  <span className="text-xs lg:text-sm font-bold text-zinc-100 tabular-nums truncate">{formatRate(metrics.disk.write_bytes_per_sec)}</span>
+                  <span className="text-xs lg:text-sm font-bold text-zinc-100 tabular-nums truncate">{formatRate(nodeMetrics.disk.write_bytes_per_sec)}</span>
                 </span>
               </div>
             ) : (
@@ -337,11 +388,11 @@ export function Dashboard({
                 <div className="flex flex-col items-center justify-center gap-0.5 shrink-0" style={{ width: HW_GAUGE_PX, height: HW_GAUGE_PX }}>
                   <div className="flex items-baseline gap-1">
                     <span className="text-[9px] 2xl:text-[10px] min-[1920px]:text-xs text-zinc-500">R</span>
-                    <span className="text-xs 2xl:text-sm min-[1920px]:text-base font-bold text-zinc-100 font-mono">{formatRate(metrics.disk.read_bytes_per_sec)}</span>
+                    <span className="text-xs 2xl:text-sm min-[1920px]:text-base font-bold text-zinc-100 font-mono">{formatRate(nodeMetrics.disk.read_bytes_per_sec)}</span>
                   </div>
                   <div className="flex items-baseline gap-1">
                     <span className="text-[9px] 2xl:text-[10px] min-[1920px]:text-xs text-zinc-500">W</span>
-                    <span className="text-xs 2xl:text-sm min-[1920px]:text-base font-bold text-zinc-100 font-mono">{formatRate(metrics.disk.write_bytes_per_sec)}</span>
+                    <span className="text-xs 2xl:text-sm min-[1920px]:text-base font-bold text-zinc-100 font-mono">{formatRate(nodeMetrics.disk.write_bytes_per_sec)}</span>
                   </div>
                 </div>
                 <div className="flex-1 min-w-0">
@@ -360,16 +411,16 @@ export function Dashboard({
           </HwCard>
 
           {/* Network I/O */}
-          <HwCard title="Network" subtitle={metrics.network.name ?? undefined}>
+          <HwCard title="Network" subtitle={nodeMetrics.network.name ?? undefined}>
             {compact ? (
               <div className="flex items-baseline justify-between gap-2 min-w-0 font-mono">
                 <span className="flex items-baseline gap-1 min-w-0">
                   <span className="text-[9px] lg:text-[10px] text-zinc-500">RX</span>
-                  <span className="text-xs lg:text-sm font-bold text-zinc-100 tabular-nums truncate">{formatRate(metrics.network.rx_bytes_per_sec)}</span>
+                  <span className="text-xs lg:text-sm font-bold text-zinc-100 tabular-nums truncate">{formatRate(nodeMetrics.network.rx_bytes_per_sec)}</span>
                 </span>
                 <span className="flex items-baseline gap-1 min-w-0">
                   <span className="text-[9px] lg:text-[10px] text-zinc-500">TX</span>
-                  <span className="text-xs lg:text-sm font-bold text-zinc-100 tabular-nums truncate">{formatRate(metrics.network.tx_bytes_per_sec)}</span>
+                  <span className="text-xs lg:text-sm font-bold text-zinc-100 tabular-nums truncate">{formatRate(nodeMetrics.network.tx_bytes_per_sec)}</span>
                 </span>
               </div>
             ) : (
@@ -377,11 +428,11 @@ export function Dashboard({
                 <div className="flex flex-col items-center justify-center gap-0.5 shrink-0" style={{ width: HW_GAUGE_PX, height: HW_GAUGE_PX }}>
                   <div className="flex items-baseline gap-1">
                     <span className="text-[9px] 2xl:text-[10px] min-[1920px]:text-xs text-zinc-500">RX</span>
-                    <span className="text-xs 2xl:text-sm min-[1920px]:text-base font-bold text-zinc-100 font-mono">{formatRate(metrics.network.rx_bytes_per_sec)}</span>
+                    <span className="text-xs 2xl:text-sm min-[1920px]:text-base font-bold text-zinc-100 font-mono">{formatRate(nodeMetrics.network.rx_bytes_per_sec)}</span>
                   </div>
                   <div className="flex items-baseline gap-1">
                     <span className="text-[9px] 2xl:text-[10px] min-[1920px]:text-xs text-zinc-500">TX</span>
-                    <span className="text-xs 2xl:text-sm min-[1920px]:text-base font-bold text-zinc-100 font-mono">{formatRate(metrics.network.tx_bytes_per_sec)}</span>
+                    <span className="text-xs 2xl:text-sm min-[1920px]:text-base font-bold text-zinc-100 font-mono">{formatRate(nodeMetrics.network.tx_bytes_per_sec)}</span>
                   </div>
                 </div>
                 <div className="flex-1 min-w-0">
@@ -400,6 +451,8 @@ export function Dashboard({
           </HwCard>
 
         </div>
+          </>
+          )}
       </div>
     </div>
   )

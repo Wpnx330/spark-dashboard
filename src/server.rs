@@ -14,6 +14,7 @@ use crate::history::HistoryDb;
 pub struct AppState {
     pub tx: broadcast::Sender<String>,
     pub history: HistoryDb,
+    pub node_snapshots: crate::nodes::NodeSnapshots,
 }
 
 #[derive(Embed)]
@@ -33,7 +34,9 @@ pub fn create_router(state: Arc<AppState>, enable_history: bool) -> Router {
         // Liveness probe for container HEALTHCHECK / orchestrators. Intentionally
         // dependency-free: it reports that the HTTP server is up, not that any
         // engine/GPU is healthy (that's surfaced over /ws).
-        .route("/healthz", get(healthz));
+        .route("/healthz", get(healthz))
+        // Aggregated snapshots from remote node agents (polled via --nodes).
+        .route("/api/nodes", get(nodes_handler));
 
     // History API — opt-in only.
     let router = if enable_history {
@@ -67,6 +70,12 @@ pub fn create_router(state: Arc<AppState>, enable_history: bool) -> Router {
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+/// Returns the latest snapshots from all polled remote nodes (if any).
+async fn nodes_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let snapshots = state.node_snapshots.read().await.clone();
+    Json(snapshots).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -373,7 +382,11 @@ mod tests {
     fn test_router(enable_history: bool) -> Router {
         let history = HistoryDb::open(":memory:").unwrap();
         let (tx, _rx) = broadcast::channel::<String>(16);
-        let state = Arc::new(AppState { tx, history });
+        let state = Arc::new(AppState {
+            tx,
+            history,
+            node_snapshots: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+        });
         create_router(state, enable_history)
     }
 
@@ -441,5 +454,25 @@ mod tests {
         let body: serde_json::Value = resp.json().await.expect("json body");
         // Empty in-memory DB has no data for a nonexistent engine.
         assert_eq!(body.get("error").and_then(|v| v.as_str()), Some("no data"));
+    }
+
+    /// `/api/nodes` returns a JSON array even when no nodes are configured.
+    #[tokio::test]
+    async fn nodes_endpoint_returns_empty_array() {
+        let app = test_router(false);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let resp = reqwest::get(format!("http://{addr}/api/nodes"))
+            .await
+            .expect("request to /api/nodes");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert!(body.is_array(), "expected a JSON array, got: {body}");
+        assert_eq!(body.as_array().unwrap().len(), 0);
     }
 }

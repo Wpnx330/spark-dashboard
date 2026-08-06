@@ -37,7 +37,7 @@ impl HistoryDb {
         })
     }
 
-    fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS settings (
@@ -135,6 +135,72 @@ impl HistoryDb {
             "DELETE FROM snapshots_1d WHERE COALESCE(total_prompt_tokens,0) > 10000000000000",
             [],
         )?;
+
+        // Add columns if they don't exist (SQLite has no IF NOT EXISTS for
+        // ALTER TABLE ADD COLUMN). Each check is guarded by PRAGMA table_info
+        // so existing databases are migrated without losing data.
+        let add_col =
+            |conn: &Connection, table: &str, col: &str, decl: &str| -> rusqlite::Result<()> {
+                let cols: Vec<String> = conn
+                    .prepare(&format!("PRAGMA table_info({})", table))?
+                    .query_map([], |r| r.get::<_, String>(1))?
+                    .filter_map(Result::ok)
+                    .collect();
+                if !cols.contains(&col.to_string()) {
+                    conn.execute_batch(&format!(
+                        "ALTER TABLE {} ADD COLUMN {} {}",
+                        table, col, decl
+                    ))?;
+                }
+                Ok(())
+            };
+        add_col(conn, "snapshots_1s", "preemptions_total", "INTEGER")?;
+        add_col(conn, "snapshots_1h", "kv_cache_pct_max", "REAL")?;
+        add_col(conn, "snapshots_1h", "preemptions_total", "INTEGER")?;
+        add_col(conn, "snapshots_1d", "kv_cache_pct_max", "REAL")?;
+        add_col(conn, "snapshots_1d", "preemptions_total", "INTEGER")?;
+
+        // One-time backfill: historical `power_watts` values were recorded
+        // from a single node's GPU(s) only. Now that multi-node monitoring is
+        // active, multiply every existing power value by the cluster size (4
+        // DGX nodes) so old data is comparable to the new total-cluster
+        // recordings. Guarded by the `power_backfill_done` settings key so it
+        // runs exactly once.
+        const CLUSTER_NODE_COUNT: f64 = 4.0;
+        let backfill_done: Option<String> = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'power_backfill_done'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .map(Some)
+            .or::<rusqlite::Error>(Ok(None))?;
+        if backfill_done.is_none() {
+            let updated_1s = conn.execute(
+                "UPDATE snapshots_1s SET power_watts = power_watts * ?1 \
+                 WHERE power_watts IS NOT NULL",
+                params![CLUSTER_NODE_COUNT],
+            )?;
+            let updated_1h = conn.execute(
+                "UPDATE snapshots_1h SET power_watts_sum = power_watts_sum * ?1 \
+                 WHERE power_watts_sum IS NOT NULL",
+                params![CLUSTER_NODE_COUNT],
+            )?;
+            let updated_1d = conn.execute(
+                "UPDATE snapshots_1d SET power_watts_sum = power_watts_sum * ?1 \
+                 WHERE power_watts_sum IS NOT NULL",
+                params![CLUSTER_NODE_COUNT],
+            )?;
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('power_backfill_done', ?1)",
+                params![CLUSTER_NODE_COUNT as i64],
+            )?;
+            info!(
+                "History backfill: multiplied power by {} for {} 1s + {} 1h + {} 1d rows",
+                CLUSTER_NODE_COUNT, updated_1s, updated_1h, updated_1d
+            );
+        }
+
         Ok(())
     }
 
@@ -209,6 +275,7 @@ impl HistoryDb {
         prefix_cache_hit: Option<f64>,
         cpu_util: Option<f64>,
         mem_used_pct: Option<f64>,
+        preemptions_total: Option<i64>,
     ) -> rusqlite::Result<()> {
         if !self.is_enabled() {
             return Ok(());
@@ -219,8 +286,8 @@ impl HistoryDb {
              (engine_key, ts, total_prompt_tokens, total_gen_tokens, total_requests,
               prompt_tps, decode_tps, ttft_ms, itl_ms, e2e_ms,
               power_watts, gpu_util, gpu_temp, active_requests, queued_requests,
-              kv_cache_pct, prefix_cache_hit, cpu_util, mem_used_pct)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+              kv_cache_pct, prefix_cache_hit, cpu_util, mem_used_pct, preemptions_total)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
             params![
                 engine_key,
                 ts,
@@ -241,6 +308,7 @@ impl HistoryDb {
                 prefix_cache_hit,
                 cpu_util,
                 mem_used_pct,
+                preemptions_total,
             ],
         )?;
         Ok(())
@@ -267,8 +335,8 @@ impl HistoryDb {
               power_watts_sum,
               gpu_util_avg, gpu_temp_avg, gpu_temp_max,
               active_requests_max, queued_requests_max,
-              kv_cache_pct_avg, prefix_cache_hit_avg,
-              cpu_util_avg, sample_count)
+              kv_cache_pct_avg, kv_cache_pct_max, prefix_cache_hit_avg,
+              cpu_util_avg, sample_count, preemptions_total)
              SELECT
                engine_key, (ts / 3600000) * 3600000,
                SUM(COALESCE(total_prompt_tokens,0)), SUM(COALESCE(total_gen_tokens,0)),
@@ -278,8 +346,8 @@ impl HistoryDb {
                SUM(power_watts),
                AVG(gpu_util), AVG(gpu_temp), MAX(gpu_temp),
                MAX(active_requests), MAX(queued_requests),
-               AVG(kv_cache_pct), AVG(prefix_cache_hit),
-               AVG(cpu_util), COUNT(*)
+               AVG(kv_cache_pct), MAX(kv_cache_pct), AVG(prefix_cache_hit),
+               AVG(cpu_util), COUNT(*), MAX(preemptions_total)
              FROM snapshots_1s
              WHERE ts < ?1
              GROUP BY engine_key, (ts / 3600000)
@@ -317,8 +385,8 @@ impl HistoryDb {
               power_watts_sum,
               gpu_util_avg, gpu_temp_avg, gpu_temp_max,
               active_requests_max, queued_requests_max,
-              kv_cache_pct_avg, prefix_cache_hit_avg,
-              cpu_util_avg, sample_count)
+              kv_cache_pct_avg, kv_cache_pct_max, prefix_cache_hit_avg,
+              cpu_util_avg, sample_count, preemptions_total)
              SELECT
                engine_key, (bucket_ts / 86400000) * 86400000,
                SUM(COALESCE(total_prompt_tokens,0)), SUM(COALESCE(total_gen_tokens,0)),
@@ -328,8 +396,8 @@ impl HistoryDb {
                SUM(power_watts_sum),
                AVG(gpu_util_avg), AVG(gpu_temp_avg), MAX(gpu_temp_max),
                MAX(active_requests_max), MAX(queued_requests_max),
-               AVG(kv_cache_pct_avg), AVG(prefix_cache_hit_avg),
-               AVG(cpu_util_avg), SUM(sample_count)
+               AVG(kv_cache_pct_avg), MAX(kv_cache_pct_max), AVG(prefix_cache_hit_avg),
+               AVG(cpu_util_avg), SUM(sample_count), MAX(preemptions_total)
              FROM snapshots_1h
              WHERE bucket_ts < ?1
              GROUP BY engine_key, (bucket_ts / 86400000)
@@ -389,7 +457,10 @@ impl HistoryDb {
                        MAX(active_requests),
                        MAX(queued_requests),
                        SUM(power_watts),
-                       COUNT(*)
+                       COUNT(*),
+                       MAX(kv_cache_pct),
+                       AVG(kv_cache_pct),
+                       MAX(preemptions_total)
                      FROM {}
                       WHERE engine_key = ?1 AND {} >= ?2 AND {} <= ?3",
                     table, ts_col, ts_col,
@@ -407,7 +478,10 @@ impl HistoryDb {
                         MAX(active_requests{}),
                         MAX(queued_requests{}),
                         SUM(power_watts{}),
-                        SUM(sample_count)
+                        SUM(sample_count),
+                        MAX(kv_cache_pct_max),
+                        SUM(kv_cache_pct_avg * sample_count) / NULLIF(SUM(sample_count), 0),
+                        MAX(preemptions_total)
                       FROM {}
                       WHERE engine_key = ?1 AND {} >= ?2 AND {} <= ?3",
                      gauge_suffix, gauge_suffix, power_suffix, table, ts_col, ts_col,
@@ -424,6 +498,9 @@ impl HistoryDb {
                 let peak_queued: i64 = r.get::<_, Option<i64>>(6)?.unwrap_or(0);
                 let power_sum: f64 = r.get::<_, Option<f64>>(7)?.unwrap_or(0.0);
                 let count: i64 = r.get::<_, Option<i64>>(8)?.unwrap_or(0);
+                let peak_kv_cache_pct: Option<f64> = r.get::<_, Option<f64>>(9)?;
+                let avg_kv_cache_pct: Option<f64> = r.get::<_, Option<f64>>(10)?;
+                let total_preemptions: Option<i64> = r.get::<_, Option<i64>>(11)?;
                 Ok(HistorySummary {
                     delta_prompt_tokens: delta_prompt,
                     delta_gen_tokens: delta_gen,
@@ -432,6 +509,9 @@ impl HistoryDb {
                     avg_prompt_tps: avg_prompt,
                     peak_active_requests: peak_active,
                     peak_queued_requests: peak_queued,
+                    peak_kv_cache_pct,
+                    avg_kv_cache_pct,
+                    total_preemptions,
                     power_kwh: power_sum / 3600.0 / 1000.0,
                     total_seconds: Some(count as f64),
                     source_table: source,
@@ -500,6 +580,12 @@ pub struct HistorySummary {
     pub peak_active_requests: i64,
     pub peak_queued_requests: i64,
     pub total_requests: i64,
+    /// Peak KV cache utilization (%) over the window.
+    pub peak_kv_cache_pct: Option<f64>,
+    /// Average KV cache utilization (%) over the window.
+    pub avg_kv_cache_pct: Option<f64>,
+    /// Latest cumulative preemption count over the window.
+    pub total_preemptions: Option<i64>,
     /// Total energy consumption in kilowatt-hours.
     pub power_kwh: f64,
     /// Total seconds represented by the data (for calculating hours alive).
@@ -553,7 +639,8 @@ mod tests {
                 kv_cache_pct       REAL,
                 prefix_cache_hit   REAL,
                 cpu_util           REAL,
-                mem_used_pct       REAL
+                mem_used_pct       REAL,
+                preemptions_total  INTEGER
             );
             CREATE TABLE IF NOT EXISTS snapshots_1h (
                 engine_key          TEXT NOT NULL,
@@ -575,9 +662,11 @@ mod tests {
                 active_requests_max INTEGER,
                 queued_requests_max INTEGER,
                 kv_cache_pct_avg    REAL,
+                kv_cache_pct_max    REAL,
                 prefix_cache_hit_avg REAL,
                 cpu_util_avg        REAL,
                 sample_count        INTEGER NOT NULL,
+                preemptions_total   INTEGER,
                 UNIQUE(engine_key, bucket_ts)
             );
             CREATE TABLE IF NOT EXISTS snapshots_1d (
@@ -600,9 +689,11 @@ mod tests {
                 active_requests_max INTEGER,
                 queued_requests_max INTEGER,
                 kv_cache_pct_avg    REAL,
+                kv_cache_pct_max    REAL,
                 prefix_cache_hit_avg REAL,
                 cpu_util_avg        REAL,
-                sample_count        INTEGER NOT NULL
+                sample_count        INTEGER NOT NULL,
+                preemptions_total   INTEGER
             );
         ",
         )
@@ -640,6 +731,7 @@ mod tests {
             Some(0.1),
             Some(60.0),
             Some(50.0),
+            Some(3),
         )
         .await
         .unwrap();
@@ -652,6 +744,7 @@ mod tests {
         assert_eq!(s.total_requests, 5);
         assert_eq!(s.source_table, "raw");
         assert!(s.power_kwh > 0.0);
+        assert_eq!(s.total_preemptions, Some(3));
     }
 
     #[tokio::test]
@@ -687,6 +780,7 @@ mod tests {
             key,
             now,
             Some(100),
+            None,
             None,
             None,
             None,
@@ -739,6 +833,7 @@ mod tests {
             Some(0.05),
             Some(55.0),
             Some(45.0),
+            Some(0),
         )
         .await
         .unwrap();
@@ -762,6 +857,7 @@ mod tests {
             Some(0.06),
             Some(58.0),
             Some(48.0),
+            Some(2),
         )
         .await
         .unwrap();
@@ -785,6 +881,7 @@ mod tests {
             Some(0.04),
             Some(60.0),
             Some(50.0),
+            Some(5),
         )
         .await
         .unwrap();
@@ -798,6 +895,11 @@ mod tests {
         let s = summary.unwrap();
         assert_eq!(s.source_table, "hourly");
         assert_eq!(s.total_requests, 9, "should sum all requests: 2+3+4");
+        assert_eq!(
+            s.total_preemptions,
+            Some(5),
+            "MAX of cumulative preemptions"
+        );
     }
 
     #[tokio::test]
@@ -836,6 +938,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -845,6 +948,7 @@ mod tests {
             Some(30),
             Some(40),
             Some(2),
+            None,
             None,
             None,
             None,
@@ -874,5 +978,93 @@ mod tests {
             s.delta_prompt_tokens, 30,
             "only the newer row should remain"
         );
+    }
+
+    /// The one-time power backfill migration should multiply all existing
+    /// power values by the cluster size (4) when it runs, and be idempotent
+    /// on subsequent runs (guarded by the `power_backfill_done` settings key).
+    #[tokio::test]
+    async fn test_power_backfill_multiplies_and_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+            .unwrap();
+        // First migrate creates the schema and runs the backfill (which is a
+        // no-op on an empty DB but still marks `power_backfill_done`).
+        HistoryDb::migrate(&conn).unwrap();
+
+        // Simulate pre-existing data recorded before the backfill: clear the
+        // marker, insert rows with known power values, then re-run migrate.
+        conn.execute("DELETE FROM settings WHERE key = 'power_backfill_done'", [])
+            .unwrap();
+        // Insert a 1s row with a known power value.
+        conn.execute(
+            "INSERT INTO snapshots_1s (engine_key, ts, power_watts) VALUES ('e1', 1000, 100.0)",
+            [],
+        )
+        .unwrap();
+        // Insert a 1h row with a known power_watts_sum.
+        conn.execute(
+            "INSERT INTO snapshots_1h (engine_key, bucket_ts, power_watts_sum, sample_count) \
+             VALUES ('e1', 3600000, 200.0, 60)",
+            [],
+        )
+        .unwrap();
+        // Insert a 1d row with a known power_watts_sum.
+        conn.execute(
+            "INSERT INTO snapshots_1d (engine_key, bucket_ts, power_watts_sum, sample_count) \
+             VALUES ('e1', 86400000, 300.0, 1440)",
+            [],
+        )
+        .unwrap();
+
+        // Run migrate again — this time the backfill should fire on the data.
+        HistoryDb::migrate(&conn).unwrap();
+
+        // All power values should be multiplied by 4.
+        let p1s: f64 = conn
+            .query_row(
+                "SELECT power_watts FROM snapshots_1s WHERE engine_key='e1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(p1s, 400.0, "1s power should be 100 * 4");
+        let p1h: f64 = conn
+            .query_row(
+                "SELECT power_watts_sum FROM snapshots_1h WHERE engine_key='e1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(p1h, 800.0, "1h power should be 200 * 4");
+        let p1d: f64 = conn
+            .query_row(
+                "SELECT power_watts_sum FROM snapshots_1d WHERE engine_key='e1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(p1d, 1200.0, "1d power should be 300 * 4");
+
+        // The settings key should be set.
+        let done: String = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key='power_backfill_done'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(done, "4");
+
+        // Run migrate a third time — should NOT multiply again.
+        HistoryDb::migrate(&conn).unwrap();
+        let p1s_again: f64 = conn
+            .query_row(
+                "SELECT power_watts FROM snapshots_1s WHERE engine_key='e1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(p1s_again, 400.0, "backfill must be idempotent");
     }
 }
