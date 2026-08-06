@@ -358,13 +358,19 @@ impl HistoryDb {
         let now_ms = chrono_now_ms();
         let current_hour_start = (now_ms / 3_600_000) * 3_600_000;
 
-        // Roll up every complete hour that has data
+        // Roll up every complete hour that has data. The latency columns
+        // (ttft_ms_p95, itl_ms_p95, e2e_ms_p95) use AVG() as an approximation
+        // of the p95 since SQLite has no built-in PERCENTILE. The column
+        // names are kept for API/metrics-contract compatibility. ON CONFLICT
+        // DO UPDATE for the five latency columns so existing rows are
+        // backfilled when new 1s data arrives in a subsequent rollup run.
         let rows = db.execute(
-            "INSERT OR IGNORE INTO snapshots_1h
+            "INSERT INTO snapshots_1h
              (engine_key, bucket_ts,
               total_prompt_tokens, total_gen_tokens, total_requests,
               prompt_tps_avg, prompt_tps_max,
               decode_tps_avg, decode_tps_max,
+              ttft_ms_p95, itl_ms_p95, e2e_ms_p95,
               power_watts_sum,
               gpu_util_avg, gpu_temp_avg, gpu_temp_max,
               active_requests_max, queued_requests_max,
@@ -377,6 +383,7 @@ impl HistoryDb {
                SUM(COALESCE(total_requests,0)),
                AVG(prompt_tps), MAX(prompt_tps),
                AVG(decode_tps), MAX(decode_tps),
+               AVG(ttft_ms), AVG(itl_ms), AVG(e2e_ms),
                SUM(power_watts),
                AVG(gpu_util), AVG(gpu_temp), MAX(gpu_temp),
                MAX(active_requests), MAX(queued_requests),
@@ -386,7 +393,12 @@ impl HistoryDb {
              FROM snapshots_1s
              WHERE ts < ?1
              GROUP BY engine_key, (ts / 3600000)
-             ON CONFLICT(engine_key, bucket_ts) DO NOTHING",
+             ON CONFLICT(engine_key, bucket_ts) DO UPDATE SET
+               ttft_ms_p95 = excluded.ttft_ms_p95,
+               itl_ms_p95 = excluded.itl_ms_p95,
+               e2e_ms_p95 = excluded.e2e_ms_p95,
+               queue_time_ms_avg = excluded.queue_time_ms_avg,
+               tpot_ms_avg = excluded.tpot_ms_avg",
             params![current_hour_start],
         )?;
 
@@ -411,12 +423,17 @@ impl HistoryDb {
         let now_ms = chrono_now_ms();
         let current_day_start = (now_ms / 86_400_000) * 86_400_000;
 
+        // Same latency-column + ON CONFLICT DO UPDATE pattern as the 1s→1h
+        // rollup. The 1h table stores ttft_ms_p95/itl_ms_p95/e2e_ms_p95
+        // (AVG approximation) and queue_time_ms_avg/tpot_ms_avg; we average
+        // them across hours for the daily bucket.
         let rows = db.execute(
-            "INSERT OR IGNORE INTO snapshots_1d
+            "INSERT INTO snapshots_1d
              (engine_key, bucket_ts,
               total_prompt_tokens, total_gen_tokens, total_requests,
               prompt_tps_avg, prompt_tps_max,
               decode_tps_avg, decode_tps_max,
+              ttft_ms_p95, itl_ms_p95, e2e_ms_p95,
               power_watts_sum,
               gpu_util_avg, gpu_temp_avg, gpu_temp_max,
               active_requests_max, queued_requests_max,
@@ -429,6 +446,7 @@ impl HistoryDb {
                SUM(COALESCE(total_requests,0)),
                AVG(prompt_tps_avg), MAX(prompt_tps_max),
                AVG(decode_tps_avg), MAX(decode_tps_max),
+               AVG(ttft_ms_p95), AVG(itl_ms_p95), AVG(e2e_ms_p95),
                SUM(power_watts_sum),
                AVG(gpu_util_avg), AVG(gpu_temp_avg), MAX(gpu_temp_max),
                MAX(active_requests_max), MAX(queued_requests_max),
@@ -438,7 +456,12 @@ impl HistoryDb {
              FROM snapshots_1h
              WHERE bucket_ts < ?1
              GROUP BY engine_key, (bucket_ts / 86400000)
-             ON CONFLICT(engine_key, bucket_ts) DO NOTHING",
+             ON CONFLICT(engine_key, bucket_ts) DO UPDATE SET
+               ttft_ms_p95 = excluded.ttft_ms_p95,
+               itl_ms_p95 = excluded.itl_ms_p95,
+               e2e_ms_p95 = excluded.e2e_ms_p95,
+               queue_time_ms_avg = excluded.queue_time_ms_avg,
+               tpot_ms_avg = excluded.tpot_ms_avg",
             params![current_day_start],
         )?;
 
@@ -799,6 +822,43 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
 
+    /// (ttft_ms_p95, itl_ms_p95, e2e_ms_p95, queue_time_ms_avg, tpot_ms_avg)
+    type LatencyRow = (
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+    );
+
+    /// Read the five latency columns from a rollup table for one engine row.
+    fn read_latency(
+        conn: &Connection,
+        table: &str,
+        engine_key: &str,
+        bucket_ts: Option<i64>,
+    ) -> LatencyRow {
+        let sql = match bucket_ts {
+            Some(_) => format!(
+                "SELECT ttft_ms_p95, itl_ms_p95, e2e_ms_p95, queue_time_ms_avg, tpot_ms_avg \
+                 FROM {table} WHERE engine_key = ?1 AND bucket_ts = ?2"
+            ),
+            None => format!(
+                "SELECT ttft_ms_p95, itl_ms_p95, e2e_ms_p95, queue_time_ms_avg, tpot_ms_avg \
+                 FROM {table} WHERE engine_key = ?1"
+            ),
+        };
+        let mapper = |r: &rusqlite::Row| -> rusqlite::Result<LatencyRow> {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        };
+        match bucket_ts {
+            Some(b) => conn
+                .query_row(&sql, params![engine_key, b], mapper)
+                .unwrap(),
+            None => conn.query_row(&sql, params![engine_key], mapper).unwrap(),
+        }
+    }
+
     /// Open an in-memory database for testing (skipping file I/O).
     fn test_db() -> HistoryDb {
         // We bypass HistoryDb::open and manually construct from an in-memory conn.
@@ -893,6 +953,7 @@ mod tests {
                 queue_time_ms_avg   REAL,
                 tpot_ms_avg         REAL
             );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_1d_unique ON snapshots_1d(engine_key, bucket_ts);
         ",
         )
         .unwrap();
@@ -1644,5 +1705,246 @@ mod tests {
             .unwrap();
         assert_eq!(points.len(), 1);
         assert_eq!(points[0].value, 5.0, "sum of 2+3 = 5");
+    }
+
+    // -----------------------------------------------------------------
+    // rollup latency column tests
+    // -----------------------------------------------------------------
+
+    /// Insert 1s rows with latency values, run rollup, and verify the 1h
+    /// table has non-NULL latency columns (ttft_ms_p95, itl_ms_p95,
+    /// e2e_ms_p95, queue_time_ms_avg, tpot_ms_avg).
+    #[tokio::test]
+    async fn test_rollup_1s_to_1h_populates_latency_columns() {
+        let db = test_db();
+        let key = "lat-engine";
+        // Two samples in the same completed hour, 3 hours ago.
+        let hour = (chrono_now_ms() / 3_600_000) * 3_600_000 - 10_800_000;
+
+        for (i, (ttft, itl, e2e, qt, tpot)) in [
+            (100.0, 10.0, 500.0, 5.0, 30.0),
+            (200.0, 20.0, 600.0, 15.0, 40.0),
+        ]
+        .iter()
+        .enumerate()
+        {
+            db.insert_1s(
+                key,
+                hour + 1000 * (i as i64 + 1),
+                Some(50),
+                Some(100),
+                Some(2),
+                Some(40.0),
+                Some(25.0),
+                Some(*ttft),
+                Some(*itl),
+                Some(*e2e),
+                Some(100.0),
+                Some(70.0),
+                Some(40.0),
+                Some(2),
+                Some(0),
+                Some(0.5),
+                Some(0.05),
+                Some(55.0),
+                Some(45.0),
+                Some(0),
+                Some(*qt),
+                Some(*tpot),
+            )
+            .await
+            .unwrap();
+        }
+
+        let rolled = db.rollup_1s_to_1h().await.unwrap();
+        assert!(rolled >= 1, "should roll up at least 1 hour bucket");
+
+        // Read the latency columns directly from snapshots_1h.
+        let conn = db.inner.lock().await;
+        let (ttft, itl, e2e, qt, tpot) = read_latency(&conn, "snapshots_1h", key, None);
+        drop(conn);
+
+        // AVG(100, 200) = 150
+        assert!(ttft.is_some(), "ttft_ms_p95 should not be NULL");
+        assert!((ttft.unwrap() - 150.0).abs() < f64::EPSILON, "ttft avg");
+        // AVG(10, 20) = 15
+        assert!(itl.is_some(), "itl_ms_p95 should not be NULL");
+        assert!((itl.unwrap() - 15.0).abs() < f64::EPSILON, "itl avg");
+        // AVG(500, 600) = 550
+        assert!(e2e.is_some(), "e2e_ms_p95 should not be NULL");
+        assert!((e2e.unwrap() - 550.0).abs() < f64::EPSILON, "e2e avg");
+        // AVG(5, 15) = 10
+        assert!(qt.is_some(), "queue_time_ms_avg should not be NULL");
+        assert!((qt.unwrap() - 10.0).abs() < f64::EPSILON, "queue_time avg");
+        // AVG(30, 40) = 35
+        assert!(tpot.is_some(), "tpot_ms_avg should not be NULL");
+        assert!((tpot.unwrap() - 35.0).abs() < f64::EPSILON, "tpot avg");
+    }
+
+    /// Verify ON CONFLICT DO UPDATE updates existing latency rows. Insert a
+    /// 1h row with NULL latency, run rollup with latency data, and confirm
+    /// the row is backfilled rather than ignored.
+    #[tokio::test]
+    async fn test_rollup_1s_to_1h_updates_existing_latency() {
+        let db = test_db();
+        let key = "upd-engine";
+        let hour = (chrono_now_ms() / 3_600_000) * 3_600_000 - 10_800_000;
+
+        // Pre-insert an hourly row with NULL latency columns (simulating a
+        // row created by the old INSERT OR IGNORE rollup).
+        {
+            let conn = db.inner.lock().await;
+            conn.execute(
+                "INSERT INTO snapshots_1h \
+                 (engine_key, bucket_ts, total_prompt_tokens, total_gen_tokens, \
+                  total_requests, prompt_tps_avg, decode_tps_avg, sample_count) \
+                 VALUES (?1, ?2, 0, 0, 0, 0.0, 0.0, 1)",
+                params![key, hour],
+            )
+            .unwrap();
+            // Confirm it's NULL before rollup.
+            let qt: Option<f64> = conn
+                .query_row(
+                    "SELECT queue_time_ms_avg FROM snapshots_1h WHERE engine_key=?1 AND bucket_ts=?2",
+                    params![key, hour],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(qt.is_none(), "precondition: latency should be NULL");
+        }
+
+        // Insert 1s latency data for the same hour.
+        db.insert_1s(
+            key,
+            hour + 1000,
+            Some(10),
+            Some(20),
+            Some(1),
+            Some(40.0),
+            Some(25.0),
+            Some(88.0),
+            Some(8.0),
+            Some(400.0),
+            Some(100.0),
+            Some(70.0),
+            Some(40.0),
+            Some(2),
+            Some(0),
+            Some(0.5),
+            Some(0.05),
+            Some(55.0),
+            Some(45.0),
+            Some(0),
+            Some(12.0),
+            Some(33.0),
+        )
+        .await
+        .unwrap();
+
+        let rolled = db.rollup_1s_to_1h().await.unwrap();
+        // ON CONFLICT DO UPDATE counts as 1 affected row in SQLite.
+        assert!(rolled >= 1, "rollup should update the existing row");
+
+        let conn = db.inner.lock().await;
+        let (ttft, itl, e2e, qt, tpot) = read_latency(&conn, "snapshots_1h", key, Some(hour));
+        drop(conn);
+
+        assert!(ttft.is_some() && (ttft.unwrap() - 88.0).abs() < f64::EPSILON);
+        assert!(itl.is_some() && (itl.unwrap() - 8.0).abs() < f64::EPSILON);
+        assert!(e2e.is_some() && (e2e.unwrap() - 400.0).abs() < f64::EPSILON);
+        assert!(qt.is_some() && (qt.unwrap() - 12.0).abs() < f64::EPSILON);
+        assert!(tpot.is_some() && (tpot.unwrap() - 33.0).abs() < f64::EPSILON);
+    }
+
+    /// Verify rollup_1h_to_1d populates latency columns from the 1h table and
+    /// uses ON CONFLICT DO UPDATE for existing daily rows.
+    #[tokio::test]
+    async fn test_rollup_1h_to_1d_populates_and_updates_latency() {
+        let db = test_db();
+        let key = "day-engine";
+        // Use a fixed day 2 days ago so it's a "complete" day.
+        let now = chrono_now_ms();
+        let day_start = (now / 86_400_000) * 86_400_000 - 86_400_000; // yesterday start
+        let hour1 = day_start + 3_600_000;
+        let hour2 = day_start + 7_200_000;
+
+        {
+            let conn = db.inner.lock().await;
+            // Insert two hourly rows with latency values.
+            for (bucket, ttft, itl, e2e, qt, tpot) in [
+                (hour1, 100.0, 10.0, 500.0, 5.0, 30.0),
+                (hour2, 200.0, 20.0, 600.0, 15.0, 40.0),
+            ] {
+                conn.execute(
+                    "INSERT INTO snapshots_1h \
+                     (engine_key, bucket_ts, total_prompt_tokens, total_gen_tokens, \
+                      total_requests, prompt_tps_avg, decode_tps_avg, sample_count, \
+                      ttft_ms_p95, itl_ms_p95, e2e_ms_p95, queue_time_ms_avg, tpot_ms_avg) \
+                     VALUES (?1, ?2, 10, 20, 1, 40.0, 25.0, 60, ?3, ?4, ?5, ?6, ?7)",
+                    params![key, bucket, ttft, itl, e2e, qt, tpot],
+                )
+                .unwrap();
+            }
+        }
+
+        let rolled = db.rollup_1h_to_1d().await.unwrap();
+        assert!(rolled >= 1, "should roll up at least 1 day bucket");
+
+        // Read latency columns from snapshots_1d.
+        let conn = db.inner.lock().await;
+        let (ttft, itl, e2e, qt, tpot) = read_latency(&conn, "snapshots_1d", key, None);
+        drop(conn);
+
+        // AVG(100, 200) = 150
+        assert!(
+            ttft.is_some() && (ttft.unwrap() - 150.0).abs() < f64::EPSILON,
+            "1d ttft avg"
+        );
+        assert!(
+            itl.is_some() && (itl.unwrap() - 15.0).abs() < f64::EPSILON,
+            "1d itl avg"
+        );
+        assert!(
+            e2e.is_some() && (e2e.unwrap() - 550.0).abs() < f64::EPSILON,
+            "1d e2e avg"
+        );
+        assert!(
+            qt.is_some() && (qt.unwrap() - 10.0).abs() < f64::EPSILON,
+            "1d queue avg"
+        );
+        assert!(
+            tpot.is_some() && (tpot.unwrap() - 35.0).abs() < f64::EPSILON,
+            "1d tpot avg"
+        );
+
+        // Now update the hourly data with new latency values and re-rollup.
+        // ON CONFLICT DO UPDATE should refresh the daily row.
+        {
+            let conn = db.inner.lock().await;
+            conn.execute(
+                "UPDATE snapshots_1h SET ttft_ms_p95 = 999.0 \
+                 WHERE engine_key = ?1 AND bucket_ts = ?2",
+                params![key, hour1],
+            )
+            .unwrap();
+        }
+
+        db.rollup_1h_to_1d().await.unwrap();
+
+        let conn = db.inner.lock().await;
+        let ttft: f64 = conn
+            .query_row(
+                "SELECT ttft_ms_p95 FROM snapshots_1d WHERE engine_key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        // AVG(999, 200) = 599.5
+        assert!(
+            (ttft - 599.5).abs() < 0.01,
+            "daily ttft should be updated to AVG(999,200)=599.5, got {}",
+            ttft
+        );
     }
 }

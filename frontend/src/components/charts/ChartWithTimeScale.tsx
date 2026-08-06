@@ -213,6 +213,10 @@ export function ChartWithTimeScale({
           hideTooltipLabel={hideTooltipLabel}
           tooltipLabel={tooltipLabel}
           seriesLabel={seriesLabel}
+          // 1m → 60 points (1/sec), 5m → 300 points (1/sec). Without this,
+          // TimeSeriesChart defaults to maxPoints=60 and downsamples 5m to 60,
+          // making 1m and 5m look identical.
+          maxPoints={scale === '5m' ? 300 : 60}
           events={events}
           requests={requests}
         />
