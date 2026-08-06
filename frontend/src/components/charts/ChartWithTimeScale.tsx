@@ -309,6 +309,7 @@ export function ChartWithTimeScale({
           hideTooltipLabel={hideTooltipLabel}
           tooltipLabel={tooltipLabel}
           seriesLabel={seriesLabel}
+          maxPoints={scale === '1h' ? 360 : 240}
           // No events/requests in history mode — they're real-time only.
         />
       )}

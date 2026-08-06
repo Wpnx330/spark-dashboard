@@ -69,6 +69,12 @@ interface TimeSeriesChartProps {
    * renders its own label row.
    */
   compact?: boolean
+  /**
+   * Maximum data points to render. Data exceeding this is evenly
+   * downsampled across the full time range. Defaults to 60 (buffer mode).
+   * Set higher for history views (e.g. 360 for 1h at 10s resolution).
+   */
+  maxPoints?: number
 }
 
 function formatTime(timestamp: number): string {
@@ -90,20 +96,39 @@ function eventStrokeColor(type: string): string {
 // number of commands, enabling smooth CSS `d` transitions between frames.
 const CHART_POINTS = 60
 
-function padData(data: DataPoint[]): DataPoint[] {
+function padData(data: DataPoint[], maxPoints = CHART_POINTS): DataPoint[] {
   if (data.length === 0) return []
-  if (data.length >= CHART_POINTS) return data.slice(-CHART_POINTS)
 
-  const first = data[0]
-  const interval = data.length > 1 ? data[1].timestamp - data[0].timestamp : 1000
-  const padding = Array.from(
-    { length: CHART_POINTS - data.length },
-    (_, i) => ({
-      timestamp: first.timestamp - (CHART_POINTS - data.length - i) * interval,
-      value: first.value,
-    }),
-  )
-  return [...padding, ...data]
+  // When we have more points than maxPoints, downsample evenly across the
+  // full time range so the chart shows the entire span (not just the tail).
+  if (data.length > maxPoints) {
+    const stride = Math.ceil(data.length / maxPoints)
+    const sampled: DataPoint[] = []
+    for (let i = 0; i < data.length; i += stride) {
+      sampled.push(data[i])
+    }
+    // Always include the last point so the right edge is accurate
+    if (sampled[sampled.length - 1] !== data[data.length - 1]) {
+      sampled.push(data[data.length - 1])
+    }
+    return sampled
+  }
+
+  // Pad up to maxPoints for smooth CSS path transitions (buffer mode)
+  if (data.length < maxPoints) {
+    const first = data[0]
+    const interval = data.length > 1 ? data[1].timestamp - data[0].timestamp : 1000
+    const padding = Array.from(
+      { length: maxPoints - data.length },
+      (_, i) => ({
+        timestamp: first.timestamp - (maxPoints - data.length - i) * interval,
+        value: first.value,
+      }),
+    )
+    return [...padding, ...data]
+  }
+
+  return data
 }
 
 /**
@@ -112,9 +137,10 @@ function padData(data: DataPoint[]): DataPoint[] {
  */
 function mergeSeries(
   seriesList: ChartSeries[],
+  maxPoints = CHART_POINTS,
 ): Array<Record<string, number>> {
   // Pad each series individually
-  const paddedAll = seriesList.map((s) => padData(s.data))
+  const paddedAll = seriesList.map((s) => padData(s.data, maxPoints))
 
   // Build a map of timestamp → merged row
   const map = new Map<number, Record<string, number>>()
@@ -147,6 +173,7 @@ export const TimeSeriesChart = React.memo(function TimeSeriesChart({
   seriesLabel,
   className,
   compact = false,
+  maxPoints = CHART_POINTS,
 }: TimeSeriesChartProps) {
   const isMulti = series && series.length > 0
 
@@ -156,7 +183,7 @@ export const TimeSeriesChart = React.memo(function TimeSeriesChart({
   let lineKeys: Array<{ key: string; color: string; axis: 'left' | 'right' }>
 
   if (isMulti) {
-    chartData = mergeSeries(series)
+    chartData = mergeSeries(series, maxPoints)
     chartConfig = {}
     lineKeys = []
     for (let i = 0; i < series.length; i++) {
@@ -166,7 +193,7 @@ export const TimeSeriesChart = React.memo(function TimeSeriesChart({
     }
   } else {
     const lineColor = color ?? NVIDIA_THEME.chartLine
-    const paddedData = padData(data ?? [])
+    const paddedData = padData(data ?? [], maxPoints)
     chartData = paddedData.map((d) => ({ timestamp: d.timestamp, value: d.value }))
     chartConfig = { value: { label: seriesLabel ?? unit ?? '', color: lineColor } }
     lineKeys = [{ key: 'value', color: lineColor, axis: 'left' }]
