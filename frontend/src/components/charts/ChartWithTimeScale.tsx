@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useCallback } from 'react'
 import { TimeSeriesChart, type ChartSeries } from './TimeSeriesChart'
 import { TimeScaleButton, type TimeScale } from './TimeScaleButton'
 import { useHistoryTimeseries } from '@/hooks/useHistoryTimeseries'
@@ -8,6 +8,29 @@ interface DataPoint {
   value: number
 }
 
+/**
+ * A series that is computed from one or more fetched history metrics
+ * rather than having its own direct DB column.
+ *
+ * For example, "per-request throughput" = decode_tps / active_requests.
+ * The component fetches each source metric from the history API, then
+ * calls `compute` to produce the derived data points.
+ */
+export interface DerivedSeries {
+  /** Metrics to fetch from the history API. */
+  sourceMetrics: string[]
+  /** Compute derived data from fetched source data. */
+  compute: (sources: Record<string, DataPoint[] | null>) => DataPoint[]
+}
+
+/**
+ * Per-series history config. Either:
+ * - `metric`: a direct DB column name (string) → fetched and shown as-is
+ * - `derived`: computed from other metrics via DerivedSeries
+ * - `undefined`: no history support (series hidden at 1h/24h — should be rare now)
+ */
+export type HistorySeriesConfig = string | DerivedSeries | undefined
+
 interface ChartWithTimeScaleProps {
   /** Single-line buffer mode (1m/5m). */
   bufferData?: DataPoint[]
@@ -16,11 +39,11 @@ interface ChartWithTimeScaleProps {
   /** Engine endpoint for history API calls (1h/24h). If null, button is hidden. */
   engineEndpoint: string | null
   /**
-   * Map each series to a history metric. Only series with a defined metric
-   * are shown in 1h/24h mode. For single-line: one entry. For multi-line:
-   * array matching bufferSeries order. `undefined` = no history equivalent.
+   * Per-series history configuration. For single-line: one entry.
+   * For multi-line: array matching bufferSeries order.
+   * String = direct DB metric, DerivedSeries = computed, undefined = hidden.
    */
-  historyMetrics?: (string | undefined)[]
+  historyMetrics?: HistorySeriesConfig[]
   /** Pass-through to TimeSeriesChart. */
   color?: string
   yDomain?: [number, number]
@@ -53,39 +76,78 @@ const BUFFER_SLICE: Record<'1m' | '5m', number> = {
   '5m': 300,
 }
 
-/** Hook helper: fetch history data for multiple metrics. */
-function useHistoryForMetrics(
+/** Flattened metric list needed for history fetches (direct + derived sources). */
+function collectNeededMetrics(configs: HistorySeriesConfig[]): string[] {
+  const metrics = new Set<string>()
+  for (const cfg of configs) {
+    if (typeof cfg === 'string') {
+      metrics.add(cfg)
+    } else if (cfg && typeof cfg === 'object') {
+      for (const m of cfg.sourceMetrics) metrics.add(m)
+    }
+  }
+  return Array.from(metrics)
+}
+
+/** Hook: fetch all unique metrics needed for history mode. */
+
+/** Individual hook slot — always called, returns null if metric is empty. */
+function useMetricSlot(
   engineEndpoint: string | null,
-  metrics: (string | undefined)[],
+  metric: string | null,
   scale: TimeScale,
-): Array<{ data: DataPoint[] | null; loading: boolean; error: string | null }> {
-  // Call the hook unconditionally for each metric slot (including undefined)
-  // so hook count stays stable across renders. For undefined metrics, the
-  // hook returns null immediately (scale is irrelevant, but the call must
-  // exist).
-  //
-  // We can't call hooks in a loop with dynamic count, so we dispatch to
-  // fixed-slot helpers up to a max, then inline. The current max is 4
-  // (Latency: TTFT + Queue + ITL + TPOT). We'll use individual calls.
-  //
-  // Actually, React rules require hooks to be called in the same order every
-  // render, but we CAN call them in a loop as long as the array length is
-  // constant. historyMetrics length is constant for a given chart instance.
+): { metric: string; data: DataPoint[] | null; loading: boolean } {
+  const { data, loading } = useHistoryTimeseries(
+    metric ? engineEndpoint : null,
+    metric ?? '__none__',
+    scale,
+  )
+  const mapped: DataPoint[] | null = data
+    ? data.map((p) => ({ timestamp: p.timestamp_ms, value: p.value }))
+    : null
+  return { metric: metric ?? '', data: mapped, loading }
+}
+
+/** Hook that fetches up to MAX_METRIC_SLOTS unique metrics. */
+function useAllHistoryData(
+  engineEndpoint: string | null,
+  configs: HistorySeriesConfig[],
+  scale: TimeScale,
+): { data: Map<string, DataPoint[]>; loading: boolean } {
+  const needed = useMemo(() => collectNeededMetrics(configs), [configs])
+
+  // Always call exactly MAX_METRIC_SLOTS hooks (stable count per render).
+  // Slots beyond the needed list pass null metric → hook returns null immediately.
   // eslint-disable-next-line react-hooks/rules-of-hooks
-  return metrics.map((metric) => {
-    // For undefined metrics, we still need to call the hook the same number
-    // of times. Pass a dummy that returns null for buffer scales.
-    const { data, loading, error } = useHistoryTimeseries(
-      metric ? engineEndpoint : null,
-      metric ?? '__none__',
-      scale,
-    )
-    // Map API format { timestamp_ms, value } → chart format { timestamp, value }
-    const mapped: DataPoint[] | null = data
-      ? data.map((p) => ({ timestamp: p.timestamp_ms, value: p.value }))
-      : null
-    return { data: mapped, loading, error }
-  })
+  const slot0 = useMetricSlot(engineEndpoint, needed[0] ?? null, scale)
+  // eslint-disable-next-line react-hooks/rules-of-hooks
+  const slot1 = useMetricSlot(engineEndpoint, needed[1] ?? null, scale)
+  // eslint-disable-next-line react-hooks/rules-of-hooks
+  const slot2 = useMetricSlot(engineEndpoint, needed[2] ?? null, scale)
+  // eslint-disable-next-line react-hooks/rules-of-hooks
+  const slot3 = useMetricSlot(engineEndpoint, needed[3] ?? null, scale)
+  // eslint-disable-next-line react-hooks/rules-of-hooks
+  const slot4 = useMetricSlot(engineEndpoint, needed[4] ?? null, scale)
+  // eslint-disable-next-line react-hooks/rules-of-hooks
+  const slot5 = useMetricSlot(engineEndpoint, needed[5] ?? null, scale)
+  // eslint-disable-next-line react-hooks/rules-of-hooks
+  const slot6 = useMetricSlot(engineEndpoint, needed[6] ?? null, scale)
+  // eslint-disable-next-line react-hooks/rules-of-hooks
+  const slot7 = useMetricSlot(engineEndpoint, needed[7] ?? null, scale)
+
+  const slots = [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7]
+
+  const map = useMemo(() => {
+    const m = new Map<string, DataPoint[]>()
+    for (const s of slots) {
+      if (s.metric && s.data) m.set(s.metric, s.data)
+    }
+    return m
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [slot0.data, slot1.data, slot2.data, slot3.data, slot4.data, slot5.data, slot6.data, slot7.data])
+
+  const loading = slots.some((s) => s.loading && s.metric !== '')
+  return { data: map, loading }
 }
 
 export function ChartWithTimeScale({
@@ -110,20 +172,16 @@ export function ChartWithTimeScale({
   const isBuffer = scale === '1m' || scale === '5m'
   const showButton = engineEndpoint !== null && historyMetrics !== undefined
 
-  // For history mode, determine which metrics to fetch.
-  // If historyMetrics not provided, use a single-element array from color mode.
-  const effectiveHistoryMetrics = useMemo(() => {
-    if (historyMetrics) return historyMetrics
-    return undefined
-  }, [historyMetrics])
+  const effectiveConfigs = useMemo(() => historyMetrics ?? [], [historyMetrics])
 
-  // Fetch history data for each metric (only used in 1h/24h mode).
-  // The hook is called unconditionally; it returns null for buffer scales.
-  const historyResults = effectiveHistoryMetrics
-    ? useHistoryForMetrics(engineEndpoint, effectiveHistoryMetrics, scale)
-    : []
+  // Fetch all needed history data (direct metrics + derived source metrics).
+  const { data: historyData, loading: historyLoading } = useAllHistoryData(
+    isBuffer ? null : engineEndpoint,
+    isBuffer ? [] : effectiveConfigs,
+    scale,
+  )
 
-  const handleCycle = () => setScale((s) => nextScale(s))
+  const handleCycle = useCallback(() => setScale((s) => nextScale(s)), [])
 
   // ── Buffer mode (1m / 5m) ──
   if (isBuffer) {
@@ -168,33 +226,61 @@ export function ChartWithTimeScale({
   }
 
   // ── History mode (1h / 24h) ──
-  // Build series from fetched history data. Only include series that have a
-  // defined historyMetric AND received non-empty data.
-  const isLoading = historyResults.some((r) => r.loading)
-
+  // Build series from fetched history data. Each series is either:
+  // - Direct: fetched by its own metric name
+  // - Derived: computed from source metrics via compute()
   let chartSeries: ChartSeries[] | undefined
   let chartData: DataPoint[] | undefined
 
-  if (bufferSeries && effectiveHistoryMetrics) {
+  if (bufferSeries && effectiveConfigs.length > 0) {
     // Multi-line mode
     chartSeries = []
     for (let i = 0; i < bufferSeries.length; i++) {
-      const metric = effectiveHistoryMetrics[i]
-      if (!metric) continue
-      const result = historyResults[i]
-      if (!result.data || result.data.length === 0) continue
+      const cfg = effectiveConfigs[i]
+      if (!cfg) continue
+
+      let dataPoints: DataPoint[] | null = null
+
+      if (typeof cfg === 'string') {
+        // Direct metric
+        dataPoints = historyData.get(cfg) ?? null
+      } else if (cfg && typeof cfg === 'object') {
+        // Derived series — fetch sources and compute
+        const sources: Record<string, DataPoint[] | null> = {}
+        for (const m of cfg.sourceMetrics) {
+          sources[m] = historyData.get(m) ?? null
+        }
+        // Only compute if at least one source has data
+        const hasAnyData = Object.values(sources).some((d) => d && d.length > 0)
+        if (hasAnyData) {
+          dataPoints = cfg.compute(sources)
+        }
+      }
+
+      if (!dataPoints || dataPoints.length === 0) continue
       chartSeries.push({
-        data: result.data,
+        data: dataPoints,
         label: bufferSeries[i].label,
         color: bufferSeries[i].color,
         axis: bufferSeries[i].axis,
       })
     }
-  } else if (bufferData && effectiveHistoryMetrics) {
+  } else if (bufferData && effectiveConfigs.length > 0) {
     // Single-line mode
-    const result = historyResults[0]
-    if (result.data && result.data.length > 0) {
-      chartData = result.data
+    const cfg = effectiveConfigs[0]
+    if (cfg) {
+      if (typeof cfg === 'string') {
+        chartData = historyData.get(cfg) ?? undefined
+      } else if (cfg && typeof cfg === 'object') {
+        const sources: Record<string, DataPoint[] | null> = {}
+        for (const m of cfg.sourceMetrics) {
+          sources[m] = historyData.get(m) ?? null
+        }
+        const hasAnyData = Object.values(sources).some((d) => d && d.length > 0)
+        if (hasAnyData) {
+          chartData = cfg.compute(sources)
+        }
+      }
     }
   }
 
@@ -202,7 +288,7 @@ export function ChartWithTimeScale({
 
   return (
     <div className={`relative ${className ?? ''}`}>
-      {isLoading && allEmpty ? (
+      {historyLoading && allEmpty ? (
         <div className="flex items-center justify-center" style={{ height: typeof height === 'number' ? `${height}px` : height }}>
           <span className="text-xs text-zinc-500">Loading…</span>
         </div>

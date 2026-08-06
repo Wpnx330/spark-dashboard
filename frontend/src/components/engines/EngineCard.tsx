@@ -1,5 +1,5 @@
 import { type ChartSeries } from '@/components/charts/TimeSeriesChart'
-import { ChartWithTimeScale } from '@/components/charts/ChartWithTimeScale'
+import { ChartWithTimeScale, type HistorySeriesConfig, type DerivedSeries } from '@/components/charts/ChartWithTimeScale'
 import { formatTps, formatTtft, formatDurationMs, formatCompactTokens } from '@/lib/format'
 import type { EngineSnapshot } from '@/types/metrics'
 import type { InferenceRequest } from '@/types/events'
@@ -59,6 +59,59 @@ function prefillTokenSeries(chartData: {
     { data: chartData.perReqPromptTps, label: 'Per-req', color: '#a855f7' },
   ]
 }
+
+// ── Derived series configs for history mode (1h / 24h) ──
+// These compute the same "Avg" and "Per-req" lines from DB-stored metrics,
+// so all three series show at every time scale.
+
+/** Rolling average of a metric (window = all returned points). */
+function deriveAvg(metric: string): DerivedSeries {
+  return {
+    sourceMetrics: [metric],
+    compute: (sources) => {
+      const data = sources[metric]
+      if (!data || data.length === 0) return []
+      const sum = data.reduce((acc, p) => acc + p.value, 0)
+      const avg = sum / data.length
+      return data.map((p) => ({ timestamp: p.timestamp, value: avg }))
+    },
+  }
+}
+
+/** Per-request throughput = throughput / active_requests. */
+function derivePerReq(tpsMetric: string): DerivedSeries {
+  return {
+    sourceMetrics: [tpsMetric, 'active_requests'],
+    compute: (sources) => {
+      const tps = sources[tpsMetric]
+      const reqs = sources['active_requests']
+      if (!tps || tps.length === 0) return []
+      // If no active_requests data, return zeros (avoid div-by-zero)
+      if (!reqs || reqs.length === 0) return tps.map((p) => ({ timestamp: p.timestamp, value: 0 }))
+      // Align by timestamp (nearest match within 5s tolerance)
+      const reqMap = new Map(reqs.map((r) => [r.timestamp, r.value]))
+      return tps.map((p) => {
+        // Try exact match, then nearest within 5s
+        let reqVal = reqMap.get(p.timestamp)
+        if (reqVal === undefined) {
+          const nearest = reqs.reduce((best, r) =>
+            Math.abs(r.timestamp - p.timestamp) < Math.abs(best.timestamp - p.timestamp) ? r : best
+          )
+          reqVal = nearest.value
+        }
+        return { timestamp: p.timestamp, value: reqVal > 0 ? p.value / reqVal : 0 }
+      })
+    },
+  }
+}
+
+// History configs for each chart — stable references per chart type.
+const THROUGHPUT_PREFILL_HISTORY: HistorySeriesConfig[] = ['prompt_tps', deriveAvg('prompt_tps'), derivePerReq('prompt_tps')]
+const THROUGHPUT_DECODE_HISTORY: HistorySeriesConfig[] = ['decode_tps', deriveAvg('decode_tps'), derivePerReq('decode_tps')]
+const LATENCY_HISTORY: HistorySeriesConfig[] = ['ttft_ms', 'queue_time_ms', 'itl_ms', 'tpot_ms']
+const E2E_HISTORY: HistorySeriesConfig[] = ['e2e_ms']
+const REQUESTS_HISTORY: HistorySeriesConfig[] = ['active_requests', 'queued_requests', 'total_requests']
+const CACHE_HISTORY: HistorySeriesConfig[] = ['kv_cache_pct', 'prefix_cache_hit']
 
 interface EngineCardProps {
   engine: EngineSnapshot
@@ -258,7 +311,7 @@ export function EngineCard({
                         hideTooltipLabel
                         bufferSeries={prefillTokenSeries(chartData)}
                         engineEndpoint={engine.endpoint}
-                        historyMetrics={['prompt_tps', undefined, undefined]}
+                        historyMetrics={THROUGHPUT_PREFILL_HISTORY}
                         unit="tok/s"
                         height="100%"
                       />
@@ -293,7 +346,7 @@ export function EngineCard({
                         hideTooltipLabel
                         bufferSeries={decodeTokenSeries(chartData)}
                         engineEndpoint={engine.endpoint}
-                        historyMetrics={['decode_tps', undefined, undefined]}
+                        historyMetrics={THROUGHPUT_DECODE_HISTORY}
                         unit="tok/s"
                         height="100%"
                       />
@@ -336,7 +389,7 @@ export function EngineCard({
                           { data: tpotSeries, label: 'TPOT', color: '#ec4899', axis: 'right' },
                         ]}
                         engineEndpoint={engine.endpoint}
-                        historyMetrics={['ttft_ms', undefined, 'itl_ms', undefined]}
+                        historyMetrics={LATENCY_HISTORY}
                         unit="ms"
                         height="100%"
                       />
@@ -383,7 +436,7 @@ export function EngineCard({
                         seriesLabel="E2E Latency"
                         bufferData={e2eSeries.map(p => ({ ...p, value: p.value / 1000 }))}
                         engineEndpoint={engine.endpoint}
-                        historyMetrics={['e2e_ms']}
+                        historyMetrics={E2E_HISTORY}
                         unit="s"
                         height="100%"
                       />
@@ -428,7 +481,7 @@ export function EngineCard({
                           { data: chartData.totalRequests, label: 'Total', color: '#3b82f6', axis: 'right' },
                         ]}
                         engineEndpoint={engine.endpoint}
-                        historyMetrics={['active_requests', 'queued_requests', undefined]}
+                        historyMetrics={REQUESTS_HISTORY}
                         unit=""
                         height="100%"
                       />
@@ -494,7 +547,7 @@ export function EngineCard({
                           { data: chartData.prefixCacheHit, label: 'Prefix Hit', color: '#3b82f6' },
                         ]}
                         engineEndpoint={engine.endpoint}
-                        historyMetrics={['kv_cache_pct', 'prefix_cache_hit']}
+                        historyMetrics={CACHE_HISTORY}
                         yDomain={[0, 100]}
                         unit="%"
                         height="100%"
@@ -519,7 +572,7 @@ export function EngineCard({
                 hideTooltipLabel
                 bufferSeries={prefillTokenSeries(chartData)}
                 engineEndpoint={engine.endpoint}
-                historyMetrics={['prompt_tps', undefined, undefined]}
+                historyMetrics={THROUGHPUT_PREFILL_HISTORY}
                 unit="tok/s"
                 height="clamp(72px, 13vh, 200px)"
                 requests={requestSpans}
@@ -529,7 +582,7 @@ export function EngineCard({
                 hideTooltipLabel
                 bufferSeries={decodeTokenSeries(chartData)}
                 engineEndpoint={engine.endpoint}
-                historyMetrics={['decode_tps', undefined, undefined]}
+                historyMetrics={THROUGHPUT_DECODE_HISTORY}
                 unit="tok/s"
                 height="clamp(72px, 13vh, 200px)"
                 requests={requestSpans}
@@ -544,7 +597,7 @@ export function EngineCard({
                   { data: tpotSeries, label: 'TPOT', color: '#ec4899', axis: 'right' },
                 ]}
                 engineEndpoint={engine.endpoint}
-                historyMetrics={['ttft_ms', undefined, 'itl_ms', undefined]}
+                historyMetrics={LATENCY_HISTORY}
                 unit="ms"
                 height="clamp(72px, 13vh, 200px)"
                 requests={requestSpans}
@@ -555,7 +608,7 @@ export function EngineCard({
                 seriesLabel="E2E Latency"
                 bufferData={e2eSeries.map(p => ({ ...p, value: p.value / 1000 }))}
                 engineEndpoint={engine.endpoint}
-                historyMetrics={['e2e_ms']}
+                historyMetrics={E2E_HISTORY}
                 unit="s"
                 height="clamp(72px, 13vh, 200px)"
                 requests={requestSpans}
@@ -569,7 +622,7 @@ export function EngineCard({
                   { data: chartData.totalRequests, label: 'Total', color: '#3b82f6', axis: 'right' },
                 ]}
                 engineEndpoint={engine.endpoint}
-                historyMetrics={['active_requests', 'queued_requests', undefined]}
+                historyMetrics={REQUESTS_HISTORY}
                 unit=""
                 height="clamp(72px, 13vh, 200px)"
                 requests={requestSpans}
@@ -582,7 +635,7 @@ export function EngineCard({
                   { data: chartData.prefixCacheHit, label: 'Prefix Hit', color: '#3b82f6' },
                 ]}
                 engineEndpoint={engine.endpoint}
-                historyMetrics={['kv_cache_pct', 'prefix_cache_hit']}
+                historyMetrics={CACHE_HISTORY}
                 yDomain={[0, 100]}
                 unit="%"
                 height="clamp(72px, 13vh, 200px)"

@@ -242,8 +242,70 @@ describe('ChartWithTimeScale', () => {
     })
   })
 
+  it('shows derived series in 1h mode when source metrics are fetched', async () => {
+    // Throughput chart: Live (direct), Avg (derived from prompt_tps), Per-req (derived from prompt_tps + active_requests)
+    fetchHandler = async (url: string) => {
+      if (url.includes('metric=prompt_tps')) {
+        return {
+          points: [
+            { timestamp_ms: 1700000000000, value: 100 },
+            { timestamp_ms: 1700000001000, value: 110 },
+          ],
+        }
+      }
+      if (url.includes('metric=active_requests')) {
+        return {
+          points: [
+            { timestamp_ms: 1700000000000, value: 2 },
+            { timestamp_ms: 1700000001000, value: 2 },
+          ],
+        }
+      }
+      return { points: [] }
+    }
+
+    render(
+      <ChartWithTimeScale
+        bufferSeries={sampleSeries}
+        engineEndpoint="http://localhost:8000"
+        historyMetrics={[
+          'prompt_tps',
+          { sourceMetrics: ['prompt_tps'], compute: (src) => {
+            const d = src['prompt_tps']
+            if (!d || d.length === 0) return []
+            const avg = d.reduce((a, p) => a + p.value, 0) / d.length
+            return d.map((p) => ({ timestamp: p.timestamp, value: avg }))
+          }},
+          { sourceMetrics: ['prompt_tps', 'active_requests'], compute: (src) => {
+            const tps = src['prompt_tps']
+            const reqs = src['active_requests']
+            if (!tps || tps.length === 0) return []
+            if (!reqs || reqs.length === 0) return tps.map((p) => ({ timestamp: p.timestamp, value: 0 }))
+            return tps.map((p, i) => ({ timestamp: p.timestamp, value: reqs[Math.min(i, reqs.length - 1)].value > 0 ? p.value / reqs[Math.min(i, reqs.length - 1)].value : 0 }))
+          }},
+        ]}
+        unit="tok/s"
+      />,
+    )
+
+    // Switch to 1h
+    fireEvent.click(screen.getByRole('button'))
+
+    // Wait for fetch — all 3 metrics should be fetched
+    await waitFor(() => {
+      expect(fetch).toHaveBeenCalledWith(
+        expect.stringContaining('metric=prompt_tps'),
+      )
+    })
+    await waitFor(() => {
+      expect(fetch).toHaveBeenCalledWith(
+        expect.stringContaining('metric=active_requests'),
+      )
+    })
+  })
+
   it('series without historyMetric are hidden in 1h/24h mode', async () => {
-    // Only the first series has a history metric; Avg and Per-req should be hidden
+    // Only the first series has a history metric; others are undefined → hidden
     fetchHandler = async (url: string) => {
       if (url.includes('metric=prompt_tps')) {
         return {
@@ -268,18 +330,12 @@ describe('ChartWithTimeScale', () => {
     // Switch to 1h
     fireEvent.click(screen.getByRole('button'))
 
-    // Wait for fetch to complete — in history mode, the legend for "Live"
-    // should show but "Avg" and "Per-req" should not (they have no history metric)
     await waitFor(() => {
       expect(fetch).toHaveBeenCalled()
     })
 
-    // The compact mode (no title) doesn't show legends, so we just verify
-    // the chart renders without error
+    // Verify no crash and scale switched
     await waitFor(() => {
-      // Either we see "Live" in a non-compact legend, or the chart renders
-      // In history mode with a title, legend shows
-      // Without title + compact, no legend. We just verify no crash.
       expect(screen.queryByText('5m')).not.toBeInTheDocument()
     })
   })

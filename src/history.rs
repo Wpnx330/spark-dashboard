@@ -64,7 +64,10 @@ impl HistoryDb {
                 kv_cache_pct       REAL,
                 prefix_cache_hit   REAL,
                 cpu_util           REAL,
-                mem_used_pct       REAL
+                mem_used_pct       REAL,
+                preemptions_total  INTEGER,
+                queue_time_ms      REAL,
+                tpot_ms            REAL
             );
             CREATE INDEX IF NOT EXISTS idx_1s_engine_ts ON snapshots_1s(engine_key, ts);
 
@@ -88,9 +91,13 @@ impl HistoryDb {
                 active_requests_max INTEGER,
                 queued_requests_max INTEGER,
                 kv_cache_pct_avg    REAL,
+                kv_cache_pct_max    REAL,
                 prefix_cache_hit_avg REAL,
                 cpu_util_avg        REAL,
                 sample_count        INTEGER NOT NULL,
+                preemptions_total   INTEGER,
+                queue_time_ms_avg   REAL,
+                tpot_ms_avg         REAL,
                 UNIQUE(engine_key, bucket_ts)
             );
             CREATE INDEX IF NOT EXISTS idx_1h_engine_ts ON snapshots_1h(engine_key, bucket_ts);
@@ -115,9 +122,13 @@ impl HistoryDb {
                 active_requests_max INTEGER,
                 queued_requests_max INTEGER,
                 kv_cache_pct_avg    REAL,
+                kv_cache_pct_max    REAL,
                 prefix_cache_hit_avg REAL,
                 cpu_util_avg        REAL,
-                sample_count        INTEGER NOT NULL
+                sample_count        INTEGER NOT NULL,
+                preemptions_total   INTEGER,
+                queue_time_ms_avg   REAL,
+                tpot_ms_avg         REAL
             );
             CREATE INDEX IF NOT EXISTS idx_1d_engine_ts ON snapshots_1d(engine_key, bucket_ts);
         ",
@@ -155,10 +166,27 @@ impl HistoryDb {
                 Ok(())
             };
         add_col(conn, "snapshots_1s", "preemptions_total", "INTEGER")?;
+        add_col(conn, "snapshots_1s", "queue_time_ms", "REAL")?;
+        add_col(conn, "snapshots_1s", "tpot_ms", "REAL")?;
         add_col(conn, "snapshots_1h", "kv_cache_pct_max", "REAL")?;
         add_col(conn, "snapshots_1h", "preemptions_total", "INTEGER")?;
+        add_col(conn, "snapshots_1h", "queue_time_ms_avg", "REAL")?;
+        add_col(conn, "snapshots_1h", "tpot_ms_avg", "REAL")?;
         add_col(conn, "snapshots_1d", "kv_cache_pct_max", "REAL")?;
         add_col(conn, "snapshots_1d", "preemptions_total", "INTEGER")?;
+        add_col(conn, "snapshots_1d", "queue_time_ms_avg", "REAL")?;
+        add_col(conn, "snapshots_1d", "tpot_ms_avg", "REAL")?;
+
+        // Legacy databases may have been created before the UNIQUE constraint
+        // on (engine_key, bucket_ts) was added to the CREATE TABLE statement.
+        // The rollup INSERT … ON CONFLICT(engine_key, bucket_ts) requires a
+        // UNIQUE constraint or PRIMARY KEY covering those columns. Add a
+        // unique index if the table itself doesn't have one (IF NOT EXISTS
+        // makes this idempotent).
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_1h_unique ON snapshots_1h(engine_key, bucket_ts);
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_1d_unique ON snapshots_1d(engine_key, bucket_ts);",
+        )?;
 
         // One-time backfill: historical `power_watts` values were recorded
         // from a single node's GPU(s) only. Now that multi-node monitoring is
@@ -276,6 +304,8 @@ impl HistoryDb {
         cpu_util: Option<f64>,
         mem_used_pct: Option<f64>,
         preemptions_total: Option<i64>,
+        queue_time_ms: Option<f64>,
+        tpot_ms: Option<f64>,
     ) -> rusqlite::Result<()> {
         if !self.is_enabled() {
             return Ok(());
@@ -286,8 +316,9 @@ impl HistoryDb {
              (engine_key, ts, total_prompt_tokens, total_gen_tokens, total_requests,
               prompt_tps, decode_tps, ttft_ms, itl_ms, e2e_ms,
               power_watts, gpu_util, gpu_temp, active_requests, queued_requests,
-              kv_cache_pct, prefix_cache_hit, cpu_util, mem_used_pct, preemptions_total)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+              kv_cache_pct, prefix_cache_hit, cpu_util, mem_used_pct, preemptions_total,
+              queue_time_ms, tpot_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
             params![
                 engine_key,
                 ts,
@@ -309,6 +340,8 @@ impl HistoryDb {
                 cpu_util,
                 mem_used_pct,
                 preemptions_total,
+                queue_time_ms,
+                tpot_ms,
             ],
         )?;
         Ok(())
@@ -336,7 +369,8 @@ impl HistoryDb {
               gpu_util_avg, gpu_temp_avg, gpu_temp_max,
               active_requests_max, queued_requests_max,
               kv_cache_pct_avg, kv_cache_pct_max, prefix_cache_hit_avg,
-              cpu_util_avg, sample_count, preemptions_total)
+              cpu_util_avg, sample_count, preemptions_total,
+              queue_time_ms_avg, tpot_ms_avg)
              SELECT
                engine_key, (ts / 3600000) * 3600000,
                SUM(COALESCE(total_prompt_tokens,0)), SUM(COALESCE(total_gen_tokens,0)),
@@ -347,7 +381,8 @@ impl HistoryDb {
                AVG(gpu_util), AVG(gpu_temp), MAX(gpu_temp),
                MAX(active_requests), MAX(queued_requests),
                AVG(kv_cache_pct), MAX(kv_cache_pct), AVG(prefix_cache_hit),
-               AVG(cpu_util), COUNT(*), MAX(preemptions_total)
+               AVG(cpu_util), COUNT(*), MAX(preemptions_total),
+               AVG(queue_time_ms), AVG(tpot_ms)
              FROM snapshots_1s
              WHERE ts < ?1
              GROUP BY engine_key, (ts / 3600000)
@@ -386,7 +421,8 @@ impl HistoryDb {
               gpu_util_avg, gpu_temp_avg, gpu_temp_max,
               active_requests_max, queued_requests_max,
               kv_cache_pct_avg, kv_cache_pct_max, prefix_cache_hit_avg,
-              cpu_util_avg, sample_count, preemptions_total)
+              cpu_util_avg, sample_count, preemptions_total,
+              queue_time_ms_avg, tpot_ms_avg)
              SELECT
                engine_key, (bucket_ts / 86400000) * 86400000,
                SUM(COALESCE(total_prompt_tokens,0)), SUM(COALESCE(total_gen_tokens,0)),
@@ -397,7 +433,8 @@ impl HistoryDb {
                AVG(gpu_util_avg), AVG(gpu_temp_avg), MAX(gpu_temp_max),
                MAX(active_requests_max), MAX(queued_requests_max),
                AVG(kv_cache_pct_avg), MAX(kv_cache_pct_max), AVG(prefix_cache_hit_avg),
-               AVG(cpu_util_avg), SUM(sample_count), MAX(preemptions_total)
+               AVG(cpu_util_avg), SUM(sample_count), MAX(preemptions_total),
+               AVG(queue_time_ms_avg), AVG(tpot_ms_avg)
              FROM snapshots_1h
              WHERE bucket_ts < ?1
              GROUP BY engine_key, (bucket_ts / 86400000)
@@ -573,6 +610,7 @@ impl HistoryDb {
             "e2e_ms" => ("e2e_ms", Some("e2e_ms_p95")),
             "active_requests" => ("active_requests", Some("active_requests_max")),
             "queued_requests" => ("queued_requests", Some("queued_requests_max")),
+            "total_requests" => ("total_requests", Some("total_requests")),
             "kv_cache_pct" => ("kv_cache_pct", Some("kv_cache_pct_avg")),
             "prefix_cache_hit" => ("prefix_cache_hit", Some("prefix_cache_hit_avg")),
             "gpu_util" => ("gpu_util", Some("gpu_util_avg")),
@@ -581,6 +619,8 @@ impl HistoryDb {
             "cpu_util" => ("cpu_util", Some("cpu_util_avg")),
             "mem_used_pct" => ("mem_used_pct", None),
             "preemptions_total" => ("preemptions_total", Some("preemptions_total")),
+            "queue_time_ms" => ("queue_time_ms", Some("queue_time_ms_avg")),
+            "tpot_ms" => ("tpot_ms", Some("tpot_ms_avg")),
             _ => return Ok(Vec::new()),
         };
 
@@ -754,7 +794,9 @@ mod tests {
                 prefix_cache_hit   REAL,
                 cpu_util           REAL,
                 mem_used_pct       REAL,
-                preemptions_total  INTEGER
+                preemptions_total  INTEGER,
+                queue_time_ms      REAL,
+                tpot_ms            REAL
             );
             CREATE TABLE IF NOT EXISTS snapshots_1h (
                 engine_key          TEXT NOT NULL,
@@ -781,6 +823,8 @@ mod tests {
                 cpu_util_avg        REAL,
                 sample_count        INTEGER NOT NULL,
                 preemptions_total   INTEGER,
+                queue_time_ms_avg   REAL,
+                tpot_ms_avg         REAL,
                 UNIQUE(engine_key, bucket_ts)
             );
             CREATE TABLE IF NOT EXISTS snapshots_1d (
@@ -807,7 +851,9 @@ mod tests {
                 prefix_cache_hit_avg REAL,
                 cpu_util_avg        REAL,
                 sample_count        INTEGER NOT NULL,
-                preemptions_total   INTEGER
+                preemptions_total   INTEGER,
+                queue_time_ms_avg   REAL,
+                tpot_ms_avg         REAL
             );
         ",
         )
@@ -846,6 +892,8 @@ mod tests {
             Some(60.0),
             Some(50.0),
             Some(3),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -911,6 +959,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -948,6 +998,8 @@ mod tests {
             Some(55.0),
             Some(45.0),
             Some(0),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -972,6 +1024,8 @@ mod tests {
             Some(58.0),
             Some(48.0),
             Some(2),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -996,6 +1050,8 @@ mod tests {
             Some(60.0),
             Some(50.0),
             Some(5),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1053,6 +1109,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1062,6 +1120,8 @@ mod tests {
             Some(30),
             Some(40),
             Some(2),
+            None,
+            None,
             None,
             None,
             None,
@@ -1214,6 +1274,8 @@ mod tests {
             Some(60.0),
             Some(50.0),
             Some(3),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1238,6 +1300,8 @@ mod tests {
             Some(62.0),
             Some(52.0),
             Some(5),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1374,6 +1438,8 @@ mod tests {
             None,
             Some(65.0),
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1392,5 +1458,153 @@ mod tests {
             .await
             .unwrap();
         assert!(points.is_empty(), "mem_used_pct has no aggregate column");
+    }
+
+    #[tokio::test]
+    async fn test_timeseries_queue_time_and_tpot_1s() {
+        let db = test_db();
+        let key = "ts-engine";
+        let base = 1_700_000_000_000i64;
+
+        db.insert_1s(
+            key,
+            base,
+            Some(100),
+            Some(200),
+            Some(5),
+            Some(50.0),
+            Some(30.0),
+            Some(10.0),
+            Some(5.0),
+            Some(100.0),
+            Some(150.0),
+            Some(80.0),
+            Some(45.0),
+            Some(3),
+            Some(1),
+            Some(0.75),
+            Some(0.1),
+            Some(60.0),
+            Some(50.0),
+            Some(3),
+            Some(15.0), // queue_time_ms
+            Some(25.0), // tpot_ms
+        )
+        .await
+        .unwrap();
+
+        // Query queue_time_ms at 1s resolution
+        let points = db
+            .query_timeseries(key, "queue_time_ms", base, base + 2000)
+            .await
+            .unwrap();
+        assert_eq!(points.len(), 1);
+        assert!((points[0].value - 15.0).abs() < f64::EPSILON);
+
+        // Query tpot_ms at 1s resolution
+        let points = db
+            .query_timeseries(key, "tpot_ms", base, base + 2000)
+            .await
+            .unwrap();
+        assert_eq!(points.len(), 1);
+        assert!((points[0].value - 25.0).abs() < f64::EPSILON);
+
+        // Query total_requests at 1s resolution
+        let points = db
+            .query_timeseries(key, "total_requests", base, base + 2000)
+            .await
+            .unwrap();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].value, 5.0);
+    }
+
+    #[tokio::test]
+    async fn test_timeseries_queue_time_and_tpot_1h_aggregation() {
+        let db = test_db();
+        let key = "ts-engine";
+        let hour1 = (chrono_now_ms() / 3_600_000) * 3_600_000 - 7_200_000;
+
+        db.insert_1s(
+            key,
+            hour1 + 1000,
+            Some(50),
+            Some(100),
+            Some(2),
+            Some(40.0),
+            Some(25.0),
+            None,
+            None,
+            None,
+            Some(100.0),
+            Some(70.0),
+            Some(40.0),
+            Some(2),
+            Some(0),
+            Some(0.5),
+            Some(0.05),
+            Some(55.0),
+            Some(45.0),
+            Some(0),
+            Some(10.0), // queue_time_ms
+            Some(20.0), // tpot_ms
+        )
+        .await
+        .unwrap();
+        db.insert_1s(
+            key,
+            hour1 + 2000,
+            Some(60),
+            Some(120),
+            Some(3),
+            Some(45.0),
+            Some(28.0),
+            None,
+            None,
+            None,
+            Some(110.0),
+            Some(72.0),
+            Some(41.0),
+            Some(3),
+            Some(1),
+            Some(0.6),
+            Some(0.06),
+            Some(58.0),
+            Some(48.0),
+            Some(2),
+            Some(30.0), // queue_time_ms
+            Some(40.0), // tpot_ms
+        )
+        .await
+        .unwrap();
+
+        let _rolled = db.rollup_1s_to_1h().await.unwrap();
+
+        // Query at 1h range → should hit 1h table with avg.
+        // Range must be > 1h and ≤ 24h to select the 1h table.
+        let range_end = hour1 + 7_200_000; // hour1 + 2h (well within 24h of hour1)
+        let range_start = hour1 - 3_600_000; // 1h before, total range = 3h
+        let points = db
+            .query_timeseries(key, "queue_time_ms", range_start, range_end)
+            .await
+            .unwrap();
+        assert_eq!(points.len(), 1);
+        // avg(10.0, 30.0) = 20.0
+        assert!((points[0].value - 20.0).abs() < f64::EPSILON);
+
+        let points = db
+            .query_timeseries(key, "tpot_ms", range_start, range_end)
+            .await
+            .unwrap();
+        assert_eq!(points.len(), 1);
+        // avg(20.0, 40.0) = 30.0
+        assert!((points[0].value - 30.0).abs() < f64::EPSILON);
+
+        // total_requests in 1h table should be sum
+        let points = db
+            .query_timeseries(key, "total_requests", range_start, range_end)
+            .await
+            .unwrap();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].value, 5.0, "sum of 2+3 = 5");
     }
 }

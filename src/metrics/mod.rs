@@ -272,6 +272,8 @@ pub async fn metrics_collector(
                         Some(snapshot.cpu.aggregate_percent as f64),
                         None, // mem_used_pct - not directly available
                         m.preemptions_total.map(|v| v as i64),
+                        m.queue_time_ms,
+                        m.tpot_ms,
                     )
                     .await
                     .ok();
