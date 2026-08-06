@@ -627,15 +627,48 @@ impl HistoryDb {
         let range_ms = until_ms.saturating_sub(since_ms);
 
         if range_ms <= HOUR_MS {
-            // Raw 1s table.
-            let sql = format!(
+            // For ranges ≤ 1h we query BOTH the 1h table (completed hour
+            // buckets that have already been rolled up and pruned from 1s)
+            // AND the 1s table (current incomplete hour).  This prevents
+            // empty charts when the rollup has already deleted the 1s data
+            // for the earlier part of the requested range.
+            let mut points = Vec::new();
+
+            // Part 1: aggregated 1h buckets that fall within the range.
+            if let Some(agg) = agg_col {
+                let value_expr = if metric == "power_watts" {
+                    format!("{agg} / NULLIF(sample_count, 0)")
+                } else {
+                    agg.to_owned()
+                };
+                let sql_agg = format!(
+                    "SELECT bucket_ts, {value_expr} FROM snapshots_1h \
+                     WHERE engine_key = ?1 AND bucket_ts >= ?2 AND bucket_ts <= ?3 \
+                     ORDER BY bucket_ts ASC",
+                );
+                let mut stmt = db.prepare(&sql_agg)?;
+                let agg_points = stmt
+                    .query_map(params![engine_key, since_ms, until_ms], |r| {
+                        let ts: i64 = r.get(0)?;
+                        let val: Option<f64> = r.get(1)?;
+                        Ok(TimeSeriesPoint {
+                            timestamp_ms: ts,
+                            value: val.unwrap_or(0.0),
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                points.extend(agg_points);
+            }
+
+            // Part 2: raw 1s data for the current (incomplete) hour.
+            let sql_raw = format!(
                 "SELECT ts, {col} FROM snapshots_1s \
                  WHERE engine_key = ?1 AND ts >= ?2 AND ts <= ?3 \
                  ORDER BY ts ASC",
                 col = raw_col
             );
-            let mut stmt = db.prepare(&sql)?;
-            let points = stmt
+            let mut stmt = db.prepare(&sql_raw)?;
+            let raw_points = stmt
                 .query_map(params![engine_key, since_ms, until_ms], |r| {
                     let ts: i64 = r.get(0)?;
                     let val: Option<f64> = r.get(1)?;
@@ -645,6 +678,11 @@ impl HistoryDb {
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
+            points.extend(raw_points);
+
+            // Deduplicate by timestamp (1h bucket_ts and 1s ts won't
+            // overlap, but sort to be safe).
+            points.sort_by_key(|p| p.timestamp_ms);
             Ok(points)
         } else {
             // Aggregated table (1h or 1d).
