@@ -3,6 +3,7 @@ import { ArcGauge, type GaugeSegment } from '@/components/gauges/ArcGauge'
 import { HBar } from '@/components/gauges/HBar'
 import { CoreHeatmap } from '@/components/charts/CoreHeatmap'
 import { TimeSeriesChart } from '@/components/charts/TimeSeriesChart'
+import { ChartWithTimeScale } from '@/components/charts/ChartWithTimeScale'
 import { NodeOverview } from '@/components/NodeOverview'
 import { EngineSection } from '@/components/engines/EngineSection'
 import { useElementSize } from '@/hooks/useElementSize'
@@ -191,6 +192,10 @@ export function Dashboard({
   const NET_RX_COLOR = '#3B82F6'
   const NET_TX_COLOR = '#A855F7'
 
+  // Engine endpoint for the history timeseries API (1h/24h chart scales).
+  // Uses the first engine's endpoint, matching the backend's engine_key scheme.
+  const engineEndpoint = metrics.engines[0]?.endpoint ?? null
+
   return (
     <div ref={rootRef} className="flex flex-col gap-2 w-full md:flex-1 md:min-h-0">
       {/* ── LLM Engines — auto-height, fits content; hardware fills remainder ── */}
@@ -278,7 +283,16 @@ export function Dashboard({
               <div className="flex items-center gap-2 min-w-0 min-h-0 flex-1 overflow-hidden">
                 <ArcGauge value={activeGpu.utilization_percent ?? 0} label="GPU Util" unit="%" size={HW_GAUGE_PX} />
                 <div className="flex-1 min-w-0">
-                  <TimeSeriesChart data={history.getChartData(gpuMetricKey('gpuUtil'))} yDomain={[0, 100]} unit="%" events={activeGpuChartEvents} requests={requestSpans} height={HW_CHART_HEIGHT} />
+                  <ChartWithTimeScale
+                    bufferData={history.getChartData(gpuMetricKey('gpuUtil'))}
+                    engineEndpoint={engineEndpoint}
+                    historyMetrics={['gpu_util']}
+                    yDomain={[0, 100]}
+                    unit="%"
+                    events={activeGpuChartEvents}
+                    requests={requestSpans}
+                    height={HW_CHART_HEIGHT}
+                  />
                 </div>
               </div>
             )}
@@ -292,7 +306,14 @@ export function Dashboard({
               <div className="flex items-center gap-2 min-w-0 min-h-0 flex-1 overflow-hidden">
                 <ArcGauge value={activeGpu.temperature_celsius ?? 0} label="GPU Temp" unit="°C" thresholds={THRESHOLDS.gpuTemp} size={HW_GAUGE_PX} />
                 <div className="flex-1 min-w-0">
-                  <TimeSeriesChart data={history.getChartData(gpuMetricKey('gpuTemp'))} yDomain={[0, 100]} unit="°C" height={HW_CHART_HEIGHT} />
+                  <ChartWithTimeScale
+                    bufferData={history.getChartData(gpuMetricKey('gpuTemp'))}
+                    engineEndpoint={engineEndpoint}
+                    historyMetrics={['gpu_temp']}
+                    yDomain={[0, 100]}
+                    unit="°C"
+                    height={HW_CHART_HEIGHT}
+                  />
                 </div>
               </div>
             )}
@@ -319,7 +340,13 @@ export function Dashboard({
                   size={HW_GAUGE_PX}
                 />
                 <div className="flex-1 min-w-0">
-                  <TimeSeriesChart data={powerHistory} unit="W" height={HW_CHART_HEIGHT} />
+                  <ChartWithTimeScale
+                    bufferData={powerHistory}
+                    engineEndpoint={engineEndpoint}
+                    historyMetrics={['power_watts']}
+                    unit="W"
+                    height={HW_CHART_HEIGHT}
+                  />
                 </div>
               </div>
             )}
@@ -352,7 +379,14 @@ export function Dashboard({
               <div className="flex items-center gap-2 min-w-0 min-h-0 flex-1 overflow-hidden">
                 <ArcGauge value={nodeMetrics.cpu.aggregate_percent} label="CPU" unit="%" thresholds={THRESHOLDS.cpuUsage} size={HW_GAUGE_PX} />
                 <div className="flex-1 min-w-0">
-                  <TimeSeriesChart data={history.getChartData('cpuAggregate')} yDomain={[0, 100]} unit="%" height={HW_CHART_HEIGHT} />
+                  <ChartWithTimeScale
+                    bufferData={history.getChartData('cpuAggregate')}
+                    engineEndpoint={engineEndpoint}
+                    historyMetrics={['cpu_util']}
+                    yDomain={[0, 100]}
+                    unit="%"
+                    height={HW_CHART_HEIGHT}
+                  />
                 </div>
               </div>
             )}

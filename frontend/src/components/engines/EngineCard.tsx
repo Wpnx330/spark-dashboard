@@ -1,4 +1,5 @@
-import { TimeSeriesChart, type ChartSeries } from '@/components/charts/TimeSeriesChart'
+import { type ChartSeries } from '@/components/charts/TimeSeriesChart'
+import { ChartWithTimeScale } from '@/components/charts/ChartWithTimeScale'
 import { formatTps, formatTtft, formatDurationMs, formatCompactTokens } from '@/lib/format'
 import type { EngineSnapshot } from '@/types/metrics'
 import type { InferenceRequest } from '@/types/events'
@@ -252,10 +253,12 @@ export function EngineCard({
                   <div className="text-[10px] font-semibold text-zinc-400 tracking-tight mb-1 shrink-0">Prompt Processing / Prefill Throughput (tok/s)</div>
                   {chartData ? (
                     <div className="flex-1 min-h-0">
-                      <TimeSeriesChart
+                      <ChartWithTimeScale
                         compact
                         hideTooltipLabel
-                        series={prefillTokenSeries(chartData)}
+                        bufferSeries={prefillTokenSeries(chartData)}
+                        engineEndpoint={engine.endpoint}
+                        historyMetrics={['prompt_tps', undefined, undefined]}
                         unit="tok/s"
                         height="100%"
                       />
@@ -285,10 +288,12 @@ export function EngineCard({
                   <div className="text-[10px] font-semibold text-zinc-400 tracking-tight mb-1 shrink-0">Token Generation / Decode Throughput (tok/s)</div>
                   {chartData ? (
                     <div className="flex-1 min-h-0">
-                      <TimeSeriesChart
+                      <ChartWithTimeScale
                         compact
                         hideTooltipLabel
-                        series={decodeTokenSeries(chartData)}
+                        bufferSeries={decodeTokenSeries(chartData)}
+                        engineEndpoint={engine.endpoint}
+                        historyMetrics={['decode_tps', undefined, undefined]}
                         unit="tok/s"
                         height="100%"
                       />
@@ -321,18 +326,17 @@ export function EngineCard({
                   <div className="text-[10px] font-semibold text-zinc-400 tracking-tight mb-1 shrink-0">{latencyHeading} (ms)</div>
                   {chartData ? (
                     <div className="flex-1 min-h-0">
-                      <TimeSeriesChart
+                      <ChartWithTimeScale
                         compact
                         hideTooltipLabel
-                        series={[
-                          // TTFT lives on the left axis (typically hundreds of ms).
-                          // Queue + ITL + TPOT share a right axis (often single/double digits)
-                          // so small variations remain visible against the TTFT scale.
+                        bufferSeries={[
                           { data: ttftSeries, label: 'TTFT', color: '#f59e0b', axis: 'left' },
                           { data: chartData.queueTime, label: 'Queue', color: '#8b5cf6', axis: 'right' },
                           { data: itlSeries, label: 'ITL', color: '#14b8a6', axis: 'right' },
                           { data: tpotSeries, label: 'TPOT', color: '#ec4899', axis: 'right' },
                         ]}
+                        engineEndpoint={engine.endpoint}
+                        historyMetrics={['ttft_ms', undefined, 'itl_ms', undefined]}
                         unit="ms"
                         height="100%"
                       />
@@ -373,11 +377,13 @@ export function EngineCard({
                   <div className="text-[10px] font-semibold text-zinc-400 tracking-tight mb-1 shrink-0">E2E Latency (s)</div>
                   {chartData ? (
                     <div className="flex-1 min-h-0">
-                      <TimeSeriesChart
+                      <ChartWithTimeScale
                         compact
                         hideTooltipLabel
                         seriesLabel="E2E Latency"
-                        data={e2eSeries.map(p => ({ ...p, value: p.value / 1000 }))}
+                        bufferData={e2eSeries.map(p => ({ ...p, value: p.value / 1000 }))}
+                        engineEndpoint={engine.endpoint}
+                        historyMetrics={['e2e_ms']}
                         unit="s"
                         height="100%"
                       />
@@ -413,14 +419,16 @@ export function EngineCard({
                   <div className="text-[10px] font-semibold text-zinc-400 tracking-tight mb-1 shrink-0">Requests</div>
                   {chartData ? (
                     <div className="flex-1 min-h-0">
-                      <TimeSeriesChart
+                      <ChartWithTimeScale
                         compact
                         hideTooltipLabel
-                        series={[
+                        bufferSeries={[
                           { data: chartData.activeRequests, label: 'Active', color: '#76B900', axis: 'left' },
                           { data: chartData.queuedRequests, label: 'Queued', color: '#f59e0b', axis: 'left' },
                           { data: chartData.totalRequests, label: 'Total', color: '#3b82f6', axis: 'right' },
                         ]}
+                        engineEndpoint={engine.endpoint}
+                        historyMetrics={['active_requests', 'queued_requests', undefined]}
                         unit=""
                         height="100%"
                       />
@@ -478,13 +486,15 @@ export function EngineCard({
                   <div className="text-[10px] font-semibold text-zinc-400 tracking-tight mb-1 shrink-0">Cache (%)</div>
                   {chartData ? (
                     <div className="flex-1 min-h-0">
-                      <TimeSeriesChart
+                      <ChartWithTimeScale
                         compact
                         hideTooltipLabel
-                        series={[
+                        bufferSeries={[
                           { data: chartData.kv, label: 'KV Cache', color: '#76B900' },
                           { data: chartData.prefixCacheHit, label: 'Prefix Hit', color: '#3b82f6' },
                         ]}
+                        engineEndpoint={engine.endpoint}
+                        historyMetrics={['kv_cache_pct', 'prefix_cache_hit']}
                         yDomain={[0, 100]}
                         unit="%"
                         height="100%"
@@ -504,66 +514,75 @@ export function EngineCard({
            * E2E sits under SLO Goodput (col 4); Requests under col 5; KV under Cache (col 6). */}
           {showCharts && !collapseCharts && chartData && (
             <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 pt-1">
-              <TimeSeriesChart
+              <ChartWithTimeScale
                 title="Prefill Throughput (tok/s)"
                 hideTooltipLabel
-                series={prefillTokenSeries(chartData)}
+                bufferSeries={prefillTokenSeries(chartData)}
+                engineEndpoint={engine.endpoint}
+                historyMetrics={['prompt_tps', undefined, undefined]}
                 unit="tok/s"
                 height="clamp(72px, 13vh, 200px)"
                 requests={requestSpans}
               />
-              <TimeSeriesChart
+              <ChartWithTimeScale
                 title="Decode Throughput (tok/s)"
                 hideTooltipLabel
-                series={decodeTokenSeries(chartData)}
+                bufferSeries={decodeTokenSeries(chartData)}
+                engineEndpoint={engine.endpoint}
+                historyMetrics={['decode_tps', undefined, undefined]}
                 unit="tok/s"
                 height="clamp(72px, 13vh, 200px)"
                 requests={requestSpans}
               />
-              <TimeSeriesChart
+              <ChartWithTimeScale
                 title={`Latency (ms) · ${latencyModeLabel(latencyMode)}`}
                 hideTooltipLabel
-                series={[
-                  // TTFT lives on the left axis (typically hundreds of ms).
-                  // Queue + ITL share a right axis (often single/double digits)
-                  // so small variations remain visible against the TTFT scale.
+                bufferSeries={[
                   { data: ttftSeries, label: 'TTFT', color: '#f59e0b', axis: 'left' },
                   { data: chartData.queueTime, label: 'Queue', color: '#8b5cf6', axis: 'right' },
                   { data: itlSeries, label: 'ITL', color: '#14b8a6', axis: 'right' },
                   { data: tpotSeries, label: 'TPOT', color: '#ec4899', axis: 'right' },
                 ]}
+                engineEndpoint={engine.endpoint}
+                historyMetrics={['ttft_ms', undefined, 'itl_ms', undefined]}
                 unit="ms"
                 height="clamp(72px, 13vh, 200px)"
                 requests={requestSpans}
               />
-              <TimeSeriesChart
+              <ChartWithTimeScale
                 title={`E2E Latency (s) · ${latencyModeLabel(latencyMode)}`}
                 hideTooltipLabel
                 seriesLabel="E2E Latency"
-                data={e2eSeries.map(p => ({ ...p, value: p.value / 1000 }))}
+                bufferData={e2eSeries.map(p => ({ ...p, value: p.value / 1000 }))}
+                engineEndpoint={engine.endpoint}
+                historyMetrics={['e2e_ms']}
                 unit="s"
                 height="clamp(72px, 13vh, 200px)"
                 requests={requestSpans}
               />
-              <TimeSeriesChart
+              <ChartWithTimeScale
                 title="Requests"
                 hideTooltipLabel
-                series={[
+                bufferSeries={[
                   { data: chartData.activeRequests, label: 'Active', color: '#76B900', axis: 'left' },
                   { data: chartData.queuedRequests, label: 'Queued', color: '#f59e0b', axis: 'left' },
                   { data: chartData.totalRequests, label: 'Total', color: '#3b82f6', axis: 'right' },
                 ]}
+                engineEndpoint={engine.endpoint}
+                historyMetrics={['active_requests', 'queued_requests', undefined]}
                 unit=""
                 height="clamp(72px, 13vh, 200px)"
                 requests={requestSpans}
               />
-              <TimeSeriesChart
+              <ChartWithTimeScale
                 title="Cache (%)"
                 hideTooltipLabel
-                series={[
+                bufferSeries={[
                   { data: chartData.kv, label: 'KV Cache', color: '#76B900' },
                   { data: chartData.prefixCacheHit, label: 'Prefix Hit', color: '#3b82f6' },
                 ]}
+                engineEndpoint={engine.endpoint}
+                historyMetrics={['kv_cache_pct', 'prefix_cache_hit']}
                 yDomain={[0, 100]}
                 unit="%"
                 height="clamp(72px, 13vh, 200px)"
