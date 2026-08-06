@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 
 /// A complete snapshot of all hardware metrics at a point in time.
-#[derive(Clone, serde::Serialize, Debug)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 pub struct MetricsSnapshot {
     pub timestamp_ms: u64,
     /// Backwards-compatible primary GPU metric. Mirrors the first entry in
@@ -38,6 +38,8 @@ pub async fn metrics_collector(
     gpu_index: Option<u32>,
     simulate_gpus: u32,
     engine_state: std::sync::Arc<tokio::sync::RwLock<Vec<EngineSnapshot>>>,
+    history_db: crate::history::HistoryDb,
+    node_snapshots: crate::nodes::NodeSnapshots,
 ) {
     let mut interval = tokio::time::interval(Duration::from_millis(poll_interval_ms));
 
@@ -105,6 +107,11 @@ pub async fn metrics_collector(
     sys.refresh_cpu_usage();
 
     let mut memory_logged = false;
+    // Track cumulative counter values to compute per-second deltas
+    use std::collections::HashMap;
+    let mut prev_prompt: HashMap<String, i64> = HashMap::new();
+    let mut prev_gen: HashMap<String, i64> = HashMap::new();
+    let mut prev_reqs: HashMap<String, i64> = HashMap::new();
 
     loop {
         interval.tick().await;
@@ -157,6 +164,7 @@ pub async fn metrics_collector(
         ));
         let gpu = gpus.first().cloned().unwrap_or_else(gpu::empty_gpu_metrics);
 
+        let engines_for_history = engines.clone();
         let snapshot = MetricsSnapshot {
             timestamp_ms,
             gpu,
@@ -178,6 +186,99 @@ pub async fn metrics_collector(
                 tracing::error!("Failed to serialize metrics: {}", e);
             }
         }
+
+        // Log to history database (if enabled)
+        let ts = timestamp_ms as i64;
+        for eng in &engines_for_history {
+            if let Some(m) = &eng.metrics {
+                // Compute per-second deltas from cumulative counters
+                let cur_prompt = m.total_prompt_tokens.map(|v| v as i64);
+                let cur_gen = m.total_generation_tokens.map(|v| v as i64);
+                let cur_reqs = m.total_requests.map(|v| v as i64);
+                let delta_prompt = match (prev_prompt.get(&eng.endpoint), cur_prompt) {
+                    (Some(&prev), Some(cur)) if cur >= prev => Some(cur - prev),
+                    _ => None,
+                };
+                let delta_gen = match (prev_gen.get(&eng.endpoint), cur_gen) {
+                    (Some(&prev), Some(cur)) if cur >= prev => Some(cur - prev),
+                    _ => None,
+                };
+                let delta_reqs = match (prev_reqs.get(&eng.endpoint), cur_reqs) {
+                    (Some(&prev), Some(cur)) if cur >= prev => Some(cur - prev),
+                    _ => None,
+                };
+                if let Some(v) = cur_prompt {
+                    prev_prompt.insert(eng.endpoint.clone(), v);
+                }
+                if let Some(v) = cur_gen {
+                    prev_gen.insert(eng.endpoint.clone(), v);
+                }
+                if let Some(v) = cur_reqs {
+                    prev_reqs.insert(eng.endpoint.clone(), v);
+                }
+                // Sum power across ALL local GPUs (TP1=1x, TP2=2x, TP4=4x, etc.)
+                // Falls back to the primary GPU when the full list is empty.
+                let local_power_watts: Option<f64> = if snapshot.gpus.is_empty() {
+                    snapshot.gpu.power_watts
+                } else {
+                    Some(
+                        snapshot
+                            .gpus
+                            .iter()
+                            .filter_map(|g| g.power_watts)
+                            .sum::<f64>(),
+                    )
+                    .filter(|v: &f64| *v > 0.0)
+                    .or(snapshot.gpu.power_watts)
+                };
+
+                // Add power from every online remote node so the recorded
+                // value reflects the *actual* total cluster draw rather than
+                // just the local node. Falls back to local-only when no node
+                // snapshots are available (single-node deployments).
+                let remote_power_watts: f64 = node_snapshots
+                    .read()
+                    .await
+                    .iter()
+                    .filter(|n| n.online)
+                    .filter_map(|n| n.snapshot.as_ref())
+                    .filter_map(|s| s.gpu.power_watts)
+                    .sum();
+                let power_watts = match (local_power_watts, remote_power_watts) {
+                    (Some(local), remote) if remote > 0.0 => Some(local + remote),
+                    (Some(local), _) => Some(local),
+                    (None, remote) if remote > 0.0 => Some(remote),
+                    (None, _) => None,
+                };
+                history_db
+                    .insert_1s(
+                        &eng.endpoint,
+                        ts,
+                        delta_prompt,
+                        delta_gen,
+                        delta_reqs,
+                        m.prompt_tokens_per_sec,
+                        m.tokens_per_sec,
+                        m.ttft_ms,
+                        m.inter_token_latency_ms,
+                        m.e2e_latency_ms,
+                        power_watts,
+                        snapshot.gpu.utilization_percent.map(|v| v as f64),
+                        snapshot.gpu.temperature_celsius.map(|v| v as f64),
+                        m.active_requests.map(|v| v as i64),
+                        m.queued_requests.map(|v| v as i64),
+                        m.kv_cache_percent,
+                        m.prefix_cache_hit_rate,
+                        Some(snapshot.cpu.aggregate_percent as f64),
+                        None, // mem_used_pct - not directly available
+                        m.preemptions_total.map(|v| v as i64),
+                        m.queue_time_ms,
+                        m.tpot_ms,
+                    )
+                    .await
+                    .ok();
+            }
+        }
     }
 }
 
@@ -189,6 +290,8 @@ pub async fn metrics_collector(
     _gpu_index: Option<u32>,
     simulate_gpus: u32,
     engine_state: std::sync::Arc<tokio::sync::RwLock<Vec<EngineSnapshot>>>,
+    _history_db: crate::history::HistoryDb,
+    _node_snapshots: crate::nodes::NodeSnapshots,
 ) {
     let mut interval = tokio::time::interval(Duration::from_millis(poll_interval_ms));
 
@@ -255,7 +358,7 @@ pub async fn metrics_collector(
 
 /// GPU metrics collected via NVML.
 /// Fields are `Option` because some queries may return `NotSupported` depending on the GPU.
-#[derive(Clone, serde::Serialize, Debug)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 pub struct GpuMetrics {
     pub index: Option<u32>,
     pub name: Option<String>,
@@ -272,7 +375,7 @@ pub struct GpuMetrics {
 }
 
 /// CPU metrics with aggregate and per-core breakdown.
-#[derive(Clone, serde::Serialize, Debug)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 pub struct CpuMetrics {
     pub name: Option<String>,
     pub aggregate_percent: f32,
@@ -280,7 +383,7 @@ pub struct CpuMetrics {
 }
 
 /// Per-core CPU usage.
-#[derive(Clone, serde::Serialize, Debug)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 pub struct CoreMetrics {
     pub id: usize,
     pub usage_percent: f32,
@@ -296,7 +399,7 @@ pub struct CoreMetrics {
 /// marketed capacity. NVML reports the full hardware-addressable unified pool,
 /// so we prefer it when available. Used/available stay sourced from the kernel
 /// view to keep utilisation percentages honest.
-#[derive(Clone, serde::Serialize, Debug)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 pub struct MemoryMetrics {
     pub total_bytes: u64,
     pub display_total_bytes: u64,
@@ -310,7 +413,7 @@ pub struct MemoryMetrics {
 }
 
 /// Disk I/O throughput rates.
-#[derive(Clone, serde::Serialize, Debug)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 pub struct DiskMetrics {
     pub name: Option<String>,
     pub read_bytes_per_sec: u64,
@@ -318,7 +421,7 @@ pub struct DiskMetrics {
 }
 
 /// Network I/O throughput rates.
-#[derive(Clone, serde::Serialize, Debug)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 pub struct NetworkMetrics {
     pub name: Option<String>,
     pub rx_bytes_per_sec: u64,

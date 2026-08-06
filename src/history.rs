@@ -1,0 +1,1610 @@
+use rusqlite::{params, Connection};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tracing::info;
+
+/// Thread-safe handle to the history database.
+#[derive(Clone)]
+pub struct HistoryDb {
+    inner: Arc<Mutex<Connection>>,
+    /// Whether the user has opted in to historical logging (atomic for fast reads).
+    enabled: Arc<AtomicBool>,
+}
+
+impl HistoryDb {
+    /// Open (or create) the database and run migrations.
+    pub fn open(path: &str) -> rusqlite::Result<Self> {
+        let conn = Connection::open(path)?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        Self::migrate(&conn)?;
+        let enabled = Arc::new(AtomicBool::new(false));
+        // Read current setting from DB
+        if let Ok(Some(val)) = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'history_enabled'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .map(Some)
+            .or::<rusqlite::Error>(Ok(None))
+        {
+            enabled.store(val == "true", Ordering::Relaxed);
+        }
+        Ok(HistoryDb {
+            inner: Arc::new(Mutex::new(conn)),
+            enabled,
+        })
+    }
+
+    pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS snapshots_1s (
+                engine_key         TEXT NOT NULL,
+                ts                 INTEGER NOT NULL,
+                total_prompt_tokens INTEGER,
+                total_gen_tokens   INTEGER,
+                total_requests     INTEGER,
+                prompt_tps         REAL,
+                decode_tps         REAL,
+                ttft_ms            REAL,
+                itl_ms             REAL,
+                e2e_ms             REAL,
+                power_watts        REAL,
+                gpu_util           REAL,
+                gpu_temp           REAL,
+                active_requests    INTEGER,
+                queued_requests    INTEGER,
+                kv_cache_pct       REAL,
+                prefix_cache_hit   REAL,
+                cpu_util           REAL,
+                mem_used_pct       REAL,
+                preemptions_total  INTEGER,
+                queue_time_ms      REAL,
+                tpot_ms            REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_1s_engine_ts ON snapshots_1s(engine_key, ts);
+
+            CREATE TABLE IF NOT EXISTS snapshots_1h (
+                engine_key          TEXT NOT NULL,
+                bucket_ts           INTEGER NOT NULL,
+                total_prompt_tokens INTEGER,
+                total_gen_tokens    INTEGER,
+                total_requests      INTEGER,
+                prompt_tps_avg      REAL,
+                prompt_tps_max      REAL,
+                decode_tps_avg      REAL,
+                decode_tps_max      REAL,
+                ttft_ms_p95         REAL,
+                itl_ms_p95          REAL,
+                e2e_ms_p95          REAL,
+                power_watts_sum     REAL,
+                gpu_util_avg        REAL,
+                gpu_temp_avg        REAL,
+                gpu_temp_max        REAL,
+                active_requests_max INTEGER,
+                queued_requests_max INTEGER,
+                kv_cache_pct_avg    REAL,
+                kv_cache_pct_max    REAL,
+                prefix_cache_hit_avg REAL,
+                cpu_util_avg        REAL,
+                sample_count        INTEGER NOT NULL,
+                preemptions_total   INTEGER,
+                queue_time_ms_avg   REAL,
+                tpot_ms_avg         REAL,
+                UNIQUE(engine_key, bucket_ts)
+            );
+            CREATE INDEX IF NOT EXISTS idx_1h_engine_ts ON snapshots_1h(engine_key, bucket_ts);
+
+            CREATE TABLE IF NOT EXISTS snapshots_1d (
+                engine_key          TEXT NOT NULL,
+                bucket_ts           INTEGER NOT NULL,
+                total_prompt_tokens INTEGER,
+                total_gen_tokens    INTEGER,
+                total_requests      INTEGER,
+                prompt_tps_avg      REAL,
+                prompt_tps_max      REAL,
+                decode_tps_avg      REAL,
+                decode_tps_max      REAL,
+                ttft_ms_p95         REAL,
+                itl_ms_p95          REAL,
+                e2e_ms_p95          REAL,
+                power_watts_sum     REAL,
+                gpu_util_avg        REAL,
+                gpu_temp_avg        REAL,
+                gpu_temp_max        REAL,
+                active_requests_max INTEGER,
+                queued_requests_max INTEGER,
+                kv_cache_pct_avg    REAL,
+                kv_cache_pct_max    REAL,
+                prefix_cache_hit_avg REAL,
+                cpu_util_avg        REAL,
+                sample_count        INTEGER NOT NULL,
+                preemptions_total   INTEGER,
+                queue_time_ms_avg   REAL,
+                tpot_ms_avg         REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_1d_engine_ts ON snapshots_1d(engine_key, bucket_ts);
+        ",
+        )?;
+        // Clear old cumulative data (now using deltas)
+        conn.execute(
+            "DELETE FROM snapshots_1s WHERE COALESCE(total_prompt_tokens,0) > 10000000000000",
+            [],
+        )?;
+        conn.execute(
+            "DELETE FROM snapshots_1h WHERE COALESCE(total_prompt_tokens,0) > 10000000000000",
+            [],
+        )?;
+        conn.execute(
+            "DELETE FROM snapshots_1d WHERE COALESCE(total_prompt_tokens,0) > 10000000000000",
+            [],
+        )?;
+
+        // Add columns if they don't exist (SQLite has no IF NOT EXISTS for
+        // ALTER TABLE ADD COLUMN). Each check is guarded by PRAGMA table_info
+        // so existing databases are migrated without losing data.
+        let add_col =
+            |conn: &Connection, table: &str, col: &str, decl: &str| -> rusqlite::Result<()> {
+                let cols: Vec<String> = conn
+                    .prepare(&format!("PRAGMA table_info({})", table))?
+                    .query_map([], |r| r.get::<_, String>(1))?
+                    .filter_map(Result::ok)
+                    .collect();
+                if !cols.contains(&col.to_string()) {
+                    conn.execute_batch(&format!(
+                        "ALTER TABLE {} ADD COLUMN {} {}",
+                        table, col, decl
+                    ))?;
+                }
+                Ok(())
+            };
+        add_col(conn, "snapshots_1s", "preemptions_total", "INTEGER")?;
+        add_col(conn, "snapshots_1s", "queue_time_ms", "REAL")?;
+        add_col(conn, "snapshots_1s", "tpot_ms", "REAL")?;
+        add_col(conn, "snapshots_1h", "kv_cache_pct_max", "REAL")?;
+        add_col(conn, "snapshots_1h", "preemptions_total", "INTEGER")?;
+        add_col(conn, "snapshots_1h", "queue_time_ms_avg", "REAL")?;
+        add_col(conn, "snapshots_1h", "tpot_ms_avg", "REAL")?;
+        add_col(conn, "snapshots_1d", "kv_cache_pct_max", "REAL")?;
+        add_col(conn, "snapshots_1d", "preemptions_total", "INTEGER")?;
+        add_col(conn, "snapshots_1d", "queue_time_ms_avg", "REAL")?;
+        add_col(conn, "snapshots_1d", "tpot_ms_avg", "REAL")?;
+
+        // Legacy databases may have been created before the UNIQUE constraint
+        // on (engine_key, bucket_ts) was added to the CREATE TABLE statement.
+        // The rollup INSERT … ON CONFLICT(engine_key, bucket_ts) requires a
+        // UNIQUE constraint or PRIMARY KEY covering those columns. Add a
+        // unique index if the table itself doesn't have one (IF NOT EXISTS
+        // makes this idempotent).
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_1h_unique ON snapshots_1h(engine_key, bucket_ts);
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_1d_unique ON snapshots_1d(engine_key, bucket_ts);",
+        )?;
+
+        // One-time backfill: historical `power_watts` values were recorded
+        // from a single node's GPU(s) only. Now that multi-node monitoring is
+        // active, multiply every existing power value by the cluster size (4
+        // DGX nodes) so old data is comparable to the new total-cluster
+        // recordings. Guarded by the `power_backfill_done` settings key so it
+        // runs exactly once.
+        const CLUSTER_NODE_COUNT: f64 = 4.0;
+        let backfill_done: Option<String> = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'power_backfill_done'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .map(Some)
+            .or::<rusqlite::Error>(Ok(None))?;
+        if backfill_done.is_none() {
+            let updated_1s = conn.execute(
+                "UPDATE snapshots_1s SET power_watts = power_watts * ?1 \
+                 WHERE power_watts IS NOT NULL",
+                params![CLUSTER_NODE_COUNT],
+            )?;
+            let updated_1h = conn.execute(
+                "UPDATE snapshots_1h SET power_watts_sum = power_watts_sum * ?1 \
+                 WHERE power_watts_sum IS NOT NULL",
+                params![CLUSTER_NODE_COUNT],
+            )?;
+            let updated_1d = conn.execute(
+                "UPDATE snapshots_1d SET power_watts_sum = power_watts_sum * ?1 \
+                 WHERE power_watts_sum IS NOT NULL",
+                params![CLUSTER_NODE_COUNT],
+            )?;
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('power_backfill_done', ?1)",
+                params![CLUSTER_NODE_COUNT as i64],
+            )?;
+            info!(
+                "History backfill: multiplied power by {} for {} 1s + {} 1h + {} 1d rows",
+                CLUSTER_NODE_COUNT, updated_1s, updated_1h, updated_1d
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Check if historical logging is enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// Toggle historical logging on/off and persist the setting.
+    pub async fn set_enabled(&self, on: bool) -> rusqlite::Result<()> {
+        let val = if on { "true" } else { "false" };
+        self.enabled.store(on, Ordering::Relaxed);
+        let db = self.inner.lock().await;
+        db.execute(
+            "INSERT INTO settings (key, value) VALUES ('history_enabled', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![val],
+        )?;
+        info!(
+            "History logging {}",
+            if on { "enabled" } else { "disabled" }
+        );
+        Ok(())
+    }
+
+    /// Get a setting value by key.
+    pub async fn get_setting(&self, key: &str) -> rusqlite::Result<Option<String>> {
+        let db = self.inner.lock().await;
+        db.query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })
+    }
+
+    /// Upsert a setting value.
+    pub async fn set_setting(&self, key: &str, value: &str) -> rusqlite::Result<()> {
+        let db = self.inner.lock().await;
+        db.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Insert a 1-second snapshot. Called every poll cycle.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_1s(
+        &self,
+        engine_key: &str,
+        ts: i64,
+        total_prompt_tokens: Option<i64>,
+        total_gen_tokens: Option<i64>,
+        total_requests: Option<i64>,
+        prompt_tps: Option<f64>,
+        decode_tps: Option<f64>,
+        ttft_ms: Option<f64>,
+        itl_ms: Option<f64>,
+        e2e_ms: Option<f64>,
+        power_watts: Option<f64>,
+        gpu_util: Option<f64>,
+        gpu_temp: Option<f64>,
+        active_requests: Option<i64>,
+        queued_requests: Option<i64>,
+        kv_cache_pct: Option<f64>,
+        prefix_cache_hit: Option<f64>,
+        cpu_util: Option<f64>,
+        mem_used_pct: Option<f64>,
+        preemptions_total: Option<i64>,
+        queue_time_ms: Option<f64>,
+        tpot_ms: Option<f64>,
+    ) -> rusqlite::Result<()> {
+        if !self.is_enabled() {
+            return Ok(());
+        }
+        let db = self.inner.lock().await;
+        db.execute(
+            "INSERT INTO snapshots_1s
+             (engine_key, ts, total_prompt_tokens, total_gen_tokens, total_requests,
+              prompt_tps, decode_tps, ttft_ms, itl_ms, e2e_ms,
+              power_watts, gpu_util, gpu_temp, active_requests, queued_requests,
+              kv_cache_pct, prefix_cache_hit, cpu_util, mem_used_pct, preemptions_total,
+              queue_time_ms, tpot_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
+            params![
+                engine_key,
+                ts,
+                total_prompt_tokens,
+                total_gen_tokens,
+                total_requests,
+                prompt_tps,
+                decode_tps,
+                ttft_ms,
+                itl_ms,
+                e2e_ms,
+                power_watts,
+                gpu_util,
+                gpu_temp,
+                active_requests,
+                queued_requests,
+                kv_cache_pct,
+                prefix_cache_hit,
+                cpu_util,
+                mem_used_pct,
+                preemptions_total,
+                queue_time_ms,
+                tpot_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Roll up completed hours into hourly records and prune the 1s source data.
+    /// Should be called periodically (e.g. once per hour by a background task).
+    pub async fn rollup_1s_to_1h(&self) -> rusqlite::Result<u64> {
+        let db = self.inner.lock().await;
+        // Find all complete hours that haven't been rolled up yet.
+        // We compute the latest hour boundary from the data.
+        // A "complete hour" is one whose all-60-minutes-worth of data has
+        // passed — i.e., the current time has moved past that hour.
+        let now_ms = chrono_now_ms();
+        let current_hour_start = (now_ms / 3_600_000) * 3_600_000;
+
+        // Roll up every complete hour that has data
+        let rows = db.execute(
+            "INSERT OR IGNORE INTO snapshots_1h
+             (engine_key, bucket_ts,
+              total_prompt_tokens, total_gen_tokens, total_requests,
+              prompt_tps_avg, prompt_tps_max,
+              decode_tps_avg, decode_tps_max,
+              power_watts_sum,
+              gpu_util_avg, gpu_temp_avg, gpu_temp_max,
+              active_requests_max, queued_requests_max,
+              kv_cache_pct_avg, kv_cache_pct_max, prefix_cache_hit_avg,
+              cpu_util_avg, sample_count, preemptions_total,
+              queue_time_ms_avg, tpot_ms_avg)
+             SELECT
+               engine_key, (ts / 3600000) * 3600000,
+               SUM(COALESCE(total_prompt_tokens,0)), SUM(COALESCE(total_gen_tokens,0)),
+               SUM(COALESCE(total_requests,0)),
+               AVG(prompt_tps), MAX(prompt_tps),
+               AVG(decode_tps), MAX(decode_tps),
+               SUM(power_watts),
+               AVG(gpu_util), AVG(gpu_temp), MAX(gpu_temp),
+               MAX(active_requests), MAX(queued_requests),
+               AVG(kv_cache_pct), MAX(kv_cache_pct), AVG(prefix_cache_hit),
+               AVG(cpu_util), COUNT(*), MAX(preemptions_total),
+               AVG(queue_time_ms), AVG(tpot_ms)
+             FROM snapshots_1s
+             WHERE ts < ?1
+             GROUP BY engine_key, (ts / 3600000)
+             ON CONFLICT(engine_key, bucket_ts) DO NOTHING",
+            params![current_hour_start],
+        )?;
+
+        // Prune the 1s data that was just rolled up (any completed hour)
+        let deleted = db.execute(
+            "DELETE FROM snapshots_1s WHERE ts < ?1",
+            params![current_hour_start],
+        )?;
+
+        if rows > 0 {
+            info!(
+                "History: rolled up {} hours from 1s data, pruned {} rows",
+                rows, deleted
+            );
+        }
+        Ok(rows as u64)
+    }
+
+    /// Roll up completed days from hourly data.
+    pub async fn rollup_1h_to_1d(&self) -> rusqlite::Result<u64> {
+        let db = self.inner.lock().await;
+        let now_ms = chrono_now_ms();
+        let current_day_start = (now_ms / 86_400_000) * 86_400_000;
+
+        let rows = db.execute(
+            "INSERT OR IGNORE INTO snapshots_1d
+             (engine_key, bucket_ts,
+              total_prompt_tokens, total_gen_tokens, total_requests,
+              prompt_tps_avg, prompt_tps_max,
+              decode_tps_avg, decode_tps_max,
+              power_watts_sum,
+              gpu_util_avg, gpu_temp_avg, gpu_temp_max,
+              active_requests_max, queued_requests_max,
+              kv_cache_pct_avg, kv_cache_pct_max, prefix_cache_hit_avg,
+              cpu_util_avg, sample_count, preemptions_total,
+              queue_time_ms_avg, tpot_ms_avg)
+             SELECT
+               engine_key, (bucket_ts / 86400000) * 86400000,
+               SUM(COALESCE(total_prompt_tokens,0)), SUM(COALESCE(total_gen_tokens,0)),
+               SUM(COALESCE(total_requests,0)),
+               AVG(prompt_tps_avg), MAX(prompt_tps_max),
+               AVG(decode_tps_avg), MAX(decode_tps_max),
+               SUM(power_watts_sum),
+               AVG(gpu_util_avg), AVG(gpu_temp_avg), MAX(gpu_temp_max),
+               MAX(active_requests_max), MAX(queued_requests_max),
+               AVG(kv_cache_pct_avg), MAX(kv_cache_pct_max), AVG(prefix_cache_hit_avg),
+               AVG(cpu_util_avg), SUM(sample_count), MAX(preemptions_total),
+               AVG(queue_time_ms_avg), AVG(tpot_ms_avg)
+             FROM snapshots_1h
+             WHERE bucket_ts < ?1
+             GROUP BY engine_key, (bucket_ts / 86400000)
+             ON CONFLICT(engine_key, bucket_ts) DO NOTHING",
+            params![current_day_start],
+        )?;
+
+        // Prune hourly data older than 30 days
+        let cutoff = now_ms - 30 * 86_400_000;
+        let deleted = db.execute(
+            "DELETE FROM snapshots_1h WHERE bucket_ts < ?1",
+            params![cutoff],
+        )?;
+
+        if rows > 0 {
+            info!(
+                "History: rolled up {} days from hourly data, pruned {} stale hourly rows",
+                rows, deleted
+            );
+        }
+        Ok(rows as u64)
+    }
+
+    /// Query summary stats for a given engine and time window.
+    /// Returns (delta_prompt, delta_gen, avg_decode_tps, avg_prompt_tps,
+    ///          peak_active, peak_queued, power_kwh, total_seconds)
+    pub async fn query_summary(
+        &self,
+        engine_key: &str,
+        since_ms: i64,
+        until_ms: i64,
+    ) -> rusqlite::Result<Option<HistorySummary>> {
+        let db = self.inner.lock().await;
+
+        // All three queries use the same structure: SUM for deltas, MAX for gauges.
+        // Try daily → hourly → raw, falling through if empty.
+        let try_tables = [
+            ("snapshots_1d", "daily", "bucket_ts"),
+            ("snapshots_1h", "hourly", "bucket_ts"),
+            ("snapshots_1s", "raw", "ts"),
+        ];
+
+        for (table, source, ts_col) in &try_tables {
+            // For raw data: each row = 1 second of data.
+            // For rolled-up data: use sample_count (stored in 1h/1d tables) to weight
+            // averages and compute actual runtime instead of calendar span.
+            let gauge_suffix = if *source == "raw" { "" } else { "_max" };
+            let power_suffix = if *source == "raw" { "" } else { "_sum" };
+            let sql = if *source == "raw" {
+                format!(
+                    "SELECT
+                       COALESCE(SUM(total_prompt_tokens),0),
+                       COALESCE(SUM(total_gen_tokens),0),
+                       COALESCE(SUM(total_requests), 0),
+                       AVG(decode_tps),
+                       AVG(prompt_tps),
+                       MAX(active_requests),
+                       MAX(queued_requests),
+                       SUM(power_watts),
+                       COUNT(*),
+                       MAX(kv_cache_pct),
+                       AVG(kv_cache_pct),
+                       MAX(preemptions_total)
+                     FROM {}
+                      WHERE engine_key = ?1 AND {} >= ?2 AND {} <= ?3",
+                    table, ts_col, ts_col,
+                )
+            } else {
+                // Weighted average: SUM(val_avg * sample_count) / SUM(sample_count)
+                // Runtime: SUM(sample_count) seconds (each sample = 1 second of raw data)
+                format!(
+                     "SELECT
+                        COALESCE(SUM(total_prompt_tokens),0),
+                        COALESCE(SUM(total_gen_tokens),0),
+                        COALESCE(SUM(total_requests), 0),
+                        COALESCE(SUM(decode_tps_avg * sample_count) / NULLIF(SUM(sample_count), 0), 0),
+                        COALESCE(SUM(prompt_tps_avg * sample_count) / NULLIF(SUM(sample_count), 0), 0),
+                        MAX(active_requests{}),
+                        MAX(queued_requests{}),
+                        SUM(power_watts{}),
+                        SUM(sample_count),
+                        MAX(kv_cache_pct_max),
+                        SUM(kv_cache_pct_avg * sample_count) / NULLIF(SUM(sample_count), 0),
+                        MAX(preemptions_total)
+                      FROM {}
+                      WHERE engine_key = ?1 AND {} >= ?2 AND {} <= ?3",
+                     gauge_suffix, gauge_suffix, power_suffix, table, ts_col, ts_col,
+                 )
+            };
+
+            let result = db.query_row(&sql, params![engine_key, since_ms, until_ms], |r| {
+                let delta_prompt: i64 = r.get::<_, Option<i64>>(0)?.unwrap_or(0);
+                let delta_gen: i64 = r.get::<_, Option<i64>>(1)?.unwrap_or(0);
+                let total_reqs: i64 = r.get::<_, Option<i64>>(2)?.unwrap_or(0);
+                let avg_decode: f64 = r.get::<_, Option<f64>>(3)?.unwrap_or(0.0);
+                let avg_prompt: f64 = r.get::<_, Option<f64>>(4)?.unwrap_or(0.0);
+                let peak_active: i64 = r.get::<_, Option<i64>>(5)?.unwrap_or(0);
+                let peak_queued: i64 = r.get::<_, Option<i64>>(6)?.unwrap_or(0);
+                let power_sum: f64 = r.get::<_, Option<f64>>(7)?.unwrap_or(0.0);
+                let count: i64 = r.get::<_, Option<i64>>(8)?.unwrap_or(0);
+                let peak_kv_cache_pct: Option<f64> = r.get::<_, Option<f64>>(9)?;
+                let avg_kv_cache_pct: Option<f64> = r.get::<_, Option<f64>>(10)?;
+                let total_preemptions: Option<i64> = r.get::<_, Option<i64>>(11)?;
+                Ok(HistorySummary {
+                    delta_prompt_tokens: delta_prompt,
+                    delta_gen_tokens: delta_gen,
+                    total_requests: total_reqs,
+                    avg_decode_tps: avg_decode,
+                    avg_prompt_tps: avg_prompt,
+                    peak_active_requests: peak_active,
+                    peak_queued_requests: peak_queued,
+                    peak_kv_cache_pct,
+                    avg_kv_cache_pct,
+                    total_preemptions,
+                    power_kwh: power_sum / 3600.0 / 1000.0,
+                    total_seconds: Some(count as f64),
+                    source_table: source,
+                })
+            });
+
+            match result {
+                Ok(summary) => {
+                    // Only return if there were actually non-zero values
+                    if summary.delta_prompt_tokens > 0
+                        || summary.delta_gen_tokens > 0
+                        || summary.total_requests > 0
+                    {
+                        return Ok(Some(summary));
+                    }
+                }
+                Err(rusqlite::Error::QueryReturnedNoRows) => continue,
+                Err(e) => {
+                    tracing::warn!("History query failed on {}: {}", table, e);
+                    continue;
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Query time-series data points for a given metric and time window.
+    ///
+    /// The table is chosen by the time range:
+    ///   - ≤ 1 hour: `snapshots_1s` (raw, 1s resolution)
+    ///   - ≤ 24 hours: `snapshots_1h` (hourly buckets)
+    ///   - > 24 hours: `snapshots_1d` (daily buckets)
+    ///
+    /// Returns one data point per row, ordered by timestamp ascending.
+    /// An empty vec means there is no data for the given engine/metric in
+    /// the requested window (or the metric has no aggregate column for the
+    /// chosen table, e.g. `mem_used_pct` over a > 1 h window).
+    pub async fn query_timeseries(
+        &self,
+        engine_key: &str,
+        metric: &str,
+        since_ms: i64,
+        until_ms: i64,
+    ) -> rusqlite::Result<Vec<TimeSeriesPoint>> {
+        let db = self.inner.lock().await;
+
+        const HOUR_MS: i64 = 3_600_000;
+        const DAY_MS: i64 = 86_400_000;
+
+        // Resolve the metric to column names for the raw (1s) and aggregated
+        // (1h/1d) tables. `None` for the aggregate column means the metric is
+        // only available at 1s resolution (e.g. mem_used_pct).
+        let (raw_col, agg_col): (&str, Option<&str>) = match metric {
+            "prompt_tps" => ("prompt_tps", Some("prompt_tps_avg")),
+            "decode_tps" => ("decode_tps", Some("decode_tps_avg")),
+            "ttft_ms" => ("ttft_ms", Some("ttft_ms_p95")),
+            "itl_ms" => ("itl_ms", Some("itl_ms_p95")),
+            "e2e_ms" => ("e2e_ms", Some("e2e_ms_p95")),
+            "active_requests" => ("active_requests", Some("active_requests_max")),
+            "queued_requests" => ("queued_requests", Some("queued_requests_max")),
+            "total_requests" => ("total_requests", Some("total_requests")),
+            "kv_cache_pct" => ("kv_cache_pct", Some("kv_cache_pct_avg")),
+            "prefix_cache_hit" => ("prefix_cache_hit", Some("prefix_cache_hit_avg")),
+            "gpu_util" => ("gpu_util", Some("gpu_util_avg")),
+            "gpu_temp" => ("gpu_temp", Some("gpu_temp_avg")),
+            "power_watts" => ("power_watts", Some("power_watts_sum")),
+            "cpu_util" => ("cpu_util", Some("cpu_util_avg")),
+            "mem_used_pct" => ("mem_used_pct", None),
+            "preemptions_total" => ("preemptions_total", Some("preemptions_total")),
+            "queue_time_ms" => ("queue_time_ms", Some("queue_time_ms_avg")),
+            "tpot_ms" => ("tpot_ms", Some("tpot_ms_avg")),
+            _ => return Ok(Vec::new()),
+        };
+
+        let range_ms = until_ms.saturating_sub(since_ms);
+
+        if range_ms <= HOUR_MS {
+            // Raw 1s table.
+            let sql = format!(
+                "SELECT ts, {col} FROM snapshots_1s \
+                 WHERE engine_key = ?1 AND ts >= ?2 AND ts <= ?3 \
+                 ORDER BY ts ASC",
+                col = raw_col
+            );
+            let mut stmt = db.prepare(&sql)?;
+            let points = stmt
+                .query_map(params![engine_key, since_ms, until_ms], |r| {
+                    let ts: i64 = r.get(0)?;
+                    let val: Option<f64> = r.get(1)?;
+                    Ok(TimeSeriesPoint {
+                        timestamp_ms: ts,
+                        value: val.unwrap_or(0.0),
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(points)
+        } else {
+            // Aggregated table (1h or 1d).
+            let agg = match agg_col {
+                Some(c) => c,
+                None => return Ok(Vec::new()),
+            };
+            let (table, ts_col) = if range_ms <= DAY_MS {
+                ("snapshots_1h", "bucket_ts")
+            } else {
+                ("snapshots_1d", "bucket_ts")
+            };
+
+            // For power_watts the aggregated column is a sum; divide by
+            // sample_count to recover the average power for the bucket.
+            let value_expr = if metric == "power_watts" {
+                format!("{agg} / NULLIF(sample_count, 0)")
+            } else {
+                agg.to_owned()
+            };
+
+            let sql = format!(
+                "SELECT {ts_col}, {value_expr} FROM {table} \
+                 WHERE engine_key = ?1 AND {ts_col} >= ?2 AND {ts_col} <= ?3 \
+                 ORDER BY {ts_col} ASC",
+            );
+            let mut stmt = db.prepare(&sql)?;
+            let points = stmt
+                .query_map(params![engine_key, since_ms, until_ms], |r| {
+                    let ts: i64 = r.get(0)?;
+                    let val: Option<f64> = r.get(1)?;
+                    Ok(TimeSeriesPoint {
+                        timestamp_ms: ts,
+                        value: val.unwrap_or(0.0),
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(points)
+        }
+    }
+
+    /// Get database size in bytes.
+    pub async fn db_size(&self) -> rusqlite::Result<i64> {
+        let db = self.inner.lock().await;
+        db.query_row("SELECT COALESCE(SUM(pgsize), 0) FROM dbstat", [], |r| {
+            r.get(0)
+        })
+    }
+
+    /// Prune data older than the given timestamp across all tables.
+    pub async fn prune(&self, older_than_ms: i64) -> rusqlite::Result<(usize, usize, usize)> {
+        let db = self.inner.lock().await;
+        let s1 = db.execute(
+            "DELETE FROM snapshots_1s WHERE ts < ?1",
+            params![older_than_ms],
+        )?;
+        let h1 = db.execute(
+            "DELETE FROM snapshots_1h WHERE bucket_ts < ?1",
+            params![older_than_ms],
+        )?;
+        let d1 = db.execute(
+            "DELETE FROM snapshots_1d WHERE bucket_ts < ?1",
+            params![older_than_ms],
+        )?;
+        info!(
+            "History: pruned {}s+{}h+{}d rows older than ts={}",
+            s1, h1, d1, older_than_ms
+        );
+        Ok((s1, h1, d1))
+    }
+}
+
+/// Summary statistics returned by the history query endpoint.
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct HistorySummary {
+    pub delta_prompt_tokens: i64,
+    pub delta_gen_tokens: i64,
+    pub avg_decode_tps: f64,
+    pub avg_prompt_tps: f64,
+    pub peak_active_requests: i64,
+    pub peak_queued_requests: i64,
+    pub total_requests: i64,
+    /// Peak KV cache utilization (%) over the window.
+    pub peak_kv_cache_pct: Option<f64>,
+    /// Average KV cache utilization (%) over the window.
+    pub avg_kv_cache_pct: Option<f64>,
+    /// Latest cumulative preemption count over the window.
+    pub total_preemptions: Option<i64>,
+    /// Total energy consumption in kilowatt-hours.
+    pub power_kwh: f64,
+    /// Total seconds represented by the data (for calculating hours alive).
+    pub total_seconds: Option<f64>,
+    /// Which internal table satisfied the query (raw | hourly | daily).
+    pub source_table: &'static str,
+}
+
+/// A single time-series data point returned by [`HistoryDb::query_timeseries`].
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct TimeSeriesPoint {
+    pub timestamp_ms: i64,
+    pub value: f64,
+}
+
+/// Current Unix timestamp in milliseconds.
+fn chrono_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// Open an in-memory database for testing (skipping file I/O).
+    fn test_db() -> HistoryDb {
+        // We bypass HistoryDb::open and manually construct from an in-memory conn.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+            .unwrap();
+        // Run migrations manually since we aren't using HistoryDb::open
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS snapshots_1s (
+                engine_key         TEXT NOT NULL,
+                ts                 INTEGER NOT NULL,
+                total_prompt_tokens INTEGER,
+                total_gen_tokens   INTEGER,
+                total_requests     INTEGER,
+                prompt_tps         REAL,
+                decode_tps         REAL,
+                ttft_ms            REAL,
+                itl_ms             REAL,
+                e2e_ms             REAL,
+                power_watts        REAL,
+                gpu_util           REAL,
+                gpu_temp           REAL,
+                active_requests    INTEGER,
+                queued_requests    INTEGER,
+                kv_cache_pct       REAL,
+                prefix_cache_hit   REAL,
+                cpu_util           REAL,
+                mem_used_pct       REAL,
+                preemptions_total  INTEGER,
+                queue_time_ms      REAL,
+                tpot_ms            REAL
+            );
+            CREATE TABLE IF NOT EXISTS snapshots_1h (
+                engine_key          TEXT NOT NULL,
+                bucket_ts           INTEGER NOT NULL,
+                total_prompt_tokens INTEGER,
+                total_gen_tokens    INTEGER,
+                total_requests      INTEGER,
+                prompt_tps_avg      REAL,
+                prompt_tps_max      REAL,
+                decode_tps_avg      REAL,
+                decode_tps_max      REAL,
+                ttft_ms_p95         REAL,
+                itl_ms_p95          REAL,
+                e2e_ms_p95          REAL,
+                power_watts_sum     REAL,
+                gpu_util_avg        REAL,
+                gpu_temp_avg        REAL,
+                gpu_temp_max        REAL,
+                active_requests_max INTEGER,
+                queued_requests_max INTEGER,
+                kv_cache_pct_avg    REAL,
+                kv_cache_pct_max    REAL,
+                prefix_cache_hit_avg REAL,
+                cpu_util_avg        REAL,
+                sample_count        INTEGER NOT NULL,
+                preemptions_total   INTEGER,
+                queue_time_ms_avg   REAL,
+                tpot_ms_avg         REAL,
+                UNIQUE(engine_key, bucket_ts)
+            );
+            CREATE TABLE IF NOT EXISTS snapshots_1d (
+                engine_key          TEXT NOT NULL,
+                bucket_ts           INTEGER NOT NULL,
+                total_prompt_tokens INTEGER,
+                total_gen_tokens    INTEGER,
+                total_requests      INTEGER,
+                prompt_tps_avg      REAL,
+                prompt_tps_max      REAL,
+                decode_tps_avg      REAL,
+                decode_tps_max      REAL,
+                ttft_ms_p95         REAL,
+                itl_ms_p95          REAL,
+                e2e_ms_p95          REAL,
+                power_watts_sum     REAL,
+                gpu_util_avg        REAL,
+                gpu_temp_avg        REAL,
+                gpu_temp_max        REAL,
+                active_requests_max INTEGER,
+                queued_requests_max INTEGER,
+                kv_cache_pct_avg    REAL,
+                kv_cache_pct_max    REAL,
+                prefix_cache_hit_avg REAL,
+                cpu_util_avg        REAL,
+                sample_count        INTEGER NOT NULL,
+                preemptions_total   INTEGER,
+                queue_time_ms_avg   REAL,
+                tpot_ms_avg         REAL
+            );
+        ",
+        )
+        .unwrap();
+        let enabled = Arc::new(AtomicBool::new(true));
+        HistoryDb {
+            inner: Arc::new(Mutex::new(conn)),
+            enabled,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_insert_and_query_1s() {
+        let db = test_db();
+        let key = "test-engine";
+        let now = chrono_now_ms();
+
+        db.insert_1s(
+            key,
+            now,
+            Some(100),
+            Some(200),
+            Some(5),
+            Some(50.0),
+            Some(30.0),
+            Some(10.0),
+            Some(5.0),
+            Some(100.0),
+            Some(150.0),
+            Some(80.0),
+            Some(45.0),
+            Some(3),
+            Some(1),
+            Some(0.75),
+            Some(0.1),
+            Some(60.0),
+            Some(50.0),
+            Some(3),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let summary = db.query_summary(key, now - 1000, now + 1000).await.unwrap();
+        assert!(summary.is_some());
+        let s = summary.unwrap();
+        assert_eq!(s.delta_prompt_tokens, 100);
+        assert_eq!(s.delta_gen_tokens, 200);
+        assert_eq!(s.total_requests, 5);
+        assert_eq!(s.source_table, "raw");
+        assert!(s.power_kwh > 0.0);
+        assert_eq!(s.total_preemptions, Some(3));
+    }
+
+    #[tokio::test]
+    async fn test_setting_persistence() {
+        let db = test_db();
+        db.set_setting("cloud_prompt_rate", "1.50").await.unwrap();
+        let val = db.get_setting("cloud_prompt_rate").await.unwrap();
+        assert_eq!(val, Some("1.50".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_is_enabled_defaults_true() {
+        let db = test_db();
+        assert!(db.is_enabled());
+    }
+
+    #[tokio::test]
+    async fn test_toggle_enabled() {
+        let db = test_db();
+        db.set_enabled(false).await.unwrap();
+        assert!(!db.is_enabled());
+        db.set_enabled(true).await.unwrap();
+        assert!(db.is_enabled());
+    }
+
+    #[tokio::test]
+    async fn test_insert_disabled_does_nothing() {
+        let db = test_db();
+        db.set_enabled(false).await.unwrap();
+        let key = "test-engine";
+        let now = chrono_now_ms();
+        db.insert_1s(
+            key,
+            now,
+            Some(100),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let summary = db.query_summary(key, now - 1000, now + 1000).await.unwrap();
+        assert!(summary.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_rollup_1s_to_1h() {
+        let db = test_db();
+        let key = "test-engine";
+        // Insert data across two different hours
+        let hour1 = (chrono_now_ms() / 3_600_000) * 3_600_000 - 7_200_000; // 2 hours ago
+        let hour2 = (chrono_now_ms() / 3_600_000) * 3_600_000 - 3_600_000; // 1 hour ago
+
+        db.insert_1s(
+            key,
+            hour1 + 1000,
+            Some(50),
+            Some(100),
+            Some(2),
+            Some(40.0),
+            Some(25.0),
+            None,
+            None,
+            None,
+            Some(100.0),
+            Some(70.0),
+            Some(40.0),
+            Some(2),
+            Some(0),
+            Some(0.5),
+            Some(0.05),
+            Some(55.0),
+            Some(45.0),
+            Some(0),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.insert_1s(
+            key,
+            hour1 + 2000,
+            Some(60),
+            Some(120),
+            Some(3),
+            Some(45.0),
+            Some(28.0),
+            None,
+            None,
+            None,
+            Some(110.0),
+            Some(72.0),
+            Some(41.0),
+            Some(3),
+            Some(1),
+            Some(0.6),
+            Some(0.06),
+            Some(58.0),
+            Some(48.0),
+            Some(2),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.insert_1s(
+            key,
+            hour2 + 1000,
+            Some(70),
+            Some(140),
+            Some(4),
+            Some(50.0),
+            Some(30.0),
+            None,
+            None,
+            None,
+            Some(120.0),
+            Some(75.0),
+            Some(42.0),
+            Some(4),
+            Some(0),
+            Some(0.55),
+            Some(0.04),
+            Some(60.0),
+            Some(50.0),
+            Some(5),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let rolled = db.rollup_1s_to_1h().await.unwrap();
+        assert_eq!(rolled, 2, "should roll up 2 hourly buckets");
+
+        // Query the hourly data — it should fall through to hourly table
+        let summary = db.query_summary(key, hour1, hour2 + 5000).await.unwrap();
+        assert!(summary.is_some());
+        let s = summary.unwrap();
+        assert_eq!(s.source_table, "hourly");
+        assert_eq!(s.total_requests, 9, "should sum all requests: 2+3+4");
+        assert_eq!(
+            s.total_preemptions,
+            Some(5),
+            "MAX of cumulative preemptions"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_query_no_data_returns_none() {
+        let db = test_db();
+        let summary = db
+            .query_summary("nonexistent", 0, chrono_now_ms())
+            .await
+            .unwrap();
+        assert!(summary.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_prune_removes_old_data() {
+        let db = test_db();
+        let key = "test-engine";
+        let now = chrono_now_ms();
+
+        db.insert_1s(
+            key,
+            now - 100_000,
+            Some(10),
+            Some(20),
+            Some(1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.insert_1s(
+            key,
+            now - 50_000,
+            Some(30),
+            Some(40),
+            Some(2),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Prune data older than 60 seconds ago
+        let (s, _, _) = db.prune(now - 60_000).await.unwrap();
+        assert_eq!(s, 1, "should delete 1 old row");
+
+        let summary = db.query_summary(key, now - 200_000, now).await.unwrap();
+        assert!(summary.is_some());
+        let s = summary.unwrap();
+        assert_eq!(
+            s.delta_prompt_tokens, 30,
+            "only the newer row should remain"
+        );
+    }
+
+    /// The one-time power backfill migration should multiply all existing
+    /// power values by the cluster size (4) when it runs, and be idempotent
+    /// on subsequent runs (guarded by the `power_backfill_done` settings key).
+    #[tokio::test]
+    async fn test_power_backfill_multiplies_and_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+            .unwrap();
+        // First migrate creates the schema and runs the backfill (which is a
+        // no-op on an empty DB but still marks `power_backfill_done`).
+        HistoryDb::migrate(&conn).unwrap();
+
+        // Simulate pre-existing data recorded before the backfill: clear the
+        // marker, insert rows with known power values, then re-run migrate.
+        conn.execute("DELETE FROM settings WHERE key = 'power_backfill_done'", [])
+            .unwrap();
+        // Insert a 1s row with a known power value.
+        conn.execute(
+            "INSERT INTO snapshots_1s (engine_key, ts, power_watts) VALUES ('e1', 1000, 100.0)",
+            [],
+        )
+        .unwrap();
+        // Insert a 1h row with a known power_watts_sum.
+        conn.execute(
+            "INSERT INTO snapshots_1h (engine_key, bucket_ts, power_watts_sum, sample_count) \
+             VALUES ('e1', 3600000, 200.0, 60)",
+            [],
+        )
+        .unwrap();
+        // Insert a 1d row with a known power_watts_sum.
+        conn.execute(
+            "INSERT INTO snapshots_1d (engine_key, bucket_ts, power_watts_sum, sample_count) \
+             VALUES ('e1', 86400000, 300.0, 1440)",
+            [],
+        )
+        .unwrap();
+
+        // Run migrate again — this time the backfill should fire on the data.
+        HistoryDb::migrate(&conn).unwrap();
+
+        // All power values should be multiplied by 4.
+        let p1s: f64 = conn
+            .query_row(
+                "SELECT power_watts FROM snapshots_1s WHERE engine_key='e1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(p1s, 400.0, "1s power should be 100 * 4");
+        let p1h: f64 = conn
+            .query_row(
+                "SELECT power_watts_sum FROM snapshots_1h WHERE engine_key='e1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(p1h, 800.0, "1h power should be 200 * 4");
+        let p1d: f64 = conn
+            .query_row(
+                "SELECT power_watts_sum FROM snapshots_1d WHERE engine_key='e1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(p1d, 1200.0, "1d power should be 300 * 4");
+
+        // The settings key should be set.
+        let done: String = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key='power_backfill_done'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(done, "4");
+
+        // Run migrate a third time — should NOT multiply again.
+        HistoryDb::migrate(&conn).unwrap();
+        let p1s_again: f64 = conn
+            .query_row(
+                "SELECT power_watts FROM snapshots_1s WHERE engine_key='e1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(p1s_again, 400.0, "backfill must be idempotent");
+    }
+
+    // -----------------------------------------------------------------
+    // query_timeseries tests
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_timeseries_1s_returns_data_points() {
+        let db = test_db();
+        let key = "ts-engine";
+        // Use a fixed base so the range logic is deterministic.
+        let base = 1_700_000_000_000i64;
+
+        db.insert_1s(
+            key,
+            base,
+            Some(100),
+            Some(200),
+            Some(5),
+            Some(50.0),
+            Some(30.0),
+            Some(10.0),
+            Some(5.0),
+            Some(100.0),
+            Some(150.0),
+            Some(80.0),
+            Some(45.0),
+            Some(3),
+            Some(1),
+            Some(0.75),
+            Some(0.1),
+            Some(60.0),
+            Some(50.0),
+            Some(3),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.insert_1s(
+            key,
+            base + 1000,
+            Some(110),
+            Some(210),
+            Some(6),
+            Some(55.0),
+            Some(32.0),
+            Some(12.0),
+            Some(6.0),
+            Some(110.0),
+            Some(160.0),
+            Some(82.0),
+            Some(46.0),
+            Some(4),
+            Some(2),
+            Some(0.8),
+            Some(0.15),
+            Some(62.0),
+            Some(52.0),
+            Some(5),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Range of 2 seconds → ≤ 1 hour → raw 1s table.
+        let points = db
+            .query_timeseries(key, "decode_tps", base, base + 2000)
+            .await
+            .unwrap();
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0].timestamp_ms, base);
+        assert!((points[0].value - 30.0).abs() < f64::EPSILON);
+        assert_eq!(points[1].timestamp_ms, base + 1000);
+        assert!((points[1].value - 32.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_timeseries_nonexistent_engine_returns_empty() {
+        let db = test_db();
+        let points = db
+            .query_timeseries("ghost", "prompt_tps", 0, 1_000_000)
+            .await
+            .unwrap();
+        assert!(points.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_timeseries_unknown_metric_returns_empty() {
+        let db = test_db();
+        let points = db
+            .query_timeseries("any", "bogus_metric", 0, 1_000_000)
+            .await
+            .unwrap();
+        assert!(points.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_timeseries_1h_aggregation() {
+        let db = test_db();
+        // Insert directly into snapshots_1h (bypassing rollup, which is
+        // time-of-day dependent and prunes 1s data).
+        {
+            let conn = db.inner.lock().await;
+            conn.execute(
+                "INSERT INTO snapshots_1h \
+                 (engine_key, bucket_ts, prompt_tps_avg, decode_tps_avg, sample_count) \
+                 VALUES ('e1', 3600000, 100.0, 50.0, 60)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO snapshots_1h \
+                 (engine_key, bucket_ts, prompt_tps_avg, decode_tps_avg, sample_count) \
+                 VALUES ('e1', 7200000, 120.0, 55.0, 60)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Range = 7 200 000 ms = 2 hours → > 1 hour, ≤ 24 hours → 1h table.
+        let points = db
+            .query_timeseries("e1", "prompt_tps", 0, 7_200_000)
+            .await
+            .unwrap();
+        assert_eq!(points.len(), 2, "should return 2 hourly buckets");
+        assert_eq!(points[0].timestamp_ms, 3_600_000);
+        assert!((points[0].value - 100.0).abs() < f64::EPSILON);
+        assert_eq!(points[1].timestamp_ms, 7_200_000);
+        assert!((points[1].value - 120.0).abs() < f64::EPSILON);
+
+        // decode_tps should use decode_tps_avg from the 1h table.
+        let points = db
+            .query_timeseries("e1", "decode_tps", 0, 7_200_000)
+            .await
+            .unwrap();
+        assert_eq!(points.len(), 2);
+        assert!((points[0].value - 50.0).abs() < f64::EPSILON);
+        assert!((points[1].value - 55.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_timeseries_power_watts_averaged_in_aggregated() {
+        let db = test_db();
+        {
+            let conn = db.inner.lock().await;
+            // power_watts_sum = 6000.0, sample_count = 60 → avg = 100.0
+            conn.execute(
+                "INSERT INTO snapshots_1h \
+                 (engine_key, bucket_ts, power_watts_sum, sample_count) \
+                 VALUES ('e1', 3600000, 6000.0, 60)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Range > 1 hour → 1h table.
+        let points = db
+            .query_timeseries("e1", "power_watts", 0, 7_200_000)
+            .await
+            .unwrap();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].timestamp_ms, 3_600_000);
+        assert!(
+            (points[0].value - 100.0).abs() < 0.001,
+            "power_watts should be sum/sample_count = 100.0, got {}",
+            points[0].value
+        );
+    }
+
+    #[tokio::test]
+    async fn test_timeseries_mem_used_pct_only_in_1s() {
+        let db = test_db();
+        let key = "ts-engine";
+        let base = 1_700_000_000_000i64;
+
+        db.insert_1s(
+            key,
+            base,
+            Some(0),
+            Some(0),
+            Some(0),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(65.0),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Small range → 1s table → should get the value.
+        let points = db
+            .query_timeseries(key, "mem_used_pct", base, base + 2000)
+            .await
+            .unwrap();
+        assert_eq!(points.len(), 1);
+        assert!((points[0].value - 65.0).abs() < f64::EPSILON);
+
+        // Large range → 1h table → mem_used_pct has no aggregate → empty.
+        let points = db
+            .query_timeseries(key, "mem_used_pct", 0, 7_200_000)
+            .await
+            .unwrap();
+        assert!(points.is_empty(), "mem_used_pct has no aggregate column");
+    }
+
+    #[tokio::test]
+    async fn test_timeseries_queue_time_and_tpot_1s() {
+        let db = test_db();
+        let key = "ts-engine";
+        let base = 1_700_000_000_000i64;
+
+        db.insert_1s(
+            key,
+            base,
+            Some(100),
+            Some(200),
+            Some(5),
+            Some(50.0),
+            Some(30.0),
+            Some(10.0),
+            Some(5.0),
+            Some(100.0),
+            Some(150.0),
+            Some(80.0),
+            Some(45.0),
+            Some(3),
+            Some(1),
+            Some(0.75),
+            Some(0.1),
+            Some(60.0),
+            Some(50.0),
+            Some(3),
+            Some(15.0), // queue_time_ms
+            Some(25.0), // tpot_ms
+        )
+        .await
+        .unwrap();
+
+        // Query queue_time_ms at 1s resolution
+        let points = db
+            .query_timeseries(key, "queue_time_ms", base, base + 2000)
+            .await
+            .unwrap();
+        assert_eq!(points.len(), 1);
+        assert!((points[0].value - 15.0).abs() < f64::EPSILON);
+
+        // Query tpot_ms at 1s resolution
+        let points = db
+            .query_timeseries(key, "tpot_ms", base, base + 2000)
+            .await
+            .unwrap();
+        assert_eq!(points.len(), 1);
+        assert!((points[0].value - 25.0).abs() < f64::EPSILON);
+
+        // Query total_requests at 1s resolution
+        let points = db
+            .query_timeseries(key, "total_requests", base, base + 2000)
+            .await
+            .unwrap();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].value, 5.0);
+    }
+
+    #[tokio::test]
+    async fn test_timeseries_queue_time_and_tpot_1h_aggregation() {
+        let db = test_db();
+        let key = "ts-engine";
+        let hour1 = (chrono_now_ms() / 3_600_000) * 3_600_000 - 7_200_000;
+
+        db.insert_1s(
+            key,
+            hour1 + 1000,
+            Some(50),
+            Some(100),
+            Some(2),
+            Some(40.0),
+            Some(25.0),
+            None,
+            None,
+            None,
+            Some(100.0),
+            Some(70.0),
+            Some(40.0),
+            Some(2),
+            Some(0),
+            Some(0.5),
+            Some(0.05),
+            Some(55.0),
+            Some(45.0),
+            Some(0),
+            Some(10.0), // queue_time_ms
+            Some(20.0), // tpot_ms
+        )
+        .await
+        .unwrap();
+        db.insert_1s(
+            key,
+            hour1 + 2000,
+            Some(60),
+            Some(120),
+            Some(3),
+            Some(45.0),
+            Some(28.0),
+            None,
+            None,
+            None,
+            Some(110.0),
+            Some(72.0),
+            Some(41.0),
+            Some(3),
+            Some(1),
+            Some(0.6),
+            Some(0.06),
+            Some(58.0),
+            Some(48.0),
+            Some(2),
+            Some(30.0), // queue_time_ms
+            Some(40.0), // tpot_ms
+        )
+        .await
+        .unwrap();
+
+        let _rolled = db.rollup_1s_to_1h().await.unwrap();
+
+        // Query at 1h range → should hit 1h table with avg.
+        // Range must be > 1h and ≤ 24h to select the 1h table.
+        let range_end = hour1 + 7_200_000; // hour1 + 2h (well within 24h of hour1)
+        let range_start = hour1 - 3_600_000; // 1h before, total range = 3h
+        let points = db
+            .query_timeseries(key, "queue_time_ms", range_start, range_end)
+            .await
+            .unwrap();
+        assert_eq!(points.len(), 1);
+        // avg(10.0, 30.0) = 20.0
+        assert!((points[0].value - 20.0).abs() < f64::EPSILON);
+
+        let points = db
+            .query_timeseries(key, "tpot_ms", range_start, range_end)
+            .await
+            .unwrap();
+        assert_eq!(points.len(), 1);
+        // avg(20.0, 40.0) = 30.0
+        assert!((points[0].value - 30.0).abs() < f64::EPSILON);
+
+        // total_requests in 1h table should be sum
+        let points = db
+            .query_timeseries(key, "total_requests", range_start, range_end)
+            .await
+            .unwrap();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].value, 5.0, "sum of 2+3 = 5");
+    }
+}

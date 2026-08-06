@@ -113,6 +113,8 @@ All are optional; defaults match the binary. Set them in `.env`.
 | `SPARK_DASHBOARD_GPU_INDEX`         | _(unset)_   | Optional NVML GPU index; unset monitors all GPUs.    |
 | `SPARK_DASHBOARD_SIMULATE_GPUS`     | `0`         | Dev aid: append N fictive GPUs with simulated data.  |
 | `SPARK_DASHBOARD_PROVIDER_API_KEY`  | _(unset)_   | Fallback API key for auth-gated engines.             |
+| `SPARK_DASHBOARD_ENABLE_HISTORY`    | `false`     | Enable the `/api/history/*` API + recording.         |
+| `SPARK_DASHBOARD_HISTORY_DB`        | `/data/history.db` | SQLite history DB path (must be writable).    |
 | `RUST_LOG`                          | `info`      | Log filter (`error`/`warn`/`info`/`debug`/`trace`).  |
 
 ## Health
@@ -126,6 +128,43 @@ docker inspect spark-dashboard --format '{{.State.Health.Status}}'   # -> health
 
 It reports that the HTTP server is up — engine/GPU health is surfaced live over
 the `/ws` WebSocket in the UI.
+
+## Historical metrics (opt-in)
+
+The dashboard can record per-engine metric snapshots to a SQLite database
+(1s → 1h → 1d rollups) and expose them over `/api/history/*`. It is **off by
+default** — the history endpoints include destructive (`POST /prune`) and write
+(`settings`, `toggle`) operations that must not be exposed unauthenticated on
+`0.0.0.0`. Enable it only on trusted networks:
+
+- Compose: set `SPARK_DASHBOARD_ENABLE_HISTORY=true` in `.env`.
+- `docker run`: add `-e SPARK_DASHBOARD_ENABLE_HISTORY=true`.
+
+### Persistence
+
+The DB path defaults to `/data/history.db`. The distroless `nonroot` image
+(uid 65532) cannot write to the read-only rootfs, so **you must mount a
+writable volume at `/data`** or the container fails loudly at startup (there is
+no silent fallback to `/tmp` — that would lose data on every restart). Compose
+ships a named volume for this:
+
+```yaml
+volumes:
+  - spark-dashboard-history:/data
+```
+
+With plain `docker run`, bind-mount a host directory:
+
+```bash
+docker run --rm --gpus all -e SPARK_DASHBOARD_ENABLE_HISTORY=true \
+  -v spark-dashboard-history:/data \
+  ghcr.io/niklasfrick/spark-dashboard:latest
+```
+
+Override the path with `SPARK_DASHBOARD_HISTORY_DB` (or `--history-db-path`).
+The parent directory must exist and be writable by uid 65532. Use
+`--history-db-path :memory:` for an ephemeral, in-process DB (handy for tests;
+data is lost on exit).
 
 ## The DOCKER_GID gotcha
 
