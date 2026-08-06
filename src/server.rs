@@ -42,6 +42,7 @@ pub fn create_router(state: Arc<AppState>, enable_history: bool) -> Router {
     let router = if enable_history {
         router
             .route("/api/history/summary", get(history_summary))
+            .route("/api/history/timeseries", get(history_timeseries))
             .route("/api/history/settings", get(history_settings))
             .route("/api/history/settings", post(history_settings_update))
             .route("/api/history/toggle", post(history_toggle))
@@ -101,6 +102,28 @@ async fn history_summary(
         Ok(Some(summary)) => Json(serde_json::json!(summary)).into_response(),
         Ok(None) => Json(serde_json::json!({"error": "no data"})).into_response(),
         Err(e) => Json(serde_json::json!({"error": format!("{}", e)})).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct TimeseriesQuery {
+    engine: String,
+    metric: String,
+    since_ms: i64,
+    until_ms: i64,
+}
+
+async fn history_timeseries(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<TimeseriesQuery>,
+) -> impl IntoResponse {
+    match state
+        .history
+        .query_timeseries(&q.engine, &q.metric, q.since_ms, q.until_ms)
+        .await
+    {
+        Ok(points) => Json(serde_json::json!({ "points": points })).into_response(),
+        Err(e) => Json(serde_json::json!({ "error": format!("{}", e) })).into_response(),
     }
 }
 

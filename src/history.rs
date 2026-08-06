@@ -539,6 +539,113 @@ impl HistoryDb {
         Ok(None)
     }
 
+    /// Query time-series data points for a given metric and time window.
+    ///
+    /// The table is chosen by the time range:
+    ///   - ≤ 1 hour: `snapshots_1s` (raw, 1s resolution)
+    ///   - ≤ 24 hours: `snapshots_1h` (hourly buckets)
+    ///   - > 24 hours: `snapshots_1d` (daily buckets)
+    ///
+    /// Returns one data point per row, ordered by timestamp ascending.
+    /// An empty vec means there is no data for the given engine/metric in
+    /// the requested window (or the metric has no aggregate column for the
+    /// chosen table, e.g. `mem_used_pct` over a > 1 h window).
+    pub async fn query_timeseries(
+        &self,
+        engine_key: &str,
+        metric: &str,
+        since_ms: i64,
+        until_ms: i64,
+    ) -> rusqlite::Result<Vec<TimeSeriesPoint>> {
+        let db = self.inner.lock().await;
+
+        const HOUR_MS: i64 = 3_600_000;
+        const DAY_MS: i64 = 86_400_000;
+
+        // Resolve the metric to column names for the raw (1s) and aggregated
+        // (1h/1d) tables. `None` for the aggregate column means the metric is
+        // only available at 1s resolution (e.g. mem_used_pct).
+        let (raw_col, agg_col): (&str, Option<&str>) = match metric {
+            "prompt_tps" => ("prompt_tps", Some("prompt_tps_avg")),
+            "decode_tps" => ("decode_tps", Some("decode_tps_avg")),
+            "ttft_ms" => ("ttft_ms", Some("ttft_ms_p95")),
+            "itl_ms" => ("itl_ms", Some("itl_ms_p95")),
+            "e2e_ms" => ("e2e_ms", Some("e2e_ms_p95")),
+            "active_requests" => ("active_requests", Some("active_requests_max")),
+            "queued_requests" => ("queued_requests", Some("queued_requests_max")),
+            "kv_cache_pct" => ("kv_cache_pct", Some("kv_cache_pct_avg")),
+            "prefix_cache_hit" => ("prefix_cache_hit", Some("prefix_cache_hit_avg")),
+            "gpu_util" => ("gpu_util", Some("gpu_util_avg")),
+            "gpu_temp" => ("gpu_temp", Some("gpu_temp_avg")),
+            "power_watts" => ("power_watts", Some("power_watts_sum")),
+            "cpu_util" => ("cpu_util", Some("cpu_util_avg")),
+            "mem_used_pct" => ("mem_used_pct", None),
+            "preemptions_total" => ("preemptions_total", Some("preemptions_total")),
+            _ => return Ok(Vec::new()),
+        };
+
+        let range_ms = until_ms.saturating_sub(since_ms);
+
+        if range_ms <= HOUR_MS {
+            // Raw 1s table.
+            let sql = format!(
+                "SELECT ts, {col} FROM snapshots_1s \
+                 WHERE engine_key = ?1 AND ts >= ?2 AND ts <= ?3 \
+                 ORDER BY ts ASC",
+                col = raw_col
+            );
+            let mut stmt = db.prepare(&sql)?;
+            let points = stmt
+                .query_map(params![engine_key, since_ms, until_ms], |r| {
+                    let ts: i64 = r.get(0)?;
+                    let val: Option<f64> = r.get(1)?;
+                    Ok(TimeSeriesPoint {
+                        timestamp_ms: ts,
+                        value: val.unwrap_or(0.0),
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(points)
+        } else {
+            // Aggregated table (1h or 1d).
+            let agg = match agg_col {
+                Some(c) => c,
+                None => return Ok(Vec::new()),
+            };
+            let (table, ts_col) = if range_ms <= DAY_MS {
+                ("snapshots_1h", "bucket_ts")
+            } else {
+                ("snapshots_1d", "bucket_ts")
+            };
+
+            // For power_watts the aggregated column is a sum; divide by
+            // sample_count to recover the average power for the bucket.
+            let value_expr = if metric == "power_watts" {
+                format!("{agg} / NULLIF(sample_count, 0)")
+            } else {
+                agg.to_owned()
+            };
+
+            let sql = format!(
+                "SELECT {ts_col}, {value_expr} FROM {table} \
+                 WHERE engine_key = ?1 AND {ts_col} >= ?2 AND {ts_col} <= ?3 \
+                 ORDER BY {ts_col} ASC",
+            );
+            let mut stmt = db.prepare(&sql)?;
+            let points = stmt
+                .query_map(params![engine_key, since_ms, until_ms], |r| {
+                    let ts: i64 = r.get(0)?;
+                    let val: Option<f64> = r.get(1)?;
+                    Ok(TimeSeriesPoint {
+                        timestamp_ms: ts,
+                        value: val.unwrap_or(0.0),
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(points)
+        }
+    }
+
     /// Get database size in bytes.
     pub async fn db_size(&self) -> rusqlite::Result<i64> {
         let db = self.inner.lock().await;
@@ -592,6 +699,13 @@ pub struct HistorySummary {
     pub total_seconds: Option<f64>,
     /// Which internal table satisfied the query (raw | hourly | daily).
     pub source_table: &'static str,
+}
+
+/// A single time-series data point returned by [`HistoryDb::query_timeseries`].
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct TimeSeriesPoint {
+    pub timestamp_ms: i64,
+    pub value: f64,
 }
 
 /// Current Unix timestamp in milliseconds.
@@ -1066,5 +1180,217 @@ mod tests {
             )
             .unwrap();
         assert_eq!(p1s_again, 400.0, "backfill must be idempotent");
+    }
+
+    // -----------------------------------------------------------------
+    // query_timeseries tests
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_timeseries_1s_returns_data_points() {
+        let db = test_db();
+        let key = "ts-engine";
+        // Use a fixed base so the range logic is deterministic.
+        let base = 1_700_000_000_000i64;
+
+        db.insert_1s(
+            key,
+            base,
+            Some(100),
+            Some(200),
+            Some(5),
+            Some(50.0),
+            Some(30.0),
+            Some(10.0),
+            Some(5.0),
+            Some(100.0),
+            Some(150.0),
+            Some(80.0),
+            Some(45.0),
+            Some(3),
+            Some(1),
+            Some(0.75),
+            Some(0.1),
+            Some(60.0),
+            Some(50.0),
+            Some(3),
+        )
+        .await
+        .unwrap();
+        db.insert_1s(
+            key,
+            base + 1000,
+            Some(110),
+            Some(210),
+            Some(6),
+            Some(55.0),
+            Some(32.0),
+            Some(12.0),
+            Some(6.0),
+            Some(110.0),
+            Some(160.0),
+            Some(82.0),
+            Some(46.0),
+            Some(4),
+            Some(2),
+            Some(0.8),
+            Some(0.15),
+            Some(62.0),
+            Some(52.0),
+            Some(5),
+        )
+        .await
+        .unwrap();
+
+        // Range of 2 seconds → ≤ 1 hour → raw 1s table.
+        let points = db
+            .query_timeseries(key, "decode_tps", base, base + 2000)
+            .await
+            .unwrap();
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0].timestamp_ms, base);
+        assert!((points[0].value - 30.0).abs() < f64::EPSILON);
+        assert_eq!(points[1].timestamp_ms, base + 1000);
+        assert!((points[1].value - 32.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_timeseries_nonexistent_engine_returns_empty() {
+        let db = test_db();
+        let points = db
+            .query_timeseries("ghost", "prompt_tps", 0, 1_000_000)
+            .await
+            .unwrap();
+        assert!(points.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_timeseries_unknown_metric_returns_empty() {
+        let db = test_db();
+        let points = db
+            .query_timeseries("any", "bogus_metric", 0, 1_000_000)
+            .await
+            .unwrap();
+        assert!(points.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_timeseries_1h_aggregation() {
+        let db = test_db();
+        // Insert directly into snapshots_1h (bypassing rollup, which is
+        // time-of-day dependent and prunes 1s data).
+        {
+            let conn = db.inner.lock().await;
+            conn.execute(
+                "INSERT INTO snapshots_1h \
+                 (engine_key, bucket_ts, prompt_tps_avg, decode_tps_avg, sample_count) \
+                 VALUES ('e1', 3600000, 100.0, 50.0, 60)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO snapshots_1h \
+                 (engine_key, bucket_ts, prompt_tps_avg, decode_tps_avg, sample_count) \
+                 VALUES ('e1', 7200000, 120.0, 55.0, 60)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Range = 7 200 000 ms = 2 hours → > 1 hour, ≤ 24 hours → 1h table.
+        let points = db
+            .query_timeseries("e1", "prompt_tps", 0, 7_200_000)
+            .await
+            .unwrap();
+        assert_eq!(points.len(), 2, "should return 2 hourly buckets");
+        assert_eq!(points[0].timestamp_ms, 3_600_000);
+        assert!((points[0].value - 100.0).abs() < f64::EPSILON);
+        assert_eq!(points[1].timestamp_ms, 7_200_000);
+        assert!((points[1].value - 120.0).abs() < f64::EPSILON);
+
+        // decode_tps should use decode_tps_avg from the 1h table.
+        let points = db
+            .query_timeseries("e1", "decode_tps", 0, 7_200_000)
+            .await
+            .unwrap();
+        assert_eq!(points.len(), 2);
+        assert!((points[0].value - 50.0).abs() < f64::EPSILON);
+        assert!((points[1].value - 55.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_timeseries_power_watts_averaged_in_aggregated() {
+        let db = test_db();
+        {
+            let conn = db.inner.lock().await;
+            // power_watts_sum = 6000.0, sample_count = 60 → avg = 100.0
+            conn.execute(
+                "INSERT INTO snapshots_1h \
+                 (engine_key, bucket_ts, power_watts_sum, sample_count) \
+                 VALUES ('e1', 3600000, 6000.0, 60)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Range > 1 hour → 1h table.
+        let points = db
+            .query_timeseries("e1", "power_watts", 0, 7_200_000)
+            .await
+            .unwrap();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].timestamp_ms, 3_600_000);
+        assert!(
+            (points[0].value - 100.0).abs() < 0.001,
+            "power_watts should be sum/sample_count = 100.0, got {}",
+            points[0].value
+        );
+    }
+
+    #[tokio::test]
+    async fn test_timeseries_mem_used_pct_only_in_1s() {
+        let db = test_db();
+        let key = "ts-engine";
+        let base = 1_700_000_000_000i64;
+
+        db.insert_1s(
+            key,
+            base,
+            Some(0),
+            Some(0),
+            Some(0),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(65.0),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Small range → 1s table → should get the value.
+        let points = db
+            .query_timeseries(key, "mem_used_pct", base, base + 2000)
+            .await
+            .unwrap();
+        assert_eq!(points.len(), 1);
+        assert!((points[0].value - 65.0).abs() < f64::EPSILON);
+
+        // Large range → 1h table → mem_used_pct has no aggregate → empty.
+        let points = db
+            .query_timeseries(key, "mem_used_pct", 0, 7_200_000)
+            .await
+            .unwrap();
+        assert!(points.is_empty(), "mem_used_pct has no aggregate column");
     }
 }
