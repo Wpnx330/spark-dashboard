@@ -647,6 +647,11 @@ impl HistoryDb {
             _ => return Ok(Vec::new()),
         };
 
+        // Gauge metrics are instantaneous snapshots where averaging hides
+        // peaks; bucket them with MAX to match the rollup tables. All other
+        // metrics (rates, latencies, utilization) use AVG.
+        let agg_func = agg_func_for_metric(metric);
+
         let range_ms = until_ms.saturating_sub(since_ms);
 
         if range_ms <= HOUR_MS {
@@ -683,12 +688,21 @@ impl HistoryDb {
                 points.extend(agg_points);
             }
 
-            // Part 2: raw 1s data for the current (incomplete) hour.
+            // Part 2: raw 1s data for the current (incomplete) hour,
+            // aggregated into time buckets (~360 across the range) with the
+            // metric-appropriate function, so gauge peaks aren't averaged
+            // into a saw-tooth and the returned point count stays bounded.
+            let bucket_ms = bucket_size_ms(range_ms);
             let sql_raw = format!(
-                "SELECT ts, {col} FROM snapshots_1s \
+                "SELECT (ts / {bucket_ms}) * {bucket_ms} AS bucket_ts, \
+                 {agg_func}({col}) AS value \
+                 FROM snapshots_1s \
                  WHERE engine_key = ?1 AND ts >= ?2 AND ts <= ?3 \
-                 ORDER BY ts ASC",
-                col = raw_col
+                 GROUP BY bucket_ts \
+                 ORDER BY bucket_ts ASC",
+                col = raw_col,
+                bucket_ms = bucket_ms,
+                agg_func = agg_func,
             );
             let mut stmt = db.prepare(&sql_raw)?;
             let raw_points = stmt
@@ -807,6 +821,25 @@ pub struct HistorySummary {
 pub struct TimeSeriesPoint {
     pub timestamp_ms: i64,
     pub value: f64,
+}
+
+/// Map a metric name to the SQL aggregation function used when bucketing raw
+/// 1s data. Gauge metrics (instantaneous snapshots) use MAX so peaks aren't
+/// hidden by averaging, matching the rollup tables. Continuous and rate
+/// metrics use AVG, preserving the previous downsampling behavior.
+fn agg_func_for_metric(metric: &str) -> &'static str {
+    match metric {
+        "active_requests" | "queued_requests" | "kv_cache_pct" | "prefix_cache_hit"
+        | "gpu_util" | "gpu_temp" => "MAX",
+        _ => "AVG",
+    }
+}
+
+/// Compute the bucket size (ms) for aggregating raw 1s data in
+/// [`HistoryDb::query_timeseries`]. Targets ~360 buckets across the range,
+/// with a 1-second floor so short ranges keep 1s resolution.
+fn bucket_size_ms(range_ms: i64) -> i64 {
+    (range_ms / 360).max(1000)
 }
 
 /// Current Unix timestamp in milliseconds.
@@ -1415,6 +1448,135 @@ mod tests {
         assert!((points[0].value - 30.0).abs() < f64::EPSILON);
         assert_eq!(points[1].timestamp_ms, base + 1000);
         assert!((points[1].value - 32.0).abs() < f64::EPSILON);
+    }
+
+    /// Gauge metrics (instantaneous snapshots) must bucket with MAX while
+    /// rate/latency metrics use AVG, matching the rollup tables.
+    #[test]
+    fn test_agg_func_for_metric() {
+        for metric in [
+            "active_requests",
+            "queued_requests",
+            "kv_cache_pct",
+            "prefix_cache_hit",
+            "gpu_util",
+            "gpu_temp",
+        ] {
+            assert_eq!(
+                agg_func_for_metric(metric),
+                "MAX",
+                "{metric} should use MAX"
+            );
+        }
+        for metric in [
+            "prompt_tps",
+            "decode_tps",
+            "ttft_ms",
+            "itl_ms",
+            "e2e_ms",
+            "queue_time_ms",
+            "tpot_ms",
+            "cpu_util",
+            "mem_used_pct",
+            "power_watts",
+        ] {
+            assert_eq!(
+                agg_func_for_metric(metric),
+                "AVG",
+                "{metric} should use AVG"
+            );
+        }
+        assert_eq!(agg_func_for_metric("unknown_metric"), "AVG");
+    }
+
+    /// Bucket size targets ~360 buckets per range, never below 1 second.
+    #[test]
+    fn test_bucket_size_ms() {
+        assert_eq!(
+            bucket_size_ms(3_600_000),
+            10_000,
+            "1h -> 360 buckets of 10s"
+        );
+        assert_eq!(
+            bucket_size_ms(900_000),
+            2_500,
+            "15min -> 360 buckets of 2.5s"
+        );
+        assert_eq!(
+            bucket_size_ms(2_000),
+            1_000,
+            "short range keeps the 1s floor"
+        );
+        assert_eq!(bucket_size_ms(0), 1_000, "zero range uses the 1s floor");
+    }
+
+    /// 1s data for a ≤1h range is aggregated into buckets: gauge metrics
+    /// (active_requests) report the MAX within each bucket, rate metrics
+    /// (prompt_tps) the AVG.
+    #[tokio::test]
+    async fn test_timeseries_1s_bucketing_gauge_max_rate_avg() {
+        let db = test_db();
+        let key = "bucket-engine";
+        // base is a multiple of 10s so the three 1s rows below land in the
+        // same 10s bucket for a 1h range (bucket_ms = 3600000/360 = 10000).
+        let base = 1_700_000_000_000i64;
+
+        for (i, (active, tps)) in [(3i64, 10.0f64), (4, 20.0), (5, 30.0)].iter().enumerate() {
+            db.insert_1s(
+                key,
+                base + 1000 * i as i64,
+                Some(0),
+                Some(0),
+                Some(0),
+                Some(*tps),
+                Some(0.0),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(*active),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let points = db
+            .query_timeseries(key, "active_requests", base, base + 3_600_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            points.len(),
+            1,
+            "three 1s rows should collapse to one bucket"
+        );
+        assert_eq!(points[0].timestamp_ms, base);
+        assert_eq!(points[0].value, 5.0, "gauge should use MAX(3,4,5)");
+
+        let points = db
+            .query_timeseries(key, "prompt_tps", base, base + 3_600_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            points.len(),
+            1,
+            "three 1s rows should collapse to one bucket"
+        );
+        assert_eq!(points[0].timestamp_ms, base);
+        assert!(
+            (points[0].value - 20.0).abs() < f64::EPSILON,
+            "rate should use AVG(10,20,30)=20, got {}",
+            points[0].value
+        );
     }
 
     #[tokio::test]
