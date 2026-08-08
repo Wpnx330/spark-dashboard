@@ -523,8 +523,14 @@ impl HistoryDb {
     }
 
     /// Query summary stats for a given engine and time window.
-    /// Returns (delta_prompt, delta_gen, avg_decode_tps, avg_prompt_tps,
-    ///          peak_active, peak_queued, power_kwh, total_seconds)
+    ///
+    /// When the range spans one or more completed days **plus** the current
+    /// (incomplete) day, we query the daily table for completed days and the
+    /// hourly table for today, then merge.  This ensures data from the current
+    /// day — which has not yet been rolled up into the daily table — is not
+    /// lost.  If the daily query returns no rows (range is entirely within
+    /// today) we fall through to the existing hourly → raw chain for the full
+    /// range.
     pub async fn query_summary(
         &self,
         engine_key: &str,
@@ -533,107 +539,49 @@ impl HistoryDb {
     ) -> rusqlite::Result<Option<HistorySummary>> {
         let db = self.inner.lock().await;
 
-        // All three queries use the same structure: SUM for deltas, MAX for gauges.
-        // Try daily → hourly → raw, falling through if empty.
+        let now_ms = chrono_now_ms();
+        let start_of_today = (now_ms / 86_400_000) * 86_400_000;
+
+        // ── Path 1: daily (completed days) + hourly (today) merge ──────
+        // Only attempt the merge when the range actually starts before today.
+        if since_ms < start_of_today {
+            let daily = query_summary_one_table(
+                &db,
+                engine_key,
+                since_ms,
+                // completed days only: up to but not including today's start
+                start_of_today - 1,
+                ("snapshots_1d", "daily", "bucket_ts"),
+            )?;
+
+            if let Some(daily) = daily {
+                // Query hourly for today's portion of the range.
+                let hourly = query_summary_one_table(
+                    &db,
+                    engine_key,
+                    start_of_today,
+                    until_ms,
+                    ("snapshots_1h", "hourly", "bucket_ts"),
+                )?;
+                if let Some(hourly) = hourly {
+                    return Ok(Some(merge_summaries(&daily, &hourly)));
+                }
+                // No hourly data for today — return daily alone.
+                return Ok(Some(daily));
+            }
+            // Daily returned nothing → fall through to the single-table chain.
+        }
+
+        // ── Path 2: single-table fallback (hourly → raw) ───────────────
         let try_tables = [
-            ("snapshots_1d", "daily", "bucket_ts"),
             ("snapshots_1h", "hourly", "bucket_ts"),
             ("snapshots_1s", "raw", "ts"),
         ];
 
-        for (table, source, ts_col) in &try_tables {
-            // For raw data: each row = 1 second of data.
-            // For rolled-up data: use sample_count (stored in 1h/1d tables) to weight
-            // averages and compute actual runtime instead of calendar span.
-            let gauge_suffix = if *source == "raw" { "" } else { "_max" };
-            let power_suffix = if *source == "raw" { "" } else { "_sum" };
-            let sql = if *source == "raw" {
-                format!(
-                    "SELECT
-                       COALESCE(SUM(total_prompt_tokens),0),
-                       COALESCE(SUM(total_gen_tokens),0),
-                       COALESCE(SUM(total_requests), 0),
-                       AVG(decode_tps),
-                       AVG(prompt_tps),
-                       MAX(active_requests),
-                       MAX(queued_requests),
-                       SUM(power_watts),
-                       COUNT(*),
-                       MAX(kv_cache_pct),
-                       AVG(kv_cache_pct),
-                       MAX(preemptions_total)
-                     FROM {}
-                      WHERE engine_key = ?1 AND {} >= ?2 AND {} <= ?3",
-                    table, ts_col, ts_col,
-                )
-            } else {
-                // Weighted average: SUM(val_avg * sample_count) / SUM(sample_count)
-                // Runtime: SUM(sample_count) seconds (each sample = 1 second of raw data)
-                format!(
-                     "SELECT
-                        COALESCE(SUM(total_prompt_tokens),0),
-                        COALESCE(SUM(total_gen_tokens),0),
-                        COALESCE(SUM(total_requests), 0),
-                        COALESCE(SUM(decode_tps_avg * sample_count) / NULLIF(SUM(sample_count), 0), 0),
-                        COALESCE(SUM(prompt_tps_avg * sample_count) / NULLIF(SUM(sample_count), 0), 0),
-                        MAX(active_requests{}),
-                        MAX(queued_requests{}),
-                        SUM(power_watts{}),
-                        SUM(sample_count),
-                        MAX(kv_cache_pct_max),
-                        SUM(kv_cache_pct_avg * sample_count) / NULLIF(SUM(sample_count), 0),
-                        MAX(preemptions_total)
-                      FROM {}
-                      WHERE engine_key = ?1 AND {} >= ?2 AND {} <= ?3",
-                     gauge_suffix, gauge_suffix, power_suffix, table, ts_col, ts_col,
-                 )
-            };
-
-            let result = db.query_row(&sql, params![engine_key, since_ms, until_ms], |r| {
-                let delta_prompt: i64 = r.get::<_, Option<i64>>(0)?.unwrap_or(0);
-                let delta_gen: i64 = r.get::<_, Option<i64>>(1)?.unwrap_or(0);
-                let total_reqs: i64 = r.get::<_, Option<i64>>(2)?.unwrap_or(0);
-                let avg_decode: f64 = r.get::<_, Option<f64>>(3)?.unwrap_or(0.0);
-                let avg_prompt: f64 = r.get::<_, Option<f64>>(4)?.unwrap_or(0.0);
-                let peak_active: i64 = r.get::<_, Option<i64>>(5)?.unwrap_or(0);
-                let peak_queued: i64 = r.get::<_, Option<i64>>(6)?.unwrap_or(0);
-                let power_sum: f64 = r.get::<_, Option<f64>>(7)?.unwrap_or(0.0);
-                let count: i64 = r.get::<_, Option<i64>>(8)?.unwrap_or(0);
-                let peak_kv_cache_pct: Option<f64> = r.get::<_, Option<f64>>(9)?;
-                let avg_kv_cache_pct: Option<f64> = r.get::<_, Option<f64>>(10)?;
-                let total_preemptions: Option<i64> = r.get::<_, Option<i64>>(11)?;
-                Ok(HistorySummary {
-                    delta_prompt_tokens: delta_prompt,
-                    delta_gen_tokens: delta_gen,
-                    total_requests: total_reqs,
-                    avg_decode_tps: avg_decode,
-                    avg_prompt_tps: avg_prompt,
-                    peak_active_requests: peak_active,
-                    peak_queued_requests: peak_queued,
-                    peak_kv_cache_pct,
-                    avg_kv_cache_pct,
-                    total_preemptions,
-                    power_kwh: power_sum / 3600.0 / 1000.0,
-                    total_seconds: Some(count as f64),
-                    source_table: source,
-                })
-            });
-
-            match result {
-                Ok(summary) => {
-                    // Only return if there were actually non-zero values
-                    if summary.delta_prompt_tokens > 0
-                        || summary.delta_gen_tokens > 0
-                        || summary.total_requests > 0
-                    {
-                        return Ok(Some(summary));
-                    }
-                }
-                Err(rusqlite::Error::QueryReturnedNoRows) => continue,
-                Err(e) => {
-                    tracing::warn!("History query failed on {}: {}", table, e);
-                    continue;
-                }
+        for table_info in &try_tables {
+            let result = query_summary_one_table(&db, engine_key, since_ms, until_ms, *table_info)?;
+            if let Some(summary) = result {
+                return Ok(Some(summary));
             }
         }
 
@@ -833,6 +781,171 @@ impl HistoryDb {
     }
 }
 
+/// Run a single summary query against one rollup/raw table.
+///
+/// Returns `Ok(None)` when the table has no matching rows or when the rows
+/// contain no meaningful data (all-zero deltas).  Returns `Ok(Some(summary))`
+/// when usable data is found.
+fn query_summary_one_table(
+    db: &Connection,
+    engine_key: &str,
+    since_ms: i64,
+    until_ms: i64,
+    (table, source, ts_col): (&str, &'static str, &str),
+) -> rusqlite::Result<Option<HistorySummary>> {
+    let gauge_suffix = if source == "raw" { "" } else { "_max" };
+    let power_suffix = if source == "raw" { "" } else { "_sum" };
+    let sql = if source == "raw" {
+        format!(
+            "SELECT
+               COALESCE(SUM(total_prompt_tokens),0),
+               COALESCE(SUM(total_gen_tokens),0),
+               COALESCE(SUM(total_requests), 0),
+               AVG(decode_tps),
+               AVG(prompt_tps),
+               MAX(active_requests),
+               MAX(queued_requests),
+               SUM(power_watts),
+               COUNT(*),
+               MAX(kv_cache_pct),
+               AVG(kv_cache_pct),
+               COALESCE(MAX(preemptions_total),0) - COALESCE(MIN(preemptions_total),0)
+             FROM {}
+              WHERE engine_key = ?1 AND {} >= ?2 AND {} <= ?3",
+            table, ts_col, ts_col,
+        )
+    } else {
+        // Weighted average: SUM(val_avg * sample_count) / SUM(sample_count)
+        // Runtime: SUM(sample_count) seconds (each sample = 1 second of raw data)
+        format!(
+            "SELECT
+                COALESCE(SUM(total_prompt_tokens),0),
+                COALESCE(SUM(total_gen_tokens),0),
+                COALESCE(SUM(total_requests), 0),
+                COALESCE(SUM(decode_tps_avg * sample_count) / NULLIF(SUM(sample_count), 0), 0),
+                COALESCE(SUM(prompt_tps_avg * sample_count) / NULLIF(SUM(sample_count), 0), 0),
+                MAX(active_requests{}),
+                MAX(queued_requests{}),
+                SUM(power_watts{}),
+                SUM(sample_count),
+                MAX(kv_cache_pct_max),
+                SUM(kv_cache_pct_avg * sample_count) / NULLIF(SUM(sample_count), 0),
+                COALESCE(MAX(preemptions_total),0) - COALESCE(MIN(preemptions_total),0)
+              FROM {}
+              WHERE engine_key = ?1 AND {} >= ?2 AND {} <= ?3",
+            gauge_suffix, gauge_suffix, power_suffix, table, ts_col, ts_col,
+        )
+    };
+
+    let result = db.query_row(&sql, params![engine_key, since_ms, until_ms], |r| {
+        let delta_prompt: i64 = r.get::<_, Option<i64>>(0)?.unwrap_or(0);
+        let delta_gen: i64 = r.get::<_, Option<i64>>(1)?.unwrap_or(0);
+        let total_reqs: i64 = r.get::<_, Option<i64>>(2)?.unwrap_or(0);
+        let avg_decode: f64 = r.get::<_, Option<f64>>(3)?.unwrap_or(0.0);
+        let avg_prompt: f64 = r.get::<_, Option<f64>>(4)?.unwrap_or(0.0);
+        let peak_active: i64 = r.get::<_, Option<i64>>(5)?.unwrap_or(0);
+        let peak_queued: i64 = r.get::<_, Option<i64>>(6)?.unwrap_or(0);
+        let power_sum: f64 = r.get::<_, Option<f64>>(7)?.unwrap_or(0.0);
+        let count: i64 = r.get::<_, Option<i64>>(8)?.unwrap_or(0);
+        let peak_kv_cache_pct: Option<f64> = r.get::<_, Option<f64>>(9)?;
+        let avg_kv_cache_pct: Option<f64> = r.get::<_, Option<f64>>(10)?;
+        let total_preemptions: i64 = r.get::<_, Option<i64>>(11)?.unwrap_or(0);
+        Ok(HistorySummary {
+            delta_prompt_tokens: delta_prompt,
+            delta_gen_tokens: delta_gen,
+            total_requests: total_reqs,
+            avg_decode_tps: avg_decode,
+            avg_prompt_tps: avg_prompt,
+            peak_active_requests: peak_active,
+            peak_queued_requests: peak_queued,
+            peak_kv_cache_pct,
+            avg_kv_cache_pct,
+            total_preemptions: Some(total_preemptions),
+            power_kwh: power_sum / 3600.0 / 1000.0,
+            total_seconds: Some(count as f64),
+            source_table: source,
+        })
+    });
+
+    match result {
+        Ok(summary) => {
+            if summary.delta_prompt_tokens > 0
+                || summary.delta_gen_tokens > 0
+                || summary.total_requests > 0
+            {
+                Ok(Some(summary))
+            } else {
+                Ok(None)
+            }
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => {
+            tracing::warn!("History query failed on {}: {}", table, e);
+            Ok(None)
+        }
+    }
+}
+
+/// Merge two [`HistorySummary`] values (e.g. daily + hourly) into one.
+///
+/// - Peaks (kv_cache, active, queued) → MAX of the two
+/// - Sums (tokens, requests, power, seconds, preemptions) → SUM of the two
+/// - Averages (decode_tps, prompt_tps, kv_cache_pct) → weighted by sample_count
+fn merge_summaries(daily: &HistorySummary, hourly: &HistorySummary) -> HistorySummary {
+    let daily_samples = daily.total_seconds.unwrap_or(0.0);
+    let hourly_samples = hourly.total_seconds.unwrap_or(0.0);
+    let total_samples = daily_samples + hourly_samples;
+
+    let weighted = |d: f64, h: f64| -> f64 {
+        if total_samples > 0.0 {
+            (d * daily_samples + h * hourly_samples) / total_samples
+        } else {
+            0.0
+        }
+    };
+
+    let merge_opt_max = |a: Option<f64>, b: Option<f64>| -> Option<f64> {
+        match (a, b) {
+            (Some(x), Some(y)) => Some(x.max(y)),
+            (Some(x), None) | (None, Some(x)) => Some(x),
+            (None, None) => None,
+        }
+    };
+
+    let merge_opt_weighted = |a: Option<f64>, b: Option<f64>| -> Option<f64> {
+        match (a, b) {
+            (Some(x), Some(y)) => {
+                if total_samples > 0.0 {
+                    Some((x * daily_samples + y * hourly_samples) / total_samples)
+                } else {
+                    Some((x + y) / 2.0)
+                }
+            }
+            (Some(x), None) | (None, Some(x)) => Some(x),
+            (None, None) => None,
+        }
+    };
+
+    let daily_preemptions = daily.total_preemptions.unwrap_or(0);
+    let hourly_preemptions = hourly.total_preemptions.unwrap_or(0);
+
+    HistorySummary {
+        delta_prompt_tokens: daily.delta_prompt_tokens + hourly.delta_prompt_tokens,
+        delta_gen_tokens: daily.delta_gen_tokens + hourly.delta_gen_tokens,
+        total_requests: daily.total_requests + hourly.total_requests,
+        avg_decode_tps: weighted(daily.avg_decode_tps, hourly.avg_decode_tps),
+        avg_prompt_tps: weighted(daily.avg_prompt_tps, hourly.avg_prompt_tps),
+        peak_active_requests: daily.peak_active_requests.max(hourly.peak_active_requests),
+        peak_queued_requests: daily.peak_queued_requests.max(hourly.peak_queued_requests),
+        peak_kv_cache_pct: merge_opt_max(daily.peak_kv_cache_pct, hourly.peak_kv_cache_pct),
+        avg_kv_cache_pct: merge_opt_weighted(daily.avg_kv_cache_pct, hourly.avg_kv_cache_pct),
+        total_preemptions: Some(daily_preemptions + hourly_preemptions),
+        power_kwh: daily.power_kwh + hourly.power_kwh,
+        total_seconds: Some(total_samples),
+        source_table: "mixed",
+    }
+}
+
 /// Summary statistics returned by the history query endpoint.
 #[derive(serde::Serialize, Clone, Debug)]
 pub struct HistorySummary {
@@ -847,7 +960,7 @@ pub struct HistorySummary {
     pub peak_kv_cache_pct: Option<f64>,
     /// Average KV cache utilization (%) over the window.
     pub avg_kv_cache_pct: Option<f64>,
-    /// Latest cumulative preemption count over the window.
+    /// Preemptions that occurred during the window (MAX − MIN of the lifetime counter).
     pub total_preemptions: Option<i64>,
     /// Total energy consumption in kilowatt-hours.
     pub power_kwh: f64,
@@ -1046,6 +1159,32 @@ mod tests {
 
         db.insert_1s(
             key,
+            now - 1000,
+            Some(100),
+            Some(200),
+            Some(5),
+            Some(50.0),
+            Some(30.0),
+            Some(10.0),
+            Some(5.0),
+            Some(100.0),
+            Some(150.0),
+            Some(80.0),
+            Some(45.0),
+            Some(3),
+            Some(1),
+            Some(0.75),
+            Some(0.1),
+            Some(60.0),
+            Some(50.0),
+            Some(0),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.insert_1s(
+            key,
             now,
             Some(100),
             Some(200),
@@ -1071,15 +1210,19 @@ mod tests {
         .await
         .unwrap();
 
-        let summary = db.query_summary(key, now - 1000, now + 1000).await.unwrap();
+        let summary = db.query_summary(key, now - 2000, now + 1000).await.unwrap();
         assert!(summary.is_some());
         let s = summary.unwrap();
-        assert_eq!(s.delta_prompt_tokens, 100);
-        assert_eq!(s.delta_gen_tokens, 200);
-        assert_eq!(s.total_requests, 5);
+        assert_eq!(s.delta_prompt_tokens, 200);
+        assert_eq!(s.delta_gen_tokens, 400);
+        assert_eq!(s.total_requests, 10);
         assert_eq!(s.source_table, "raw");
         assert!(s.power_kwh > 0.0);
-        assert_eq!(s.total_preemptions, Some(3));
+        assert_eq!(
+            s.total_preemptions,
+            Some(3),
+            "delta: MAX(0,3) - MIN(0,3) = 3"
+        );
     }
 
     #[tokio::test]
@@ -1240,8 +1383,8 @@ mod tests {
         assert_eq!(s.total_requests, 9, "should sum all requests: 2+3+4");
         assert_eq!(
             s.total_preemptions,
-            Some(5),
-            "MAX of cumulative preemptions"
+            Some(3),
+            "delta of preemptions: MAX(2,5) - MIN(2,5) = 3"
         );
     }
 
