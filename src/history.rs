@@ -351,6 +351,8 @@ impl HistoryDb {
     /// Should be called periodically (e.g. once per hour by a background task).
     pub async fn rollup_1s_to_1h(&self) -> rusqlite::Result<u64> {
         let db = self.inner.lock().await;
+        // Checkpoint WAL to prevent "disk I/O error" on large rollups.
+        let _ = db.execute("PRAGMA wal_checkpoint(PASSIVE)", []);
         // Find all complete hours that haven't been rolled up yet.
         // We compute the latest hour boundary from the data.
         // A "complete hour" is one whose all-60-minutes-worth of data has
@@ -362,7 +364,7 @@ impl HistoryDb {
         // (ttft_ms_p95, itl_ms_p95, e2e_ms_p95) use AVG() as an approximation
         // of the p95 since SQLite has no built-in PERCENTILE. The column
         // names are kept for API/metrics-contract compatibility. ON CONFLICT
-        // DO UPDATE for the five latency columns so existing rows are
+        // DO UPDATE refreshes ALL columns so existing rows are fully
         // backfilled when new 1s data arrives in a subsequent rollup run.
         let rows = db.execute(
             "INSERT INTO snapshots_1h
@@ -394,9 +396,28 @@ impl HistoryDb {
              WHERE ts < ?1
              GROUP BY engine_key, (ts / 3600000)
              ON CONFLICT(engine_key, bucket_ts) DO UPDATE SET
+               total_prompt_tokens = excluded.total_prompt_tokens,
+               total_gen_tokens = excluded.total_gen_tokens,
+               total_requests = excluded.total_requests,
+               prompt_tps_avg = excluded.prompt_tps_avg,
+               prompt_tps_max = excluded.prompt_tps_max,
+               decode_tps_avg = excluded.decode_tps_avg,
+               decode_tps_max = excluded.decode_tps_max,
                ttft_ms_p95 = excluded.ttft_ms_p95,
                itl_ms_p95 = excluded.itl_ms_p95,
                e2e_ms_p95 = excluded.e2e_ms_p95,
+               power_watts_sum = excluded.power_watts_sum,
+               gpu_util_avg = excluded.gpu_util_avg,
+               gpu_temp_avg = excluded.gpu_temp_avg,
+               gpu_temp_max = excluded.gpu_temp_max,
+               active_requests_max = excluded.active_requests_max,
+               queued_requests_max = excluded.queued_requests_max,
+               kv_cache_pct_avg = excluded.kv_cache_pct_avg,
+               kv_cache_pct_max = excluded.kv_cache_pct_max,
+               prefix_cache_hit_avg = excluded.prefix_cache_hit_avg,
+               cpu_util_avg = excluded.cpu_util_avg,
+               sample_count = excluded.sample_count,
+               preemptions_total = excluded.preemptions_total,
                queue_time_ms_avg = excluded.queue_time_ms_avg,
                tpot_ms_avg = excluded.tpot_ms_avg",
             params![current_hour_start],
@@ -424,9 +445,10 @@ impl HistoryDb {
         let current_day_start = (now_ms / 86_400_000) * 86_400_000;
 
         // Same latency-column + ON CONFLICT DO UPDATE pattern as the 1s→1h
-        // rollup. The 1h table stores ttft_ms_p95/itl_ms_p95/e2e_ms_p95
-        // (AVG approximation) and queue_time_ms_avg/tpot_ms_avg; we average
-        // them across hours for the daily bucket.
+        // rollup: ON CONFLICT refreshes ALL columns. The 1h table stores
+        // ttft_ms_p95/itl_ms_p95/e2e_ms_p95 (AVG approximation) and
+        // queue_time_ms_avg/tpot_ms_avg; we average them across hours for
+        // the daily bucket.
         let rows = db.execute(
             "INSERT INTO snapshots_1d
              (engine_key, bucket_ts,
@@ -457,9 +479,28 @@ impl HistoryDb {
              WHERE bucket_ts < ?1
              GROUP BY engine_key, (bucket_ts / 86400000)
              ON CONFLICT(engine_key, bucket_ts) DO UPDATE SET
+               total_prompt_tokens = excluded.total_prompt_tokens,
+               total_gen_tokens = excluded.total_gen_tokens,
+               total_requests = excluded.total_requests,
+               prompt_tps_avg = excluded.prompt_tps_avg,
+               prompt_tps_max = excluded.prompt_tps_max,
+               decode_tps_avg = excluded.decode_tps_avg,
+               decode_tps_max = excluded.decode_tps_max,
                ttft_ms_p95 = excluded.ttft_ms_p95,
                itl_ms_p95 = excluded.itl_ms_p95,
                e2e_ms_p95 = excluded.e2e_ms_p95,
+               power_watts_sum = excluded.power_watts_sum,
+               gpu_util_avg = excluded.gpu_util_avg,
+               gpu_temp_avg = excluded.gpu_temp_avg,
+               gpu_temp_max = excluded.gpu_temp_max,
+               active_requests_max = excluded.active_requests_max,
+               queued_requests_max = excluded.queued_requests_max,
+               kv_cache_pct_avg = excluded.kv_cache_pct_avg,
+               kv_cache_pct_max = excluded.kv_cache_pct_max,
+               prefix_cache_hit_avg = excluded.prefix_cache_hit_avg,
+               cpu_util_avg = excluded.cpu_util_avg,
+               sample_count = excluded.sample_count,
+               preemptions_total = excluded.preemptions_total,
                queue_time_ms_avg = excluded.queue_time_ms_avg,
                tpot_ms_avg = excluded.tpot_ms_avg",
             params![current_day_start],
@@ -634,10 +675,10 @@ impl HistoryDb {
             "active_requests" => ("active_requests", Some("active_requests_max")),
             "queued_requests" => ("queued_requests", Some("queued_requests_max")),
             "total_requests" => ("total_requests", Some("total_requests")),
-            "kv_cache_pct" => ("kv_cache_pct", Some("kv_cache_pct_avg")),
+            "kv_cache_pct" => ("kv_cache_pct", Some("kv_cache_pct_max")),
             "prefix_cache_hit" => ("prefix_cache_hit", Some("prefix_cache_hit_avg")),
             "gpu_util" => ("gpu_util", Some("gpu_util_avg")),
-            "gpu_temp" => ("gpu_temp", Some("gpu_temp_avg")),
+            "gpu_temp" => ("gpu_temp", Some("gpu_temp_max")),
             "power_watts" => ("power_watts", Some("power_watts_sum")),
             "cpu_util" => ("cpu_util", Some("cpu_util_avg")),
             "mem_used_pct" => ("mem_used_pct", None),
