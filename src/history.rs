@@ -352,7 +352,7 @@ impl HistoryDb {
     pub async fn rollup_1s_to_1h(&self) -> rusqlite::Result<u64> {
         let db = self.inner.lock().await;
         // Checkpoint WAL to prevent "disk I/O error" on large rollups.
-        let _ = db.execute("PRAGMA wal_checkpoint(PASSIVE)", []);
+        let _ = db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
         // Find all complete hours that haven't been rolled up yet.
         // We compute the latest hour boundary from the data.
         // A "complete hour" is one whose all-60-minutes-worth of data has
@@ -441,6 +441,8 @@ impl HistoryDb {
     /// Roll up completed days from hourly data.
     pub async fn rollup_1h_to_1d(&self) -> rusqlite::Result<u64> {
         let db = self.inner.lock().await;
+        // Checkpoint WAL to prevent "disk I/O error" on large rollups.
+        let _ = db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
         let now_ms = chrono_now_ms();
         let current_day_start = (now_ms / 86_400_000) * 86_400_000;
 
@@ -730,13 +732,14 @@ impl HistoryDb {
                 agg.to_owned()
             };
 
+            // Part 1: query the rollup table for completed periods.
             let sql = format!(
                 "SELECT {ts_col}, {value_expr} FROM {table} \
                  WHERE engine_key = ?1 AND {ts_col} >= ?2 AND {ts_col} <= ?3 \
                  ORDER BY {ts_col} ASC",
             );
             let mut stmt = db.prepare(&sql)?;
-            let points = stmt
+            let mut points: Vec<TimeSeriesPoint> = stmt
                 .query_map(params![engine_key, since_ms, until_ms], |r| {
                     let ts: i64 = r.get(0)?;
                     let val: Option<f64> = r.get(1)?;
@@ -746,6 +749,46 @@ impl HistoryDb {
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
+
+            // Part 2: for 1h table, also query raw 1s data for the current
+            // incomplete hour (data that hasn't been rolled up yet). This
+            // ensures the chart shows recent activity even when the rollup
+            // hasn't run or has failed.
+            if table == "snapshots_1h" {
+                let now_ms = chrono_now_ms();
+                let current_hour_start = (now_ms / 3_600_000) * 3_600_000;
+                if until_ms >= current_hour_start {
+                    // Remove any stale 1h points for the current hour (from
+                    // partial rollups).
+                    points.retain(|p| p.timestamp_ms < current_hour_start);
+
+                    // Query 1s data for the current hour, bucketed to 1h.
+                    let sql_raw = format!(
+                        "SELECT (ts / 3600000) * 3600000 AS bucket_ts, \
+                         {agg_func}({col}) AS value \
+                         FROM snapshots_1s \
+                         WHERE engine_key = ?1 AND ts >= ?2 AND ts <= ?3 \
+                         GROUP BY bucket_ts \
+                         ORDER BY bucket_ts ASC",
+                        col = raw_col,
+                        agg_func = agg_func,
+                    );
+                    let mut stmt2 = db.prepare(&sql_raw)?;
+                    let raw_points: Vec<TimeSeriesPoint> = stmt2
+                        .query_map(params![engine_key, current_hour_start, until_ms], |r| {
+                            let ts: i64 = r.get(0)?;
+                            let val: Option<f64> = r.get(1)?;
+                            Ok(TimeSeriesPoint {
+                                timestamp_ms: ts,
+                                value: val.unwrap_or(0.0),
+                            })
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    points.extend(raw_points);
+                    points.sort_by_key(|p| p.timestamp_ms);
+                }
+            }
+
             Ok(points)
         }
     }
@@ -1853,6 +1896,169 @@ mod tests {
             (points[0].value - 100.0).abs() < 0.001,
             "power_watts should be sum/sample_count = 100.0, got {}",
             points[0].value
+        );
+    }
+
+    /// When querying a >1h range (which selects the 1h table), the current
+    /// incomplete hour may not have been rolled up yet — or the rollup may
+    /// have failed. The query must fall back to raw 1s data for the current
+    /// hour so the chart shows recent activity instead of a gap on the right.
+    #[tokio::test]
+    async fn test_timeseries_1h_range_includes_current_hour_from_1s() {
+        let db = test_db();
+        let key = "gap-engine";
+        let now = chrono_now_ms();
+        let current_hour_start = (now / 3_600_000) * 3_600_000;
+
+        // Insert a completed-hour row in the 1h table (2 hours ago).
+        {
+            let conn = db.inner.lock().await;
+            conn.execute(
+                "INSERT INTO snapshots_1h \
+                 (engine_key, bucket_ts, prompt_tps_avg, decode_tps_avg, sample_count) \
+                 VALUES (?1, ?2, 100.0, 50.0, 60)",
+                params![key, current_hour_start - 3_600_000],
+            )
+            .unwrap();
+        }
+
+        // Insert raw 1s data for the CURRENT (incomplete) hour — simulating
+        // data that hasn't been rolled up yet (e.g. rollup failed).
+        db.insert_1s(
+            key,
+            current_hour_start + 1000,
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(42.0),
+            Some(99.0),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Range > 1h and ≤ 24h → selects the 1h table.
+        let since = current_hour_start - 7_200_000;
+        let until = now + 1000;
+        let range = until - since;
+        assert!(
+            range > 3_600_000 && range <= 86_400_000,
+            "range must be >1h and ≤24h, got {range}"
+        );
+
+        let points = db
+            .query_timeseries(key, "decode_tps", since, until)
+            .await
+            .unwrap();
+
+        // Should have 2 points: the completed hour from the 1h table, and the
+        // current hour from the 1s supplement.
+        assert_eq!(
+            points.len(),
+            2,
+            "should have 1h bucket + 1s current-hour supplement"
+        );
+
+        // First point: the completed hour from the 1h table.
+        assert_eq!(points[0].timestamp_ms, current_hour_start - 3_600_000);
+        assert!((points[0].value - 50.0).abs() < f64::EPSILON);
+
+        // Second point: the current hour from 1s data (AVG of 99.0 = 99.0).
+        assert_eq!(points[1].timestamp_ms, current_hour_start);
+        assert!(
+            (points[1].value - 99.0).abs() < f64::EPSILON,
+            "current hour should come from 1s data, got {}",
+            points[1].value
+        );
+    }
+
+    /// When the 1h table has a stale row for the current hour (from a partial
+    /// rollup), the query should replace it with fresh 1s data.
+    #[tokio::test]
+    async fn test_timeseries_1h_range_replaces_stale_current_hour() {
+        let db = test_db();
+        let key = "stale-engine";
+        let now = chrono_now_ms();
+        let current_hour_start = (now / 3_600_000) * 3_600_000;
+
+        // Insert a stale 1h row for the CURRENT hour (partial rollup wrote
+        // old data before the rollup failed).
+        {
+            let conn = db.inner.lock().await;
+            conn.execute(
+                "INSERT INTO snapshots_1h \
+                 (engine_key, bucket_ts, prompt_tps_avg, decode_tps_avg, sample_count) \
+                 VALUES (?1, ?2, 10.0, 5.0, 30)",
+                params![key, current_hour_start],
+            )
+            .unwrap();
+        }
+
+        // Insert fresh 1s data for the current hour.
+        db.insert_1s(
+            key,
+            current_hour_start + 1000,
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0.0),
+            Some(77.0),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let since = current_hour_start - 3_600_000;
+        let until = now + 1000;
+
+        let points = db
+            .query_timeseries(key, "decode_tps", since, until)
+            .await
+            .unwrap();
+
+        // The stale 1h row (value=5.0) should be replaced by fresh 1s data
+        // (value=77.0), not duplicated.
+        let current_hour_points: Vec<&TimeSeriesPoint> = points
+            .iter()
+            .filter(|p| p.timestamp_ms == current_hour_start)
+            .collect();
+        assert_eq!(
+            current_hour_points.len(),
+            1,
+            "should have exactly one point for the current hour"
+        );
+        assert!(
+            (current_hour_points[0].value - 77.0).abs() < f64::EPSILON,
+            "stale 1h value should be replaced by fresh 1s data, got {}",
+            current_hour_points[0].value
         );
     }
 
