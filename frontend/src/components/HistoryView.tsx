@@ -570,13 +570,13 @@ export function HistoryView({ nodeCount = 1 }: { nodeCount?: number }) {
               <div>
                 <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Peak KV Cache</span>
                 <div className="text-base font-bold text-zinc-100 font-mono">
-                  {summary.peak_kv_cache_pct != null ? `${summary.peak_kv_cache_pct.toFixed(1)}%` : '—'}
+                  {summary.peak_kv_cache_pct != null ? `${summary.peak_kv_cache_pct.toFixed(2)}%` : '—'}
                 </div>
               </div>
               <div>
                 <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Avg KV Cache</span>
                 <div className="text-base font-bold text-zinc-100 font-mono">
-                  {summary.avg_kv_cache_pct != null ? `${summary.avg_kv_cache_pct.toFixed(1)}%` : '—'}
+                  {summary.avg_kv_cache_pct != null ? `${summary.avg_kv_cache_pct.toFixed(2)}%` : '—'}
                 </div>
               </div>
               <div>

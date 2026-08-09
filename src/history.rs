@@ -829,6 +829,24 @@ impl HistoryDb {
 /// Returns `Ok(None)` when the table has no matching rows or when the rows
 /// contain no meaningful data (all-zero deltas).  Returns `Ok(Some(summary))`
 /// when usable data is found.
+///
+/// # Peak KV cache correctness
+///
+/// The peak KV cache value is computed as `MAX(kv_cache_pct_max)` for rollup
+/// tables or `MAX(kv_cache_pct)` for the raw 1s table.  This is correct because
+/// the rollup chain preserves maxima at each level:
+///   1. `insert_1s()` stores the instantaneous `kv_cache_pct` in `snapshots_1s`.
+///   2. `rollup_1s_to_1h()` computes `MAX(kv_cache_pct)` per hour bucket,
+///      storing it as `kv_cache_pct_max` in `snapshots_1h`.
+///   3. `rollup_1h_to_1d()` computes `MAX(kv_cache_pct_max)` per day bucket,
+///      storing it as `kv_cache_pct_max` in `snapshots_1d`.
+///   4. `query_summary_one_table` takes `MAX(kv_cache_pct_max)` across all
+///      buckets in the requested time range.
+///   5. When the range spans completed days + today, `merge_summaries` uses
+///      `merge_opt_max` (MAX of daily peak and hourly peak) to combine them.
+///
+/// Thus the single highest KV cache value recorded in the time range is always
+/// returned, regardless of which table(s) serve the query.
 fn query_summary_one_table(
     db: &Connection,
     engine_key: &str,
@@ -2498,5 +2516,214 @@ mod tests {
             "daily ttft should be updated to AVG(999,200)=599.5, got {}",
             ttft
         );
+    }
+
+    // -----------------------------------------------------------------
+    // KV cache peak correctness tests
+    // -----------------------------------------------------------------
+
+    /// Different time ranges should return different peak KV cache values when
+    /// the underlying data has different maxima in those ranges.
+    #[tokio::test]
+    async fn test_peak_kv_cache_different_time_ranges() {
+        let db = test_db();
+        let key = "peak-engine";
+        let now = chrono_now_ms();
+        let current_hour_start = (now / 3_600_000) * 3_600_000;
+
+        // Insert data with distinct kv_cache_pct values in different hours.
+        // Hour A (2 hours ago): peak = 50.0
+        let hour_a = current_hour_start - 7_200_000;
+        db.insert_1s(
+            key,
+            hour_a + 1000,
+            Some(10),
+            Some(20),
+            Some(1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(50.0),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Hour B (1 hour ago): peak = 62.16
+        let hour_b = current_hour_start - 3_600_000;
+        db.insert_1s(
+            key,
+            hour_b + 1000,
+            Some(10),
+            Some(20),
+            Some(1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(62.16),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Roll up completed hours so they land in the 1h table.
+        db.rollup_1s_to_1h().await.unwrap();
+
+        // Range covering only hour A (from 1h table).
+        let summary_a = db
+            .query_summary(key, hour_a, hour_a + 3_600_000 - 1)
+            .await
+            .unwrap();
+        assert!(summary_a.is_some());
+        assert!(
+            (summary_a.unwrap().peak_kv_cache_pct.unwrap() - 50.0).abs() < 0.01,
+            "hour A peak should be 50.0"
+        );
+
+        // Range covering only hour B (from 1h table).
+        let summary_b = db
+            .query_summary(key, hour_b, hour_b + 3_600_000 - 1)
+            .await
+            .unwrap();
+        assert!(summary_b.is_some());
+        assert!(
+            (summary_b.unwrap().peak_kv_cache_pct.unwrap() - 62.16).abs() < 0.01,
+            "hour B peak should be 62.16"
+        );
+
+        // Range covering both hour A and hour B (from 1h table).
+        let summary_ab = db
+            .query_summary(key, hour_a, hour_b + 3_600_000 - 1)
+            .await
+            .unwrap();
+        assert!(summary_ab.is_some());
+        assert!(
+            (summary_ab.unwrap().peak_kv_cache_pct.unwrap() - 62.16).abs() < 0.01,
+            "combined A+B peak should be MAX(50.0, 62.16) = 62.16"
+        );
+    }
+
+    /// The merge logic (daily + hourly) should use MAX for peak KV cache,
+    /// not average or min.
+    #[tokio::test]
+    async fn test_merge_peak_kv_cache_uses_max() {
+        let db = test_db();
+        let key = "merge-peak-engine";
+        let now = chrono_now_ms();
+        let start_of_today = (now / 86_400_000) * 86_400_000;
+
+        // Insert a daily row for yesterday with kv_cache_pct_max = 70.0.
+        let yesterday = start_of_today - 86_400_000;
+        {
+            let conn = db.inner.lock().await;
+            conn.execute(
+                "INSERT INTO snapshots_1d \
+                 (engine_key, bucket_ts, total_prompt_tokens, kv_cache_pct_max, kv_cache_pct_avg, sample_count) \
+                 VALUES (?1, ?2, 100, 70.0, 50.0, 86400)",
+                params![key, yesterday],
+            )
+            .unwrap();
+        }
+
+        // Insert an hourly row for today with kv_cache_pct_max = 55.0.
+        let today_hour = start_of_today + 3_600_000;
+        {
+            let conn = db.inner.lock().await;
+            conn.execute(
+                "INSERT INTO snapshots_1h \
+                 (engine_key, bucket_ts, total_prompt_tokens, kv_cache_pct_max, kv_cache_pct_avg, sample_count) \
+                 VALUES (?1, ?2, 50, 55.0, 40.0, 3600)",
+                params![key, today_hour],
+            )
+            .unwrap();
+        }
+
+        // Query spanning yesterday + today → triggers merge path.
+        let summary = db.query_summary(key, yesterday, now + 1000).await.unwrap();
+        assert!(summary.is_some());
+        let s = summary.unwrap();
+        assert_eq!(
+            s.source_table, "mixed",
+            "should use the merge path (daily + hourly)"
+        );
+        assert!(
+            (s.peak_kv_cache_pct.unwrap() - 70.0).abs() < 0.01,
+            "merged peak should be MAX(70.0, 55.0) = 70.0"
+        );
+    }
+
+    /// Verifies that `merge_summaries` correctly picks the higher peak
+    /// regardless of which side (daily or hourly) has the larger value.
+    #[test]
+    fn test_merge_summaries_peak_max_logic() {
+        let daily = HistorySummary {
+            delta_prompt_tokens: 100,
+            delta_gen_tokens: 200,
+            total_requests: 10,
+            avg_decode_tps: 30.0,
+            avg_prompt_tps: 50.0,
+            peak_active_requests: 5,
+            peak_queued_requests: 2,
+            peak_kv_cache_pct: Some(60.0),
+            avg_kv_cache_pct: Some(40.0),
+            total_preemptions: Some(0),
+            power_kwh: 1.0,
+            total_seconds: Some(3600.0),
+            source_table: "daily",
+        };
+        let hourly = HistorySummary {
+            delta_prompt_tokens: 50,
+            delta_gen_tokens: 100,
+            total_requests: 5,
+            avg_decode_tps: 25.0,
+            avg_prompt_tps: 45.0,
+            peak_active_requests: 8,
+            peak_queued_requests: 3,
+            peak_kv_cache_pct: Some(75.0),
+            avg_kv_cache_pct: Some(50.0),
+            total_preemptions: Some(2),
+            power_kwh: 0.5,
+            total_seconds: Some(1800.0),
+            source_table: "hourly",
+        };
+
+        let merged = merge_summaries(&daily, &hourly);
+        assert!(
+            (merged.peak_kv_cache_pct.unwrap() - 75.0).abs() < 0.01,
+            "peak should be MAX(60.0, 75.0) = 75.0"
+        );
+        assert_eq!(
+            merged.peak_active_requests, 8,
+            "peak active should be MAX(5, 8) = 8"
+        );
+        assert_eq!(
+            merged.peak_queued_requests, 3,
+            "peak queued should be MAX(2, 3) = 3"
+        );
+        assert_eq!(merged.source_table, "mixed");
     }
 }
