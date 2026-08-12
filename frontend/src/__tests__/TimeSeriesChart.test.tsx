@@ -1,7 +1,12 @@
 import type { ComponentProps } from 'react'
 import { describe, it, expect } from 'vitest'
 import { render, screen } from '@testing-library/react'
-import { TimeSeriesChart } from '../components/charts/TimeSeriesChart'
+import {
+  TimeSeriesChart,
+  padData,
+  mergeSeries,
+  type ChartSeries,
+} from '../components/charts/TimeSeriesChart'
 import {
   ChartContainer,
   ChartTooltipContent,
@@ -181,5 +186,56 @@ describe('TimeSeriesChart', () => {
     )
     const chart = container.querySelector('[data-slot="chart"]')
     expect(chart).not.toBeNull()
+  })
+
+  it('padData with pad=false returns sparse data as-is (no padding)', () => {
+    const data: Array<{ timestamp: number; value: number }> = []
+    for (let i = 0; i < 24; i++) {
+      data.push({ timestamp: 1700000000000 + i * 3_600_000, value: 50 + i })
+    }
+    const result = padData(data, 240, false)
+    expect(result.length).toBe(24)
+  })
+
+  it('padData with pad=false still downsamples when exceeding maxPoints', () => {
+    const data: Array<{ timestamp: number; value: number }> = []
+    for (let i = 0; i < 3600; i++) {
+      data.push({ timestamp: 1700000000000 + i * 1000, value: i })
+    }
+    const result = padData(data, 360, false)
+    expect(result.length).toBeLessThanOrEqual(361)
+    expect(result.length).toBeGreaterThanOrEqual(360)
+  })
+
+  it('padData with pad=true (default) pads sparse data up to maxPoints', () => {
+    const data: Array<{ timestamp: number; value: number }> = []
+    for (let i = 0; i < 24; i++) {
+      data.push({ timestamp: 1700000000000 + i * 3_600_000, value: 50 + i })
+    }
+    const result = padData(data, 240, true)
+    expect(result.length).toBe(240)
+  })
+
+  it('mergeSeries with pad=false preserves real timestamps (no padding)', () => {
+    const baseTs = 1700000000000
+    const seriesA: ChartSeries = {
+      data: Array.from({ length: 24 }, (_, i) => ({
+        timestamp: baseTs + i * 3_600_000,
+        value: 10 + i,
+      })),
+      label: 'A',
+      color: '#76B900',
+    }
+    const seriesB: ChartSeries = {
+      data: Array.from({ length: 24 }, (_, i) => ({
+        timestamp: baseTs + i * 3_600_000,
+        value: 20 + i,
+      })),
+      label: 'B',
+      color: '#3b82f6',
+    }
+    const merged = mergeSeries([seriesA, seriesB], 240, false)
+    const uniqueTs = new Set(merged.map((r) => r.timestamp))
+    expect(uniqueTs.size).toBe(24)
   })
 })

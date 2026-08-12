@@ -32,6 +32,19 @@ export interface ChartSeries {
   axis?: 'left' | 'right'
 }
 
+/** Generate ~5 evenly-spaced tick timestamps across [min, max], rounded
+ * to the nearest hour for clean display. */
+function generateTicks(min: number, max: number): number[] {
+  const range = max - min
+  const tickCount = 5
+  const step = range / (tickCount - 1)
+  const HOUR = 3_600_000
+  return Array.from({ length: tickCount }, (_, i) => {
+    const raw = min + step * i
+    return Math.round(raw / HOUR) * HOUR
+  })
+}
+
 interface TimeSeriesChartProps {
   /** Single-line mode (backward compat) */
   data?: DataPoint[]
@@ -76,7 +89,14 @@ interface TimeSeriesChartProps {
    */
   maxPoints?: number
   /**
-   * Pad data to maxPoints for smooth CSS path transitions (buffer mode).
+   /**
+    * Explicit x-axis domain as [min, max] timestamps in ms. When provided,
+    * the chart x-axis spans exactly this range regardless of data point
+    * distribution. Used in history mode so all charts share the same time
+    * range (e.g. 24h: [now-86400000, now]).
+    */
+   timeDomain?: [number, number]
+   /** Pad data to maxPoints for smooth CSS path transitions (buffer mode).
    * When false (history mode), data is rendered as-is (only downsampled if
    * exceeding maxPoints). Defaults to true for backward compatibility.
    */
@@ -85,10 +105,21 @@ interface TimeSeriesChartProps {
 
 function formatTime(timestamp: number): string {
   const d = new Date(timestamp)
+  // Determine if we're showing a wide range (>1h) by checking if the
+  // timestamp is at a round hour (our history ticks are hour-rounded).
+  // For live buffer mode, ticks have seconds — show them.
+  const hasSeconds = d.getSeconds() !== 0
+  if (hasSeconds) {
+    return d.toLocaleTimeString('en-GB', {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    })
+  }
   return d.toLocaleTimeString('en-GB', {
     hour: '2-digit',
     minute: '2-digit',
-    second: '2-digit',
     hour12: false,
   })
 }
@@ -182,6 +213,7 @@ export const TimeSeriesChart = React.memo(function TimeSeriesChart({
   compact = false,
   maxPoints = CHART_POINTS,
   pad = true,
+  timeDomain,
 }: TimeSeriesChartProps) {
   const isMulti = series && series.length > 0
 
@@ -252,12 +284,16 @@ export const TimeSeriesChart = React.memo(function TimeSeriesChart({
           />
           <XAxis
             dataKey="timestamp"
+            type="number"
+            scale="time"
+            domain={timeDomain ?? ['dataMin', 'dataMax']}
             stroke={NVIDIA_THEME.chartAxis}
             fontSize={11}
             tickLine={false}
             axisLine={false}
             tickFormatter={formatTime}
-            minTickGap={60}
+            ticks={timeDomain ? generateTicks(timeDomain[0], timeDomain[1]) : undefined}
+            minTickGap={5}
           />
           <YAxis
             yAxisId="left"

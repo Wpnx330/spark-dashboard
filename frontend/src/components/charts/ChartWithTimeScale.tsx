@@ -230,6 +230,13 @@ export function ChartWithTimeScale({
   }
 
   // ── History mode (1h / 24h) ──
+  // Compute a shared time domain so all charts in history mode span the
+  // exact same range (e.g. 24h: [now-86400000, now]) and produce consistent
+  // x-axis tick labels regardless of how many data points each metric has.
+  const nowMs = Date.now()
+  const rangeMs = scale === '1h' ? 3_600_000 : 86_400_000
+  const historyTimeDomain: [number, number] = [nowMs - rangeMs, nowMs]
+
   // Build series from fetched history data. Each series is either:
   // - Direct: fetched by its own metric name
   // - Derived: computed from source metrics via compute()
@@ -315,6 +322,7 @@ export function ChartWithTimeScale({
           seriesLabel={seriesLabel}
           maxPoints={scale === '1h' ? 360 : 240}
           pad={false}
+          timeDomain={historyTimeDomain}
           // No events/requests in history mode — they're real-time only.
         />
       )}
