@@ -314,6 +314,7 @@ export function ChartWithTimeScale({
           tooltipLabel={tooltipLabel}
           seriesLabel={seriesLabel}
           maxPoints={scale === '1h' ? 360 : 240}
+          pad={false}
           // No events/requests in history mode — they're real-time only.
         />
       )}
