@@ -111,7 +111,7 @@ const THROUGHPUT_DECODE_HISTORY: HistorySeriesConfig[] = ['decode_tps', deriveAv
 const LATENCY_HISTORY: HistorySeriesConfig[] = ['ttft_ms', 'queue_time_ms', 'itl_ms', 'tpot_ms']
 const E2E_HISTORY: HistorySeriesConfig[] = ['e2e_ms']
 const REQUESTS_HISTORY: HistorySeriesConfig[] = ['active_requests', 'queued_requests', 'total_requests']
-const CACHE_HISTORY: HistorySeriesConfig[] = ['kv_cache_pct', 'prefix_cache_hit']
+const CACHE_HISTORY: HistorySeriesConfig[] = ['kv_cache_pct', 'prefix_cache_hit', 'spec_decode_acceptance_rate']
 
 interface EngineCardProps {
   engine: EngineSnapshot
@@ -150,6 +150,7 @@ interface EngineCardProps {
     activeRequests: ChartDataPoint[]
     queuedRequests: ChartDataPoint[]
     totalRequests: ChartDataPoint[]
+    tar: ChartDataPoint[]
   }
   requests?: InferenceRequest[]
   latencyMode?: LatencyMode
@@ -545,6 +546,7 @@ export function EngineCard({
                         bufferSeries={[
                           { data: chartData.kv, label: 'KV Cache', color: '#76B900' },
                           { data: chartData.prefixCacheHit, label: 'Prefix Hit', color: '#3b82f6' },
+                          { data: chartData.tar, label: 'TAR', color: '#eab308' },
                         ]}
                         engineEndpoint={engine.endpoint}
                         historyMetrics={CACHE_HISTORY}
@@ -633,6 +635,7 @@ export function EngineCard({
                 bufferSeries={[
                   { data: chartData.kv, label: 'KV Cache', color: '#76B900' },
                   { data: chartData.prefixCacheHit, label: 'Prefix Hit', color: '#3b82f6' },
+                  { data: chartData.tar, label: 'TAR', color: '#eab308' },
                 ]}
                 engineEndpoint={engine.endpoint}
                 historyMetrics={CACHE_HISTORY}

@@ -114,6 +114,7 @@ interface EngineChartData {
   activeRequests: ChartDataPoint[]
   queuedRequests: ChartDataPoint[]
   totalRequests: ChartDataPoint[]
+  tar: ChartDataPoint[]
 }
 
 interface EngineSectionProps {
@@ -487,6 +488,7 @@ export function EngineSection({
                   activeRequests: getChartData(`${engineKey}:activeRequests`),
                   queuedRequests: getChartData(`${engineKey}:queuedRequests`),
                   totalRequests: getChartData(`${engineKey}:totalRequests`),
+                  tar: getChartData(`${engineKey}:tar`),
                 }
               : undefined
 

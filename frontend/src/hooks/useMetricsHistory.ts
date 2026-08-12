@@ -167,6 +167,7 @@ export function useMetricsHistory(
           activeRequests: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           queuedRequests: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           totalRequests: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
+          tar: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
         }
       }
       const eb = engineBuffersRef.current[engineKey]
@@ -251,6 +252,9 @@ export function useMetricsHistory(
         }
         if (engine.metrics.total_requests !== null) {
           eb.totalRequests.push({ timestamp: ts, value: engine.metrics.total_requests })
+        }
+        if (engine.metrics.spec_decode_acceptance_rate !== null) {
+          eb.tar.push({ timestamp: ts, value: engine.metrics.spec_decode_acceptance_rate })
         }
       }
 

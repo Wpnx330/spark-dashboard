@@ -274,6 +274,7 @@ pub async fn metrics_collector(
                         m.preemptions_total.map(|v| v as i64),
                         m.queue_time_ms,
                         m.tpot_ms,
+                        m.spec_decode_acceptance_rate,
                     )
                     .await
                     .ok();

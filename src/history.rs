@@ -176,6 +176,10 @@ impl HistoryDb {
         add_col(conn, "snapshots_1d", "preemptions_total", "INTEGER")?;
         add_col(conn, "snapshots_1d", "queue_time_ms_avg", "REAL")?;
         add_col(conn, "snapshots_1d", "tpot_ms_avg", "REAL")?;
+        // TAR (Token Acceptance Rate) — added for Cache chart overlay.
+        add_col(conn, "snapshots_1s", "spec_decode_acceptance_rate", "REAL")?;
+        add_col(conn, "snapshots_1h", "spec_decode_acceptance_rate_avg", "REAL")?;
+        add_col(conn, "snapshots_1d", "spec_decode_acceptance_rate_avg", "REAL")?;
 
         // Legacy databases may have been created before the UNIQUE constraint
         // on (engine_key, bucket_ts) was added to the CREATE TABLE statement.
@@ -306,6 +310,7 @@ impl HistoryDb {
         preemptions_total: Option<i64>,
         queue_time_ms: Option<f64>,
         tpot_ms: Option<f64>,
+        spec_decode_acceptance_rate: Option<f64>,
     ) -> rusqlite::Result<()> {
         if !self.is_enabled() {
             return Ok(());
@@ -317,8 +322,8 @@ impl HistoryDb {
               prompt_tps, decode_tps, ttft_ms, itl_ms, e2e_ms,
               power_watts, gpu_util, gpu_temp, active_requests, queued_requests,
               kv_cache_pct, prefix_cache_hit, cpu_util, mem_used_pct, preemptions_total,
-              queue_time_ms, tpot_ms)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
+              queue_time_ms, tpot_ms, spec_decode_acceptance_rate)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
             params![
                 engine_key,
                 ts,
@@ -342,6 +347,7 @@ impl HistoryDb {
                 preemptions_total,
                 queue_time_ms,
                 tpot_ms,
+                spec_decode_acceptance_rate,
             ],
         )?;
         Ok(())
@@ -378,7 +384,7 @@ impl HistoryDb {
               active_requests_max, queued_requests_max,
               kv_cache_pct_avg, kv_cache_pct_max, prefix_cache_hit_avg,
               cpu_util_avg, sample_count, preemptions_total,
-              queue_time_ms_avg, tpot_ms_avg)
+              queue_time_ms_avg, tpot_ms_avg, spec_decode_acceptance_rate_avg)
              SELECT
                engine_key, (ts / 3600000) * 3600000,
                SUM(COALESCE(total_prompt_tokens,0)), SUM(COALESCE(total_gen_tokens,0)),
@@ -391,7 +397,7 @@ impl HistoryDb {
                MAX(active_requests), MAX(queued_requests),
                AVG(kv_cache_pct), MAX(kv_cache_pct), AVG(prefix_cache_hit),
                AVG(cpu_util), COUNT(*), MAX(preemptions_total),
-               AVG(queue_time_ms), AVG(tpot_ms)
+               AVG(queue_time_ms), AVG(tpot_ms), AVG(spec_decode_acceptance_rate)
              FROM snapshots_1s
              WHERE ts < ?1
              GROUP BY engine_key, (ts / 3600000)
@@ -463,7 +469,7 @@ impl HistoryDb {
               active_requests_max, queued_requests_max,
               kv_cache_pct_avg, kv_cache_pct_max, prefix_cache_hit_avg,
               cpu_util_avg, sample_count, preemptions_total,
-              queue_time_ms_avg, tpot_ms_avg)
+              queue_time_ms_avg, tpot_ms_avg, spec_decode_acceptance_rate_avg)
              SELECT
                engine_key, (bucket_ts / 86400000) * 86400000,
                SUM(COALESCE(total_prompt_tokens,0)), SUM(COALESCE(total_gen_tokens,0)),
@@ -476,8 +482,8 @@ impl HistoryDb {
                MAX(active_requests_max), MAX(queued_requests_max),
                AVG(kv_cache_pct_avg), MAX(kv_cache_pct_max), AVG(prefix_cache_hit_avg),
                AVG(cpu_util_avg), SUM(sample_count), MAX(preemptions_total),
-               AVG(queue_time_ms_avg), AVG(tpot_ms_avg)
-             FROM snapshots_1h
+               AVG(queue_time_ms_avg), AVG(tpot_ms_avg), AVG(spec_decode_acceptance_rate_avg)
+              FROM snapshots_1h
              WHERE bucket_ts < ?1
              GROUP BY engine_key, (bucket_ts / 86400000)
              ON CONFLICT(engine_key, bucket_ts) DO UPDATE SET
@@ -504,7 +510,8 @@ impl HistoryDb {
                sample_count = excluded.sample_count,
                preemptions_total = excluded.preemptions_total,
                queue_time_ms_avg = excluded.queue_time_ms_avg,
-               tpot_ms_avg = excluded.tpot_ms_avg",
+               tpot_ms_avg = excluded.tpot_ms_avg,
+               spec_decode_acceptance_rate_avg = excluded.spec_decode_acceptance_rate_avg",
             params![current_day_start],
         )?;
 
@@ -635,6 +642,7 @@ impl HistoryDb {
             "preemptions_total" => ("preemptions_total", Some("preemptions_total")),
             "queue_time_ms" => ("queue_time_ms", Some("queue_time_ms_avg")),
             "tpot_ms" => ("tpot_ms", Some("tpot_ms_avg")),
+            "spec_decode_acceptance_rate" => ("spec_decode_acceptance_rate", Some("spec_decode_acceptance_rate_avg")),
             _ => return Ok(Vec::new()),
         };
 
@@ -1045,7 +1053,7 @@ pub struct TimeSeriesPoint {
 fn agg_func_for_metric(metric: &str) -> &'static str {
     match metric {
         "active_requests" | "queued_requests" | "kv_cache_pct" | "prefix_cache_hit"
-        | "gpu_util" | "gpu_temp" => "MAX",
+        | "gpu_util" | "gpu_temp" | "spec_decode_acceptance_rate" => "MAX",
         _ => "AVG",
     }
 }
@@ -1142,7 +1150,8 @@ mod tests {
                 mem_used_pct       REAL,
                 preemptions_total  INTEGER,
                 queue_time_ms      REAL,
-                tpot_ms            REAL
+                tpot_ms            REAL,
+                spec_decode_acceptance_rate REAL
             );
             CREATE TABLE IF NOT EXISTS snapshots_1h (
                 engine_key          TEXT NOT NULL,
@@ -1171,6 +1180,7 @@ mod tests {
                 preemptions_total   INTEGER,
                 queue_time_ms_avg   REAL,
                 tpot_ms_avg         REAL,
+                spec_decode_acceptance_rate_avg REAL,
                 UNIQUE(engine_key, bucket_ts)
             );
             CREATE TABLE IF NOT EXISTS snapshots_1d (
@@ -1199,7 +1209,8 @@ mod tests {
                 sample_count        INTEGER NOT NULL,
                 preemptions_total   INTEGER,
                 queue_time_ms_avg   REAL,
-                tpot_ms_avg         REAL
+                tpot_ms_avg         REAL,
+                spec_decode_acceptance_rate_avg REAL
             );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_1d_unique ON snapshots_1d(engine_key, bucket_ts);
         ",
@@ -1241,6 +1252,7 @@ mod tests {
             Some(0),
             None,
             None,
+        None,
         )
         .await
         .unwrap();
@@ -1267,6 +1279,7 @@ mod tests {
             Some(3),
             None,
             None,
+        None,
         )
         .await
         .unwrap();
@@ -1338,6 +1351,7 @@ mod tests {
             None,
             None,
             None,
+        None,
         )
         .await
         .unwrap();
@@ -1377,6 +1391,7 @@ mod tests {
             Some(0),
             None,
             None,
+        None,
         )
         .await
         .unwrap();
@@ -1403,6 +1418,7 @@ mod tests {
             Some(2),
             None,
             None,
+        None,
         )
         .await
         .unwrap();
@@ -1429,6 +1445,7 @@ mod tests {
             Some(5),
             None,
             None,
+        None,
         )
         .await
         .unwrap();
@@ -1488,6 +1505,7 @@ mod tests {
             None,
             None,
             None,
+        None,
         )
         .await
         .unwrap();
@@ -1514,6 +1532,7 @@ mod tests {
             None,
             None,
             None,
+        None,
         )
         .await
         .unwrap();
@@ -1653,6 +1672,7 @@ mod tests {
             Some(3),
             None,
             None,
+        None,
         )
         .await
         .unwrap();
@@ -1679,6 +1699,7 @@ mod tests {
             Some(5),
             None,
             None,
+        None,
         )
         .await
         .unwrap();
@@ -1790,6 +1811,7 @@ mod tests {
                 None,
                 None,
                 None,
+            None,
             )
             .await
             .unwrap();
@@ -1965,6 +1987,7 @@ mod tests {
             None,
             None,
             None,
+        None,
         )
         .await
         .unwrap();
@@ -2050,6 +2073,7 @@ mod tests {
             None,
             None,
             None,
+        None,
         )
         .await
         .unwrap();
@@ -2109,6 +2133,7 @@ mod tests {
             None,
             None,
             None,
+        None,
         )
         .await
         .unwrap();
@@ -2158,6 +2183,7 @@ mod tests {
             Some(3),
             Some(15.0), // queue_time_ms
             Some(25.0), // tpot_ms
+        None,
         )
         .await
         .unwrap();
@@ -2216,6 +2242,7 @@ mod tests {
             Some(0),
             Some(10.0), // queue_time_ms
             Some(20.0), // tpot_ms
+        None,
         )
         .await
         .unwrap();
@@ -2242,6 +2269,7 @@ mod tests {
             Some(2),
             Some(30.0), // queue_time_ms
             Some(40.0), // tpot_ms
+        None,
         )
         .await
         .unwrap();
@@ -2321,6 +2349,7 @@ mod tests {
                 Some(0),
                 Some(*qt),
                 Some(*tpot),
+            None,
             )
             .await
             .unwrap();
@@ -2407,6 +2436,7 @@ mod tests {
             Some(0),
             Some(12.0),
             Some(33.0),
+        None,
         )
         .await
         .unwrap();
@@ -2557,6 +2587,7 @@ mod tests {
             None,
             None,
             None,
+        None,
         )
         .await
         .unwrap();
@@ -2586,6 +2617,7 @@ mod tests {
             None,
             None,
             None,
+        None,
         )
         .await
         .unwrap();
