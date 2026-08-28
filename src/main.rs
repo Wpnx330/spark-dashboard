@@ -291,7 +291,7 @@ async fn run_server_inner(args: RunArgs) -> Result<(), Box<dyn std::error::Error
             if let Err(e) = history_for_rollup.rollup_1s_to_1h().await {
                 tracing::warn!("History 1s→1h rollup failed: {}", e);
             }
-            if let Err(e) = history_for_rollup.rollup_1h_to_1d().await {
+            if let Err(e) = history_for_rollup.rollup_1h_to_1d(None).await {
                 tracing::warn!("History 1h→1d rollup failed: {}", e);
             }
         }

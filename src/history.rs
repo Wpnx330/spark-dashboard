@@ -178,8 +178,18 @@ impl HistoryDb {
         add_col(conn, "snapshots_1d", "tpot_ms_avg", "REAL")?;
         // TAR (Token Acceptance Rate) — added for Cache chart overlay.
         add_col(conn, "snapshots_1s", "spec_decode_acceptance_rate", "REAL")?;
-        add_col(conn, "snapshots_1h", "spec_decode_acceptance_rate_avg", "REAL")?;
-        add_col(conn, "snapshots_1d", "spec_decode_acceptance_rate_avg", "REAL")?;
+        add_col(
+            conn,
+            "snapshots_1h",
+            "spec_decode_acceptance_rate_avg",
+            "REAL",
+        )?;
+        add_col(
+            conn,
+            "snapshots_1d",
+            "spec_decode_acceptance_rate_avg",
+            "REAL",
+        )?;
 
         // Legacy databases may have been created before the UNIQUE constraint
         // on (engine_key, bucket_ts) was added to the CREATE TABLE statement.
@@ -232,6 +242,26 @@ impl HistoryDb {
                 CLUSTER_NODE_COUNT, updated_1s, updated_1h, updated_1d
             );
         }
+
+        // Legacy rows (pre-seconds/power columns) have NULL sample_count /
+        // power_watts_sum; SUM() skips NULLs, so lifetime aggregates
+        // under-counted. Backfill: seconds := bucket cadence, power := 0.
+        conn.execute(
+            "UPDATE snapshots_1d SET sample_count = 86400 WHERE sample_count IS NULL",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE snapshots_1d SET power_watts_sum = 0 WHERE power_watts_sum IS NULL",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE snapshots_1h SET sample_count = 3600 WHERE sample_count IS NULL",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE snapshots_1h SET power_watts_sum = 0 WHERE power_watts_sum IS NULL",
+            [],
+        )?;
 
         Ok(())
     }
@@ -445,8 +475,19 @@ impl HistoryDb {
     }
 
     /// Roll up completed days from hourly data.
-    pub async fn rollup_1h_to_1d(&self) -> rusqlite::Result<u64> {
+    pub async fn rollup_1h_to_1d(&self, day_offset_ms: Option<i64>) -> rusqlite::Result<u64> {
         let db = self.inner.lock().await;
+        let day_offset_ms = match day_offset_ms {
+            Some(o) => o,
+            None => {
+                get_setting_sync(&db, "utc_offset")
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(0)
+                    * 3_600_000
+            }
+        };
         // Checkpoint WAL to prevent "disk I/O error" on large rollups.
         let _ = db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
         let now_ms = chrono_now_ms();
@@ -471,7 +512,7 @@ impl HistoryDb {
               cpu_util_avg, sample_count, preemptions_total,
               queue_time_ms_avg, tpot_ms_avg, spec_decode_acceptance_rate_avg)
              SELECT
-               engine_key, (bucket_ts / 86400000) * 86400000,
+              engine_key, ((bucket_ts - ?2) / 86400000) * 86400000 + ?2,
                SUM(COALESCE(total_prompt_tokens,0)), SUM(COALESCE(total_gen_tokens,0)),
                SUM(COALESCE(total_requests,0)),
                AVG(prompt_tps_avg), MAX(prompt_tps_max),
@@ -485,7 +526,7 @@ impl HistoryDb {
                AVG(queue_time_ms_avg), AVG(tpot_ms_avg), AVG(spec_decode_acceptance_rate_avg)
               FROM snapshots_1h
              WHERE bucket_ts < ?1
-             GROUP BY engine_key, (bucket_ts / 86400000)
+             GROUP BY engine_key, ((bucket_ts - ?2) / 86400000) * 86400000 + ?2
              ON CONFLICT(engine_key, bucket_ts) DO UPDATE SET
                total_prompt_tokens = excluded.total_prompt_tokens,
                total_gen_tokens = excluded.total_gen_tokens,
@@ -512,7 +553,7 @@ impl HistoryDb {
                queue_time_ms_avg = excluded.queue_time_ms_avg,
                tpot_ms_avg = excluded.tpot_ms_avg,
                spec_decode_acceptance_rate_avg = excluded.spec_decode_acceptance_rate_avg",
-            params![current_day_start],
+            params![current_day_start, day_offset_ms],
         )?;
 
         // Prune hourly data older than 30 days
@@ -549,7 +590,15 @@ impl HistoryDb {
         let db = self.inner.lock().await;
 
         let now_ms = chrono_now_ms();
-        let start_of_today = (now_ms / 86_400_000) * 86_400_000;
+        // LOCAL (user) midnight, not UTC: daily rows are ET-keyed.
+        let utc_offset_h: i64 = get_setting_sync(&db, "utc_offset")
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
+        let day_offset_ms = utc_offset_h * 3_600_000;
+        let shifted = now_ms - day_offset_ms;
+        let start_of_today = (shifted / 86_400_000) * 86_400_000 + day_offset_ms;
 
         // ── Path 1: daily (completed days) + hourly (today) merge ──────
         // Only attempt the merge when the range actually starts before today.
@@ -642,7 +691,10 @@ impl HistoryDb {
             "preemptions_total" => ("preemptions_total", Some("preemptions_total")),
             "queue_time_ms" => ("queue_time_ms", Some("queue_time_ms_avg")),
             "tpot_ms" => ("tpot_ms", Some("tpot_ms_avg")),
-            "spec_decode_acceptance_rate" => ("spec_decode_acceptance_rate", Some("spec_decode_acceptance_rate_avg")),
+            "spec_decode_acceptance_rate" => (
+                "spec_decode_acceptance_rate",
+                Some("spec_decode_acceptance_rate_avg"),
+            ),
             _ => return Ok(Vec::new()),
         };
 
@@ -855,6 +907,20 @@ impl HistoryDb {
 ///
 /// Thus the single highest KV cache value recorded in the time range is always
 /// returned, regardless of which table(s) serve the query.
+/// Fetch a settings value synchronously from the open connection.
+fn get_setting_sync(db: &rusqlite::Connection, key: &str) -> rusqlite::Result<Option<String>> {
+    db.query_row(
+        "SELECT value FROM settings WHERE key = ?1",
+        params![key],
+        |r| r.get::<_, String>(0),
+    )
+    .map(Some)
+    .or_else(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+        other => Err(other),
+    })
+}
+
 fn query_summary_one_table(
     db: &Connection,
     engine_key: &str,
@@ -893,16 +959,23 @@ fn query_summary_one_table(
                 COALESCE(SUM(total_requests), 0),
                 COALESCE(SUM(decode_tps_avg * sample_count) / NULLIF(SUM(sample_count), 0), 0),
                 COALESCE(SUM(prompt_tps_avg * sample_count) / NULLIF(SUM(sample_count), 0), 0),
-                MAX(active_requests{}),
-                MAX(queued_requests{}),
-                SUM(power_watts{}),
-                SUM(sample_count),
+                MAX(active_requests{g1}),
+                MAX(queued_requests{g2}),
+                COALESCE(SUM(power_watts{pw}),0),
+                COALESCE(SUM(sample_count),
+                    CAST((MAX({tsc}) - MIN({tsc})) / 3600000 + 1 AS INTEGER)),
                 MAX(kv_cache_pct_max),
                 SUM(kv_cache_pct_avg * sample_count) / NULLIF(SUM(sample_count), 0),
                 COALESCE(MAX(preemptions_total),0) - COALESCE(MIN(preemptions_total),0)
-              FROM {}
-              WHERE engine_key = ?1 AND {} >= ?2 AND {} <= ?3",
-            gauge_suffix, gauge_suffix, power_suffix, table, ts_col, ts_col,
+              FROM {table}
+              WHERE engine_key = ?1 AND {ts1} >= ?2 AND {ts2} <= ?3",
+            g1 = gauge_suffix,
+            g2 = gauge_suffix,
+            pw = power_suffix,
+            tsc = ts_col,
+            table = table,
+            ts1 = ts_col,
+            ts2 = ts_col,
         )
     };
 
@@ -1052,8 +1125,13 @@ pub struct TimeSeriesPoint {
 /// metrics use AVG, preserving the previous downsampling behavior.
 fn agg_func_for_metric(metric: &str) -> &'static str {
     match metric {
-        "active_requests" | "queued_requests" | "kv_cache_pct" | "prefix_cache_hit"
-        | "gpu_util" | "gpu_temp" | "spec_decode_acceptance_rate" => "MAX",
+        "active_requests"
+        | "queued_requests"
+        | "kv_cache_pct"
+        | "prefix_cache_hit"
+        | "gpu_util"
+        | "gpu_temp"
+        | "spec_decode_acceptance_rate" => "MAX",
         _ => "AVG",
     }
 }
@@ -1252,7 +1330,7 @@ mod tests {
             Some(0),
             None,
             None,
-        None,
+            None,
         )
         .await
         .unwrap();
@@ -1279,7 +1357,7 @@ mod tests {
             Some(3),
             None,
             None,
-        None,
+            None,
         )
         .await
         .unwrap();
@@ -1351,7 +1429,7 @@ mod tests {
             None,
             None,
             None,
-        None,
+            None,
         )
         .await
         .unwrap();
@@ -1391,7 +1469,7 @@ mod tests {
             Some(0),
             None,
             None,
-        None,
+            None,
         )
         .await
         .unwrap();
@@ -1418,7 +1496,7 @@ mod tests {
             Some(2),
             None,
             None,
-        None,
+            None,
         )
         .await
         .unwrap();
@@ -1445,7 +1523,7 @@ mod tests {
             Some(5),
             None,
             None,
-        None,
+            None,
         )
         .await
         .unwrap();
@@ -1505,7 +1583,7 @@ mod tests {
             None,
             None,
             None,
-        None,
+            None,
         )
         .await
         .unwrap();
@@ -1532,7 +1610,7 @@ mod tests {
             None,
             None,
             None,
-        None,
+            None,
         )
         .await
         .unwrap();
@@ -1672,7 +1750,7 @@ mod tests {
             Some(3),
             None,
             None,
-        None,
+            None,
         )
         .await
         .unwrap();
@@ -1699,7 +1777,7 @@ mod tests {
             Some(5),
             None,
             None,
-        None,
+            None,
         )
         .await
         .unwrap();
@@ -1811,7 +1889,7 @@ mod tests {
                 None,
                 None,
                 None,
-            None,
+                None,
             )
             .await
             .unwrap();
@@ -1987,7 +2065,7 @@ mod tests {
             None,
             None,
             None,
-        None,
+            None,
         )
         .await
         .unwrap();
@@ -2073,7 +2151,7 @@ mod tests {
             None,
             None,
             None,
-        None,
+            None,
         )
         .await
         .unwrap();
@@ -2133,7 +2211,7 @@ mod tests {
             None,
             None,
             None,
-        None,
+            None,
         )
         .await
         .unwrap();
@@ -2183,7 +2261,7 @@ mod tests {
             Some(3),
             Some(15.0), // queue_time_ms
             Some(25.0), // tpot_ms
-        None,
+            None,
         )
         .await
         .unwrap();
@@ -2242,7 +2320,7 @@ mod tests {
             Some(0),
             Some(10.0), // queue_time_ms
             Some(20.0), // tpot_ms
-        None,
+            None,
         )
         .await
         .unwrap();
@@ -2269,7 +2347,7 @@ mod tests {
             Some(2),
             Some(30.0), // queue_time_ms
             Some(40.0), // tpot_ms
-        None,
+            None,
         )
         .await
         .unwrap();
@@ -2349,7 +2427,7 @@ mod tests {
                 Some(0),
                 Some(*qt),
                 Some(*tpot),
-            None,
+                None,
             )
             .await
             .unwrap();
@@ -2436,7 +2514,7 @@ mod tests {
             Some(0),
             Some(12.0),
             Some(33.0),
-        None,
+            None,
         )
         .await
         .unwrap();
@@ -2487,7 +2565,7 @@ mod tests {
             }
         }
 
-        let rolled = db.rollup_1h_to_1d().await.unwrap();
+        let rolled = db.rollup_1h_to_1d(None).await.unwrap();
         assert!(rolled >= 1, "should roll up at least 1 day bucket");
 
         // Read latency columns from snapshots_1d.
@@ -2529,7 +2607,7 @@ mod tests {
             .unwrap();
         }
 
-        db.rollup_1h_to_1d().await.unwrap();
+        db.rollup_1h_to_1d(None).await.unwrap();
 
         let conn = db.inner.lock().await;
         let ttft: f64 = conn
@@ -2587,7 +2665,7 @@ mod tests {
             None,
             None,
             None,
-        None,
+            None,
         )
         .await
         .unwrap();
@@ -2617,7 +2695,7 @@ mod tests {
             None,
             None,
             None,
-        None,
+            None,
         )
         .await
         .unwrap();
@@ -2706,6 +2784,93 @@ mod tests {
             (s.peak_kv_cache_pct.unwrap() - 70.0).abs() < 0.01,
             "merged peak should be MAX(70.0, 55.0) = 70.0"
         );
+    }
+
+    /// FIX 1: hours spanning local midnight roll into the LOCAL day.
+    #[tokio::test]
+    async fn test_rollup_1h_to_1d_local_day_boundary() {
+        let db = test_db();
+        let key = "tz-engine";
+        let ofs_h: i64 = -4; // ET
+                             // Buckets at UTC-midnight+0..3h == ET 20:00-23:00 of PREVIOUS day.
+        let midnight = (chrono_now_ms() / 86_400_000) * 86_400_000 - 86_400_000;
+        {
+            let c = db.inner.lock().await;
+            for h in 0..4 {
+                c.execute(
+                    "INSERT INTO snapshots_1h (engine_key,bucket_ts,total_prompt_tokens,sample_count) VALUES (?1,?2,?3,3600)",
+                    rusqlite::params![key, midnight + h * 3_600_000, 1000 + h],
+                )
+                .unwrap();
+            }
+        }
+        let ofs_ms = ofs_h * 3_600_000;
+        let rolled = db.rollup_1h_to_1d(Some(ofs_ms)).await.unwrap();
+        assert_eq!(rolled, 1, "all four hours = ONE local day");
+        let (bts, sum): (i64, i64) = {
+            let c = db.inner.lock().await;
+            c.query_row(
+                "SELECT bucket_ts,total_prompt_tokens FROM snapshots_1d WHERE engine_key=?1",
+                rusqlite::params![key],
+                |r| Ok((r.get(0).unwrap(), r.get(1).unwrap())),
+            )
+            .unwrap()
+        };
+        // LOCAL-day key must satisfy: ((t - ofs)floor)+ofs == bts for every
+        // member bucket. Members: midnight..midnight+3h; with ofs=-4h their
+        // (t-ofs) = midnight+4..7h → same UTC-day => key = midnight+4h-4h??
+        // EXACT: ((t +4h)/86400)*86400 -4h. For t=UTC-midnight: shifted noon
+        // → dayfloor=UTC-midnight → key=UTC-midnight-4h = PREV 20:00 ET. All
+        // four hours share ONE day because shifted=4..7h <24h. => bts:
+        // mirrors SQL exactly: ((t - ofs) / 86400000)*86400000 + ofs
+        let any_t = midnight; // UTC midnight
+        let want = ((any_t - ofs_ms) / 86_400_000) * 86_400_000 + ofs_ms;
+        assert_eq!(bts, want, "daily bucket = LOCAL-midnight key");
+        assert_eq!(sum, 4000 + 6, "token sums preserved across boundary");
+    }
+
+    /// FIX 2: migrate() backfills legacy NULL sample_count/power.
+    #[tokio::test]
+    async fn test_migrate_backfills_null_seconds_and_power() {
+        let db = test_db();
+        {
+            let c = db.inner.lock().await;
+            // drop+recreate WITHOUT the backfill? simpler: insert row with
+            // NULLs directly (schema allows).
+            c.execute(
+                "INSERT INTO snapshots_1d (engine_key,bucket_ts,total_prompt_tokens,sample_count,power_watts_sum) VALUES ('e',1783728000000,5000,86400,NULL)",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO snapshots_1h (engine_key,bucket_ts,total_prompt_tokens,sample_count) VALUES ('e2',1783728000000,77,3600)",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE snapshots_1h SET power_watts_sum=NULL WHERE engine_key='e2'",
+                [],
+            )
+            .unwrap();
+            HistoryDb::migrate(&c).unwrap(); // idempotent: runs backfill
+            let (cnt, pw): (i64, f64) = c
+                .query_row(
+                    "SELECT sample_count,COALESCE(power_watts_sum,-1) FROM snapshots_1d WHERE engine_key='e'",
+                    [],
+                    |r| Ok((r.get(0).unwrap(), r.get(1).unwrap())),
+                )
+                .unwrap();
+            assert_eq!(cnt, 86400, "legacy-NULL power row keeps its seconds");
+            assert_eq!(pw, 0.0);
+            let hcnt: i64 = c
+                .query_row(
+                    "SELECT sample_count FROM snapshots_1h WHERE engine_key='e2'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(hcnt, 3600);
+        }
     }
 
     /// Verifies that `merge_summaries` correctly picks the higher peak
