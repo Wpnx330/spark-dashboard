@@ -200,7 +200,7 @@ export function ChartWithTimeScale({
     // TIME-cut (density-proof) with point-count as cheap pre-trim.
     const cut = (pts: DataPoint[]): DataPoint[] => {
       const pre = pts.length > sliceCount ? pts.slice(-sliceCount * 2) : pts
-      return pre.filter((p) => p.t >= t0)
+      return pre.filter((p) => p.timestamp >= t0)
     }
 
     let chartData: DataPoint[] | undefined
@@ -215,7 +215,7 @@ export function ChartWithTimeScale({
       chartData = cut(bufferData)
     }
 
-    // Always render the FULL time domain, even whenamples are sparse:
+    // Always render the FULL time domain, even when samples are sparse:
     // 1m == exactly 1 minute of x-axis, 5m == exactly 5.
     const bufferTimeDomain: [number, number] = [t0, now]
 
