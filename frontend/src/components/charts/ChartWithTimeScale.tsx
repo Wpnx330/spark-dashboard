@@ -217,6 +217,11 @@ export function ChartWithTimeScale({
           // TimeSeriesChart defaults to maxPoints=60 and downsamples 5m to 60,
           // making 1m and 5m look identical.
           maxPoints={scale === '5m' ? 300 : 60}
+          //pad={ false } // LIVE TOO: per-series padData fake-heads differ
+          //  → mergeSeries() unions differing fake timestamps → 2× rows
+          //  → x-domain doubles ( 5m shows 10 min ) + stale left half.
+          //  Render real pts as-is (same lesson as history mode).
+          pad={false}
           events={events}
           requests={requests}
         />
