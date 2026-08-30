@@ -79,7 +79,9 @@ export function useMetrics() {
       if (!document.hidden) flush()
     }
 
-    const id = setInterval(flush, 2000)
+    // 1s: matches backend sample rate; 2s made every 2nd
+    // sampleoverwrite-in-flight ( buffer density halved → 1m= 2min).
+    const id = setInterval(flush, 1000)
     document.addEventListener('visibilitychange', onVisible)
 
     return () => {
