@@ -32,16 +32,17 @@ export interface ChartSeries {
   axis?: 'left' | 'right'
 }
 
-/** Generate ~5 evenly-spaced tick timestamps across [min, max], rounded
- * to the nearest hour for clean display. */
+/** Exactly 3 ticks — start, mid, end (Chris's preference: dense time axes
+ * are unreadable). End == "now" when callers pass now-anchored domains.
+ * Ranges >= 4h round to the hour (history); shorter ranges stay exact
+ * (seconds) so live chart end/ start labels match wall-clock. */
 function generateTicks(min: number, max: number): number[] {
   const range = max - min
-  const tickCount = 5
-  const step = range / (tickCount - 1)
   const HOUR = 3_600_000
-  return Array.from({ length: tickCount }, (_, i) => {
-    const raw = min + step * i
-    return Math.round(raw / HOUR) * HOUR
+  const round = range >= 4 * HOUR
+  return [0, 0.5, 1].map((f) => {
+    const raw = min + range * f
+    return round ? Math.round(raw / HOUR) * HOUR : Math.round(raw / 1000) * 1000
   })
 }
 

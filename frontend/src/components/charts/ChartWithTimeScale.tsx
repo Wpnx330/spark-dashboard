@@ -71,6 +71,13 @@ function nextScale(current: TimeScale): TimeScale {
  * Number of buffer samples to show for each buffer-based scale.
  * Buffer is 900 samples at 1/sec = 15 min.
  */
+/** Window length per buffer scale, ms. TIME-cuts the buffer and pins the
+ * x-domain to exactly [now-N, now] so span never depends on sample density. */
+const BUFFER_WINDOW_MS: Record<'1m' | '5m', number> = {
+  '1m': 60_000,
+  '5m': 300_000,
+}
+
 const BUFFER_SLICE: Record<'1m' | '5m', number> = {
   '1m': 60,
   '5m': 300,
@@ -186,6 +193,15 @@ export function ChartWithTimeScale({
   // ── Buffer mode (1m / 5m) ──
   if (isBuffer) {
     const sliceCount = BUFFER_SLICE[scale]
+    const windowMs = BUFFER_WINDOW_MS[scale]
+    const now = Date.now()
+    const t0 = now - windowMs
+
+    // TIME-cut (density-proof) with point-count as cheap pre-trim.
+    const cut = (pts: DataPoint[]): DataPoint[] => {
+      const pre = pts.length > sliceCount ? pts.slice(-sliceCount * 2) : pts
+      return pre.filter((p) => p.t >= t0)
+    }
 
     let chartData: DataPoint[] | undefined
     let chartSeries: ChartSeries[] | undefined
@@ -193,11 +209,15 @@ export function ChartWithTimeScale({
     if (bufferSeries) {
       chartSeries = bufferSeries.map((s) => ({
         ...s,
-        data: s.data.slice(-sliceCount),
+        data: cut(s.data),
       }))
     } else if (bufferData) {
-      chartData = bufferData.slice(-sliceCount)
+      chartData = cut(bufferData)
     }
+
+    // Always render the FULL time domain, even whenamples are sparse:
+    // 1m == exactly 1 minute of x-axis, 5m == exactly 5.
+    const bufferTimeDomain: [number, number] = [t0, now]
 
     return (
       <div className={`relative ${className ?? ''}`}>
@@ -216,6 +236,7 @@ export function ChartWithTimeScale({
           // 1m → 60 points (1/sec), 5m → 300 points (1/sec). Without this,
           // TimeSeriesChart defaults to maxPoints=60 and downsamples 5m to 60,
           // making 1m and 5m look identical.
+          timeDomain={bufferTimeDomain}
           maxPoints={scale === '5m' ? 300 : 60}
           //pad={ false } // LIVE TOO: per-series padData fake-heads differ
           //  → mergeSeries() unions differing fake timestamps → 2× rows
