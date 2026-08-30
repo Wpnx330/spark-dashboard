@@ -726,8 +726,12 @@ impl HistoryDb {
                      ORDER BY bucket_ts ASC",
                 );
                 let mut stmt = db.prepare(&sql_agg)?;
+                // Include the complete hour STRADDLING `since`: when the
+                // range starts mid-hour, that earlier bucket is the only
+                // data covering [since, next-hour-start) after 1s pruning.
+                let since_hour = (since_ms / 3_600_000) * 3_600_000;
                 let agg_points = stmt
-                    .query_map(params![engine_key, since_ms, until_ms], |r| {
+                    .query_map(params![engine_key, since_hour, until_ms], |r| {
                         let ts: i64 = r.get(0)?;
                         let val: Option<f64> = r.get(1)?;
                         Ok(TimeSeriesPoint {
