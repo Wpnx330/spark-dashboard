@@ -541,6 +541,14 @@ pub async fn engine_collector_loop(
                     // Refresh the PID set every detection tick — engines
                     // restart and fork workers over their lifetime.
                     state.pids = d.pids.clone();
+                    // Same policy for the container id: Docker discovery is
+                    // authoritative, and the container can CHANGE over the
+                    // process lifetime (image update, engine swap). Without
+                    // this refresh the log viewer would stream a dead
+                    // container (or none) forever.
+                    if d.container_id.is_some() && state.container_id != d.container_id {
+                        state.container_id = d.container_id.clone();
+                    }
                 }
 
                 // Engines absent from this pass (stopped, restarting, probe

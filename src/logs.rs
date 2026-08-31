@@ -155,9 +155,16 @@ async fn start_log_stream() -> broadcast::Sender<String> {
 /// Guarantees the background Docker-stream task is spawned exactly once.
 static STREAM_TASK_STARTED: AtomicBool = AtomicBool::new(false);
 
-/// Background task that owns the single Docker log stream and publishes
+/// Background task that owns the Docker log stream and publishes
 /// line-buffered log lines to all WS clients via the broadcast channel.
+///
+/// Runs as a supervisor: whenever the inner stream ends (container stopped,
+/// daemon hiccup, or an engine swap replaced the container), it waits a
+/// moment and re-resolves the CURRENT tracked container, then re-attaches.
+/// This is what makes the viewer follow engine restarts/updates instead of
+/// dying silently after the first 'stream attached'.
 async fn log_stream_task(tx: broadcast::Sender<String>) {
+    // Docker client is host-level and survives container swaps; build once.
     let docker = match Docker::connect_with_local_defaults() {
         Ok(d) => d,
         Err(e) => {
@@ -166,8 +173,20 @@ async fn log_stream_task(tx: broadcast::Sender<String>) {
         }
     };
 
+    loop {
+        stream_one_container(&docker, &tx).await;
+        // The inner task announces why it ended (ERR:/LOG:...). Pause so a
+        // restarting engine isn't spammed with attach attempts, then follow
+        // whatever container is tracked NOW (it may be a new one).
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+}
+
+/// One attach+follow cycle against the currently tracked container. Returns
+/// when the stream ends; the supervisor decides whether to re-attach.
+async fn stream_one_container(docker: &Docker, tx: &broadcast::Sender<String>) {
     // Resolve the tracked container id from shared engine state. Poll briefly
-    // in case detection hasn't completed yet at first connect.
+    // in case detection hasn't completed yet or the engine is mid-swap.
     let container_id = match resolve_container_id().await {
         Some(id) => id,
         None => {
@@ -219,8 +238,8 @@ async fn log_stream_task(tx: broadcast::Sender<String>) {
             None => {
                 // Stream ended (container stopped). Flush any trailing partial
                 // lines that never received a newline.
-                flush_trailing(&mut stdout_buf, None, &tx);
-                flush_trailing(&mut stderr_buf, Some("[stderr] "), &tx);
+                flush_trailing(&mut stdout_buf, None, tx);
+                flush_trailing(&mut stderr_buf, Some("[stderr] "), tx);
                 let _ = tx.send("LOG:Stream ended - container stopped".to_string());
                 return;
             }
