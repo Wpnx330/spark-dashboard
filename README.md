@@ -101,7 +101,9 @@ for details on what each script does.
 
 **Dashboard**
 - Arc gauges, time-series charts, sparklines, per-core heatmap
-- 15-minute rolling history with circular buffers
+- 15-minute rolling history with circular buffers; 1m/5m charts backfill
+  from SQLite history when you return to the tab or reload, so they no
+  longer reset on tab switches or refreshes
 - Connection status badge, staleness detection, auto-reconnect
 
 ## Architecture
