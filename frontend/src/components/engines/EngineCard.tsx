@@ -438,6 +438,7 @@ export function EngineCard({
                         bufferData={e2eSeries.map(p => ({ ...p, value: p.value / 1000 }))}
                         engineEndpoint={engine.endpoint}
                         historyMetrics={E2E_HISTORY}
+                        seedValueMap={(v) => v / 1000}
                         unit="s"
                         height="100%"
                       />
@@ -611,6 +612,7 @@ export function EngineCard({
                 bufferData={e2eSeries.map(p => ({ ...p, value: p.value / 1000 }))}
                 engineEndpoint={engine.endpoint}
                 historyMetrics={E2E_HISTORY}
+                seedValueMap={(v) => v / 1000}
                 unit="s"
                 height="clamp(72px, 13vh, 200px)"
                 requests={requestSpans}

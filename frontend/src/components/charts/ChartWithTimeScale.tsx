@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback } from 'react'
+import { useState, useMemo, useCallback, useEffect, useRef } from 'react'
 import { TimeSeriesChart, type ChartSeries } from './TimeSeriesChart'
 import { TimeScaleButton, type TimeScale } from './TimeScaleButton'
 import { useHistoryTimeseries } from '@/hooks/useHistoryTimeseries'
@@ -44,6 +44,12 @@ interface ChartWithTimeScaleProps {
    * String = direct DB metric, DerivedSeries = computed, undefined = hidden.
    */
   historyMetrics?: HistorySeriesConfig[]
+  /**
+   * Transform applied to seeded (DB) values before display. Needed when the
+   * buffer data is transformed at the call site (e.g. E2E chart divides ms
+   * → s) so seed and live values share one unit. History mode is untouched.
+   */
+  seedValueMap?: (value: number) => number
   /** Pass-through to TimeSeriesChart. */
   color?: string
   yDomain?: [number, number]
@@ -83,6 +89,113 @@ const BUFFER_SLICE: Record<'1m' | '5m', number> = {
   '5m': 300,
 }
 
+/**
+ * Merge DB-seeded history points into a sparse live buffer window.
+ *
+ * 1m/5m charts render from an in-memory WebSocket buffer. When the tab is
+ * hidden (background tabs throttle sample processing) or the page reloads,
+ * that buffer goes stale or empty and the chart "resets" even though the
+ * server still holds the 1s data. Seeding backfills the visible window from
+ * `/api/history/timeseries` — the same source the 1h/24h charts use.
+ *
+ * Rules:
+ * - Dense live buffer (≥ denseThreshold in-window points): returned as-is —
+ *   streaming behavior is identical to the pre-seed implementation.
+ * - Empty live buffer: seed fills the whole window (page refresh case).
+ * - Sparse live buffer: merged by timestamp — live wins on collisions, seed
+ *   fills everything else (holes before, between, and after live samples:
+ *   background-tab throttling gaps, or a stalled WebSocket where the DB is
+ *   the freshest source until the stream catches up, at which point the
+ *   collision rule hands the tail back to live).
+ */
+export function mergeSeedIntoLive(
+  live: DataPoint[],
+  seed: DataPoint[] | null | undefined,
+  opts: { denseThreshold: number; valueMap?: (v: number) => number },
+): DataPoint[] {
+  if (live.length >= opts.denseThreshold) return live
+  if (!seed || seed.length === 0) return live
+  const map = opts.valueMap
+  const apply = (p: DataPoint): DataPoint =>
+    map ? { timestamp: p.timestamp, value: map(p.value) } : p
+
+  // No live data at all → the seed IS the chart (page refresh / WS down).
+  if (live.length === 0) return seed.map(apply)
+
+  // Seed must be ascending for the two-pointer merge (backend returns
+  // ORDER BY timestamp; derived computes preserve order). Guard cheaply
+  // instead of trusting every producer.
+  let sorted = seed
+  for (let k = 1; k < seed.length; k++) {
+    if (seed[k].timestamp < seed[k - 1].timestamp) {
+      sorted = [...seed].sort((a, b) => a.timestamp - b.timestamp)
+      break
+    }
+  }
+
+  // Two-pointer merge; on equal timestamps the live point wins (both
+  // pointers advance so the seed duplicate is consumed, not re-emitted).
+  const out: DataPoint[] = []
+  let i = 0
+  let j = 0
+  while (i < sorted.length && j < live.length) {
+    const s = sorted[i]
+    const l = live[j]
+    if (s.timestamp < l.timestamp) {
+      out.push(apply(s))
+      i++
+    } else {
+      out.push(l)
+      j++
+      if (s.timestamp === l.timestamp) i++
+    }
+  }
+  while (j < live.length) {
+    out.push(live[j])
+    j++
+  }
+  // Seed points newer than every live sample: keep them. When the WebSocket
+  // is down the DB holds the freshest seconds; once live catches up the
+  // collision rule above hands those timestamps back to the stream.
+  while (i < sorted.length) {
+    out.push(apply(sorted[i]))
+    i++
+  }
+  return out
+}
+
+/**
+ * Merge one seed-fetch round into the seed map (pure — returns `prev`
+ * itself when nothing changed so React can bail out of the re-render).
+ *
+ * - A metric that failed this round (network blip, one 500 among several)
+ *   keeps its previous seed instead of vanishing for a cycle. Stale points
+ *   are clipped by the time window at render anyway.
+ * - Metrics no longer needed (configs changed) are evicted so the map
+ *   stays bounded to the live config set.
+ */
+export function applySeedResults(
+  prev: Map<string, DataPoint[]>,
+  results: ReadonlyArray<readonly [string, DataPoint[]] | null>,
+  needed: ReadonlySet<string>,
+): Map<string, DataPoint[]> {
+  let changed = false
+  const next = new Map(prev)
+  for (const r of results) {
+    if (r && r[1].length > 0) {
+      next.set(r[0], r[1])
+      changed = true
+    }
+  }
+  for (const key of next.keys()) {
+    if (!needed.has(key)) {
+      next.delete(key)
+      changed = true
+    }
+  }
+  return changed ? next : prev
+}
+
 /** Flattened metric list needed for history fetches (direct + derived sources). */
 function collectNeededMetrics(configs: HistorySeriesConfig[]): string[] {
   const metrics = new Set<string>()
@@ -94,6 +207,29 @@ function collectNeededMetrics(configs: HistorySeriesConfig[]): string[] {
     }
   }
   return Array.from(metrics)
+}
+
+/** Resolve the seed points for one series config from the fetched seed map.
+ * Direct configs look up their metric; derived configs compute from sources —
+ * exactly how history mode resolves them. */
+function seedPointsFor(
+  cfg: HistorySeriesConfig,
+  seedData: Map<string, DataPoint[]>,
+): DataPoint[] | null {
+  if (!cfg) return null
+  if (typeof cfg === 'string') return seedData.get(cfg) ?? null
+  if (typeof cfg === 'object') {
+    const sources: Record<string, DataPoint[] | null> = {}
+    let any = false
+    for (const m of cfg.sourceMetrics) {
+      const d = seedData.get(m) ?? null
+      sources[m] = d
+      if (d && d.length > 0) any = true
+    }
+    if (!any) return null
+    return cfg.compute(sources)
+  }
+  return null
 }
 
 /** Hook: fetch all unique metrics needed for history mode. */
@@ -157,6 +293,99 @@ function useAllHistoryData(
   return { data: map, loading }
 }
 
+/** Hook: seed data for buffer modes (1m/5m) from the history API.
+ *
+ * Buffer charts otherwise rely solely on in-memory WebSocket samples, which
+ * go stale when the tab is hidden or vanish on reload. This fetches the most
+ * recent window from the DB (same endpoint as 1h/24h mode) on mount, on
+ * scale/endpoint/config change, and whenever the tab becomes visible again.
+ * The merge itself happens at render time via mergeSeedIntoLive — a dense
+ * live buffer never touches the seed. */
+function useBufferSeed(
+  engineEndpoint: string | null,
+  configs: HistorySeriesConfig[],
+  scale: TimeScale,
+): Map<string, DataPoint[]> {
+  const isBuffer = scale === '1m' || scale === '5m'
+  // Content-stable key: callers pass inline arrays (e.g. ['gpu_util']) whose
+  // identity changes every parent render — keying on JSON avoids refetching
+  // the seed on each metrics tick.
+  const neededKey = useMemo(
+    () => (isBuffer ? JSON.stringify(collectNeededMetrics(configs)) : '[]'),
+    [configs, isBuffer],
+  )
+  const [seed, setSeed] = useState<Map<string, DataPoint[]>>(() => new Map())
+  const genRef = useRef(0)
+  const mountedRef = useRef(true)
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
+
+  const fetchSeed = useCallback(async () => {
+    if (!isBuffer || engineEndpoint === null || neededKey === '[]') return
+    const needed: string[] = JSON.parse(neededKey)
+    const gen = ++genRef.current
+    const untilMs = Date.now()
+    const windowMs = scale === '1m' ? BUFFER_WINDOW_MS['1m'] : BUFFER_WINDOW_MS['5m']
+    const sinceMs = untilMs - windowMs
+
+    const results = await Promise.all(
+      needed.map(async (metric) => {
+        const url =
+          `/api/history/timeseries?engine=${encodeURIComponent(engineEndpoint)}` +
+          `&metric=${encodeURIComponent(metric)}` +
+          `&since_ms=${sinceMs}&until_ms=${untilMs}`
+        try {
+          const res = await fetch(url)
+          if (!res.ok) return null
+          const json = await res.json()
+          const pts: DataPoint[] = (json.points ?? []).map(
+            (p: { timestamp_ms: number; value: number }) => ({
+              timestamp: p.timestamp_ms,
+              value: p.value,
+            }),
+          )
+          return [metric, pts] as const
+        } catch {
+          return null
+        }
+      }),
+    )
+    // A newer fetch (scale flip / visibility change) supersedes this one —
+    // and an unmounted component must never set state.
+    if (gen !== genRef.current || !mountedRef.current) return
+    // Merge per metric via the pure helper; a metric that failed this
+    // round (network blip, one 500 among several) keeps its previous
+    // seed instead of vanishing for a cycle. Stale points are clipped
+    // by the time window at render anyway.
+    setSeed((prev) =>
+      applySeedResults(
+        prev,
+        results,
+        new Set(JSON.parse(neededKey) as string[]),
+      ),
+    )
+  }, [engineEndpoint, isBuffer, neededKey, scale])
+
+  useEffect(() => {
+    void fetchSeed()
+  }, [fetchSeed])
+
+  useEffect(() => {
+    if (!isBuffer) return
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void fetchSeed()
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => document.removeEventListener('visibilitychange', onVisible)
+  }, [isBuffer, fetchSeed])
+
+  return seed
+}
+
 export function ChartWithTimeScale({
   bufferData,
   bufferSeries,
@@ -171,6 +400,7 @@ export function ChartWithTimeScale({
   hideTooltipLabel,
   tooltipLabel,
   seriesLabel,
+  seedValueMap,
   className,
   events,
   requests,
@@ -187,6 +417,10 @@ export function ChartWithTimeScale({
     isBuffer ? [] : effectiveConfigs,
     scale,
   )
+
+  // DB seed for buffer modes (no-op at 1h/24h). Merged only when the live
+  // buffer is sparse — see mergeSeedIntoLive.
+  const seedData = useBufferSeed(engineEndpoint, effectiveConfigs, scale)
 
   const handleCycle = useCallback(() => setScale((s) => nextScale(s)), [])
 
@@ -206,13 +440,27 @@ export function ChartWithTimeScale({
     let chartData: DataPoint[] | undefined
     let chartSeries: ChartSeries[] | undefined
 
+    const denseThreshold = Math.floor(sliceCount * 0.75)
+
     if (bufferSeries) {
-      chartSeries = bufferSeries.map((s) => ({
-        ...s,
-        data: cut(s.data),
-      }))
+      chartSeries = bufferSeries.map((s, i) => {
+        const cutLive = cut(s.data)
+        const merged = mergeSeedIntoLive(cutLive, seedPointsFor(effectiveConfigs[i], seedData), {
+          denseThreshold,
+          valueMap: seedValueMap,
+        })
+        // Dense path returns `cutLive` by reference (already ≥ t0) — skip
+        // the second filter/copy. The merged path can carry seed points
+        // outside the window, so it always gets filtered.
+        return { ...s, data: merged === cutLive ? merged : merged.filter((p) => p.timestamp >= t0) }
+      })
     } else if (bufferData) {
-      chartData = cut(bufferData)
+      const cutLive = cut(bufferData)
+      const merged = mergeSeedIntoLive(cutLive, seedPointsFor(effectiveConfigs[0], seedData), {
+        denseThreshold,
+        valueMap: seedValueMap,
+      })
+      chartData = merged === cutLive ? merged : merged.filter((p) => p.timestamp >= t0)
     }
 
     // Always render the FULL time domain, even when samples are sparse:

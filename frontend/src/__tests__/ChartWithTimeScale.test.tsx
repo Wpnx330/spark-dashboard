@@ -1,6 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
-import { ChartWithTimeScale } from '@/components/charts/ChartWithTimeScale'
+import {
+  ChartWithTimeScale,
+  mergeSeedIntoLive,
+  applySeedResults,
+} from '@/components/charts/ChartWithTimeScale'
 
 // --- Mock fetch ---
 type FetchHandler = (url: string) => Promise<unknown>
@@ -11,6 +15,10 @@ beforeEach(() => {
     'fetch',
     vi.fn(async (url: string) => {
       const body = await fetchHandler(url)
+      // Handlers may return a full Response (to exercise the !ok / catch
+      // paths) or a plain JSON body — pass Responses through untouched so
+      // the component's real status handling runs.
+      if (body instanceof Response) return body
       return {
         ok: true,
         status: 200,
@@ -338,5 +346,262 @@ describe('ChartWithTimeScale', () => {
     await waitFor(() => {
       expect(screen.queryByText('5m')).not.toBeInTheDocument()
     })
+  })
+})
+
+describe('mergeSeedIntoLive', () => {
+  const makeSeed = (from: number, to: number, value = 10) => {
+    const pts: Array<{ timestamp: number; value: number }> = []
+    for (let t = from; t <= to; t += 1000) pts.push({ timestamp: t, value })
+    return pts
+  }
+
+  it('returns live data untouched when the buffer is dense', () => {
+    const live = makeSeed(1_700_000_000_000, 1_700_000_000_000 + 50_000) // 51 pts
+    const s = makeSeed(1_700_000_000_000 - 60_000, 1_700_000_000_000)
+    expect(mergeSeedIntoLive(live, s, { denseThreshold: 45 })).toBe(live)
+  })
+
+  it('returns live untouched when seed is empty or missing', () => {
+    const live = [{ timestamp: 1000, value: 1 }]
+    expect(mergeSeedIntoLive(live, null, { denseThreshold: 45 })).toEqual(live)
+    expect(mergeSeedIntoLive(live, [], { denseThreshold: 45 })).toEqual(live)
+  })
+
+  it('fills the whole window from seed when live is empty (page refresh)', () => {
+    const s = [
+      { timestamp: 1000, value: 5 },
+      { timestamp: 2000, value: 6 },
+    ]
+    expect(mergeSeedIntoLive([], s, { denseThreshold: 45 })).toEqual(s)
+  })
+
+  it('applies valueMap to seed points when live is empty', () => {
+    const s = [{ timestamp: 1000, value: 5000 }]
+    const out = mergeSeedIntoLive([], s, {
+      denseThreshold: 45,
+      valueMap: (v) => v / 1000,
+    })
+    expect(out).toEqual([{ timestamp: 1000, value: 5 }])
+  })
+
+  it('merges seed by timestamp: live wins collisions, seed fills everything else', () => {
+    const live = [
+      { timestamp: 50_000, value: 1 },
+      { timestamp: 51_000, value: 2 },
+    ]
+    const s = makeSeed(10_000, 52_000, 9)
+    const out = mergeSeedIntoLive(live, s, { denseThreshold: 45 })
+    // Strictly increasing timestamps, no duplicates at the seam.
+    expect(
+      out.every((p, i) => i === 0 || p.timestamp > out[i - 1].timestamp),
+    ).toBe(true)
+    // Live points win their own timestamps.
+    expect(out.filter((p) => p.timestamp === 50_000 || p.timestamp === 51_000)).toEqual(live)
+    // Old seed prefix is present.
+    expect(out.some((p) => p.timestamp === 10_000)).toBe(true)
+    // Seed points newer than the newest live sample survive (WS-down case).
+    expect(out[out.length - 1].timestamp).toBe(52_000)
+  })
+
+  it('fills gaps BETWEEN live samples from seed (background-tab throttling)', () => {
+    // Live has scattered points with a hole between 30s and 50s.
+    const live = [
+      { timestamp: 30_000, value: 3 },
+      { timestamp: 50_000, value: 1 },
+    ]
+    const s = makeSeed(10_000, 52_000, 9)
+    const out = mergeSeedIntoLive(live, s, { denseThreshold: 45 })
+    // The hole is filled: seed points 31k..49k are present between the
+    // live samples, and live points win their own timestamps.
+    expect(out.some((p) => p.timestamp === 40_000 && p.value === 9)).toBe(true)
+    expect(out.filter((p) => p.timestamp === 30_000 || p.timestamp === 50_000)).toEqual(live)
+    expect(
+      out.every((p, i) => i === 0 || p.timestamp > out[i - 1].timestamp),
+    ).toBe(true)
+  })
+
+  it('sorts unsorted seed arrays before merging', () => {
+    const live = [{ timestamp: 50_000, value: 1 }]
+    const s = [
+      { timestamp: 52_000, value: 9 },
+      { timestamp: 10_000, value: 9 },
+      { timestamp: 30_000, value: 9 },
+    ]
+    const out = mergeSeedIntoLive(live, s, { denseThreshold: 45 })
+    expect(
+      out.every((p, i) => i === 0 || p.timestamp > out[i - 1].timestamp),
+    ).toBe(true)
+    expect(out[out.length - 1].timestamp).toBe(52_000)
+  })
+
+  it('fills before the live point and hands collisions to live', () => {
+    const live = [{ timestamp: 50_000, value: 1 }]
+    const s = [
+      { timestamp: 49_500, value: 9 },
+      { timestamp: 50_500, value: 8 },
+    ]
+    // 49_500 fills before the live point; 50_500 is newer than live[0], so
+    // it is kept after it (WS-down tail rule).
+    expect(mergeSeedIntoLive(live, s, { denseThreshold: 45 })).toEqual([
+      { timestamp: 49_500, value: 9 },
+      { timestamp: 50_000, value: 1 },
+      { timestamp: 50_500, value: 8 },
+    ])
+  })
+})
+
+describe('applySeedResults', () => {
+  const needed = (keys: string[]) => new Set(keys)
+
+  it('overwrites metrics with fresh points and keeps failed metrics unchanged', () => {
+    const prev = new Map<string, Array<{ timestamp: number; value: number }>>([
+      ['gpu_util', [{ timestamp: 1000, value: 42 }]],
+      ['kv_cache_pct', [{ timestamp: 1000, value: 7 }]],
+    ])
+    const out = applySeedResults(
+      prev,
+      [
+        ['gpu_util', [{ timestamp: 2000, value: 50 }]], // fresh data
+        null, // fetch failed this round → previous seed kept
+        ['mem_used_pct', []], // ok but empty → never seeds
+      ],
+      needed(['gpu_util', 'kv_cache_pct', 'mem_used_pct']),
+    )
+    expect(out.get('gpu_util')).toEqual([{ timestamp: 2000, value: 50 }])
+    expect(out.get('kv_cache_pct')).toEqual([{ timestamp: 1000, value: 7 }])
+    expect(out.has('mem_used_pct')).toBe(false)
+    expect(out).not.toBe(prev)
+  })
+
+  it('evicts metrics no longer needed; returns prev itself when nothing changed', () => {
+    const prev = new Map<string, Array<{ timestamp: number; value: number }>>([
+      ['gpu_util', [{ timestamp: 1000, value: 42 }]],
+      ['stale_metric', [{ timestamp: 1000, value: 1 }]],
+    ])
+    // All fetches fail and configs still need both metrics → no change.
+    const unchanged = applySeedResults(prev, [null], needed(['gpu_util', 'stale_metric']))
+    expect(unchanged).toBe(prev)
+
+    // Configs dropped stale_metric → evicted even though its fetch failed.
+    const out = applySeedResults(prev, [null], needed(['gpu_util']))
+    expect(out.has('stale_metric')).toBe(false)
+    expect(out.get('gpu_util')).toEqual([{ timestamp: 1000, value: 42 }])
+  })
+})
+
+describe('ChartWithTimeScale buffer seeding', () => {
+  it('fetches seed data from the history API on mount in buffer mode', async () => {
+    fetchHandler = async (url: string) => {
+      expect(url).toContain('/api/history/timeseries')
+      expect(url).toContain('metric=gpu_util')
+      return { points: [{ timestamp_ms: Date.now() - 5000, value: 42 }] }
+    }
+    render(
+      <ChartWithTimeScale
+        bufferData={[]}
+        engineEndpoint="http://localhost:8000"
+        historyMetrics={['gpu_util']}
+        unit="%"
+      />,
+    )
+    await waitFor(() => {
+      expect(fetch).toHaveBeenCalledWith(
+        expect.stringContaining('metric=gpu_util'),
+      )
+    })
+  })
+
+  it('refetches seed when the tab becomes visible again', async () => {
+    let calls = 0
+    fetchHandler = async () => {
+      calls++
+      return { points: [{ timestamp_ms: Date.now() - 1000, value: 1 }] }
+    }
+    const { unmount } = render(
+      <ChartWithTimeScale
+        bufferData={[]}
+        engineEndpoint="http://localhost:8000"
+        historyMetrics={['gpu_util']}
+        unit="%"
+      />,
+    )
+    await waitFor(() => expect(calls).toBeGreaterThanOrEqual(1))
+
+    // pretendToBeVisual already reports 'visible'; just fire the event.
+    document.dispatchEvent(new Event('visibilitychange'))
+    await waitFor(() => expect(calls).toBeGreaterThanOrEqual(2))
+
+    // The visibilitychange listener is removed on unmount: a second event
+    // after unmount must not trigger another fetch round.
+    const before = calls
+    unmount()
+    document.dispatchEvent(new Event('visibilitychange'))
+    await new Promise((r) => setTimeout(r, 20))
+    expect(calls).toBe(before)
+  })
+
+  it('tolerates failed seed fetch rounds (!ok and network throw) on re-visibility', async () => {
+    const okBody = {
+      points: [{ timestamp_ms: Date.now() - 5000, value: 42 }],
+    }
+    let round = 0
+    fetchHandler = async () => {
+      round++
+      if (round === 1) return okBody
+      if (round === 2) return new Response('server error', { status: 500 })
+      return Promise.reject(new TypeError('network unreachable'))
+    }
+    render(
+      <ChartWithTimeScale
+        bufferData={[]}
+        engineEndpoint="http://localhost:8000"
+        historyMetrics={['gpu_util']}
+        unit="%"
+      />,
+    )
+    // Round 1 seeds the metric on mount; round 2 fails with a real !ok
+    // response and round 3 with a rejected promise (the component's
+    // catch path) — the component must keep its prior seed state
+    // (retention semantics asserted directly in the applySeedResults
+    // unit tests above) and not crash.
+    await waitFor(() => expect(round).toBe(1))
+    document.dispatchEvent(new Event('visibilitychange'))
+    await waitFor(() => expect(round).toBe(2))
+    document.dispatchEvent(new Event('visibilitychange'))
+    await waitFor(() => expect(round).toBe(3))
+  })
+
+  it('keeps seeding other metrics when one metric fetch fails', async () => {
+    const called: string[] = []
+    fetchHandler = async (url: string) => {
+      if (url.includes('metric=gpu_util')) {
+        called.push('gpu_util')
+        return { points: [{ timestamp_ms: Date.now() - 5000, value: 42 }] }
+      }
+      called.push('kv_cache_pct')
+      return new Response('server error', { status: 500 })
+    }
+    render(
+      <ChartWithTimeScale
+        bufferData={[]}
+        engineEndpoint="http://localhost:8000"
+        historyMetrics={['gpu_util', 'kv_cache_pct']}
+        unit="%"
+      />,
+    )
+    // Both metrics are attempted; the failing one does not abort seeding.
+    await waitFor(() => expect(called).toContain('kv_cache_pct'))
+    expect(called).toContain('gpu_util')
+  })
+
+  it('does not fetch seed when engineEndpoint is null', async () => {
+    fetchHandler = async () => ({ points: [] })
+    render(
+      <ChartWithTimeScale bufferData={[]} engineEndpoint={null} unit="%" />,
+    )
+    // Give effects a tick; no fetch calls should have happened.
+    await new Promise((r) => setTimeout(r, 20))
+    expect(fetch).not.toHaveBeenCalled()
   })
 })
