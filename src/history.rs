@@ -706,14 +706,48 @@ impl HistoryDb {
         let range_ms = until_ms.saturating_sub(since_ms);
 
         if range_ms <= HOUR_MS {
-            // For ranges ≤ 1h we query BOTH the 1h table (completed hour
-            // buckets that have already been rolled up and pruned from 1s)
-            // AND the 1s table (current incomplete hour).  This prevents
-            // empty charts when the rollup has already deleted the 1s data
-            // for the earlier part of the requested range.
-            let mut points = Vec::new();
+            // For ranges ≤ 1h we query BOTH the 1s table (raw data for the
+            // current, not-yet-rolled-up stretch) AND the 1h table (completed
+            // hour buckets whose 1s data has already been rolled up and
+            // pruned).  This prevents empty charts when the rollup has
+            // already deleted the 1s data for the earlier part of the
+            // requested range — but a completed-hour bucket is only used
+            // when the raw 1s data does NOT already reach back to the
+            // window's start (see the coverage check below).
+            let bucket_ms = bucket_size_ms(range_ms);
+            let sql_raw = format!(
+                "SELECT MAX((ts / {bucket_ms}) * {bucket_ms}, ?2) AS bucket_ts, \
+                 MIN(ts) AS min_ts, \
+                 {agg_func}({col}) AS value \
+                 FROM snapshots_1s \
+                 WHERE engine_key = ?1 AND ts >= ?2 AND ts <= ?3 \
+                 GROUP BY bucket_ts \
+                 ORDER BY bucket_ts ASC",
+                col = raw_col,
+                bucket_ms = bucket_ms,
+                agg_func = agg_func,
+            );
+            let mut stmt = db.prepare(&sql_raw)?;
+            // (bucket_ts, min sample ts in bucket, aggregated value)
+            let raw_points = stmt
+                .query_map(params![engine_key, since_ms, until_ms], |r| {
+                    let bucket_ts: i64 = r.get(0)?;
+                    let min_ts: i64 = r.get(1)?;
+                    let val: Option<f64> = r.get(2)?;
+                    Ok((bucket_ts, min_ts, val.unwrap_or(0.0)))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            // Raw points go in first: when both sources produce the same
+            // timestamp after the sort below, the raw 1s value wins.
+            let mut points: Vec<TimeSeriesPoint> = raw_points
+                .iter()
+                .map(|(bucket_ts, _, value)| TimeSeriesPoint {
+                    timestamp_ms: *bucket_ts,
+                    value: *value,
+                })
+                .collect();
 
-            // Part 1: aggregated 1h buckets that fall within the range.
+            // Completed-hour rollup buckets within the range.
             if let Some(agg) = agg_col {
                 let value_expr = if metric == "power_watts" {
                     format!("{agg} / NULLIF(sample_count, 0)")
@@ -727,54 +761,59 @@ impl HistoryDb {
                 );
                 let mut stmt = db.prepare(&sql_agg)?;
                 // Include the complete hour STRADDLING `since`: when the
-                // range starts mid-hour, that earlier bucket is the only
-                // data covering [since, next-hour-start) after 1s pruning.
+                // range starts mid-hour and the 1s data for that stretch was
+                // already rolled up + pruned, that earlier bucket is the
+                // only data covering [since, next-hour-start).
                 let since_hour = (since_ms / 3_600_000) * 3_600_000;
                 let agg_points = stmt
                     .query_map(params![engine_key, since_hour, until_ms], |r| {
-                        let ts: i64 = r.get(0)?;
+                        let bucket_ts: i64 = r.get(0)?;
+                        // Clamp the straddling bucket's timestamp INTO the
+                        // requested window. Its value legitimately covers
+                        // [since, next-hour-start), but reporting it at its
+                        // raw (earlier) timestamp makes clients with a fixed
+                        // x-domain expand that domain backwards — the 1h
+                        // chart rendered a ~2h axis with data scrunched into
+                        // the right half.
+                        let ts = bucket_ts.max(since_ms);
                         let val: Option<f64> = r.get(1)?;
-                        Ok(TimeSeriesPoint {
-                            timestamp_ms: ts,
-                            value: val.unwrap_or(0.0),
-                        })
+                        Ok((bucket_ts, ts, val.unwrap_or(0.0)))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
-                points.extend(agg_points);
+                // Skip the full-hour average when raw 1s rows already reach
+                // back to the window's start: with ~1h of 1s retention a
+                // 60s/300s window almost always has raw rows, and mixing in
+                // the bucket's hour-wide average puts an artificial
+                // value-jump point at the window's left edge. "Reached the
+                // start" means the earliest raw sample sits within one
+                // bucket width of `since_ms`. The raw query filters
+                // `ts >= since_ms`, so min_ts >= since_ms always — a
+                // `<= since_ms` comparison would degenerate to
+                // exact-millisecond equality, which continuous 1s sampling
+                // (arbitrary sub-second phase vs the client's Date.now())
+                // essentially never produces. `min_ts < since_ms +
+                // bucket_ms` holds for continuous coverage (the first
+                // sample lands within ~1s of `since` and bucket_ms >= 1s)
+                // and fails whenever raw starts late (post-prune or engine
+                // restart), in which case the hour-wide average still
+                // fills the uncovered stretch.
+                let covered = raw_points
+                    .iter()
+                    .any(|(_, min_ts, _)| *min_ts < since_ms + bucket_ms);
+                for (_bucket_ts, ts, value) in agg_points {
+                    if !covered {
+                        points.push(TimeSeriesPoint {
+                            timestamp_ms: ts,
+                            value,
+                        });
+                    }
+                }
             }
 
-            // Part 2: raw 1s data for the current (incomplete) hour,
-            // aggregated into time buckets (~360 across the range) with the
-            // metric-appropriate function, so gauge peaks aren't averaged
-            // into a saw-tooth and the returned point count stays bounded.
-            let bucket_ms = bucket_size_ms(range_ms);
-            let sql_raw = format!(
-                "SELECT (ts / {bucket_ms}) * {bucket_ms} AS bucket_ts, \
-                 {agg_func}({col}) AS value \
-                 FROM snapshots_1s \
-                 WHERE engine_key = ?1 AND ts >= ?2 AND ts <= ?3 \
-                 GROUP BY bucket_ts \
-                 ORDER BY bucket_ts ASC",
-                col = raw_col,
-                bucket_ms = bucket_ms,
-                agg_func = agg_func,
-            );
-            let mut stmt = db.prepare(&sql_raw)?;
-            let raw_points = stmt
-                .query_map(params![engine_key, since_ms, until_ms], |r| {
-                    let ts: i64 = r.get(0)?;
-                    let val: Option<f64> = r.get(1)?;
-                    Ok(TimeSeriesPoint {
-                        timestamp_ms: ts,
-                        value: val.unwrap_or(0.0),
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            points.extend(raw_points);
-
-            // Deduplicate by timestamp (1h bucket_ts and 1s ts won't
-            // overlap, but sort to be safe).
+            // Sort ascending; drop duplicate timestamps (the raw point,
+            // inserted first, wins the stable sort and the dedupe).
             points.sort_by_key(|p| p.timestamp_ms);
+            points.dedup_by(|a, b| a.timestamp_ms == b.timestamp_ms);
             Ok(points)
         } else {
             // Aggregated table (1h or 1d).
@@ -2183,6 +2222,305 @@ mod tests {
             (current_hour_points[0].value - 77.0).abs() < f64::EPSILON,
             "stale 1h value should be replaced by fresh 1s data, got {}",
             current_hour_points[0].value
+        );
+    }
+
+    /// When the requested range starts mid-hour, the completed-hour bucket
+    /// that STRADDLES `since` must be included ONLY when raw 1s data does
+    /// not already cover part of that hour inside the window (1s data was
+    /// rolled up + pruned), and its timestamp must be clamped to `since`
+    /// so clients with a fixed [since, until] x-domain don't expand it
+    /// backwards (~2h axis on a 1h chart).
+    #[tokio::test]
+    async fn test_timeseries_1h_range_includes_straddle_bucket_clamped() {
+        let db = test_db();
+        let key = "straddle-engine";
+        // Fixed epoch — fully deterministic, no wall clock. h1 must be
+        // hour-aligned (divisible by 3_600_000) so the SQL floor matches.
+        let h1 = 360_000_000_000i64; // previous (completed) hour bucket
+        let h2 = h1 + 3_600_000; // current (incomplete) hour bucket
+        let now = h2 + 1_200_000; // 20 min into the current hour
+                                  // → since = now − 30 min = 50 min into h1: STRADDLE.
+
+        // Completed previous hour in the 1h table (as the rollup would write).
+        {
+            let conn = db.inner.lock().await;
+            conn.execute(
+                "INSERT INTO snapshots_1h \
+                 (engine_key, bucket_ts, prompt_tps_avg, decode_tps_avg, sample_count) \
+                 VALUES (?1, ?2, 10.0, 42.0, 60)",
+                params![key, h1],
+            )
+            .unwrap();
+        }
+
+        // Live 1s data only in the CURRENT hour (previous hour was pruned).
+        db.insert_1s(
+            key,
+            h2 + 1000,
+            Some(0),
+            Some(0),
+            Some(0),
+            None,
+            Some(99.0),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Window starts mid-PREVIOUS-hour (like the frontend's [now-60min,
+        // now] when now is 30 min past the hour): `since` lands mid-h1, so
+        // the completed h1 bucket STRADDLES the window start.
+        let since = now - 1_800_000;
+        let until = now + 1000;
+        assert!(
+            since > h1,
+            "since must be mid-way through the previous hour (h1)"
+        );
+
+        let points = db
+            .query_timeseries(key, "decode_tps", since, until)
+            .await
+            .unwrap();
+
+        // 2 points: the clamped straddle bucket + the current-hour 1s point.
+        assert_eq!(
+            points.len(),
+            2,
+            "straddle bucket + current-hour point, got {points:?}"
+        );
+        // NO point before the window start — the axis stays 1h wide.
+        assert!(
+            points[0].timestamp_ms >= since,
+            "straddle bucket must be clamped into the window: got {} < {since}",
+            points[0].timestamp_ms
+        );
+        // Its value is the straddle bucket's (42.0), not the current hour's.
+        assert!(
+            (points[0].value - 42.0).abs() < f64::EPSILON,
+            "clamped point should carry the straddle bucket's value, got {}",
+            points[0].value
+        );
+        // The 1s point survives at its own timestamp.
+        assert!(
+            (points[1].value - 99.0).abs() < f64::EPSILON,
+            "current-hour point should be the 1s sample, got {}",
+            points[1].value
+        );
+    }
+
+    /// When raw 1s data ALREADY covers part of the straddling hour inside
+    /// the window (1s retention ≈ 1h ≫ typical 1m/5m seed window), the
+    /// completed-hour rollup bucket must be SUPPRESSED: mixing in its
+    /// hour-wide average puts an artificial value-jump point at the window's
+    /// left edge of every 1m/5m/1h chart queried in the first minutes of an
+    /// hour. The raw 1s rows are the truthful data for that stretch.
+    #[tokio::test]
+    async fn test_timeseries_straddle_bucket_suppressed_when_raw_covers_window() {
+        let db = test_db();
+        let key = "cover-engine";
+        // Fixed epoch — fully deterministic, no wall clock.
+        let h1 = 360_000_000_000i64; // previous (completed) hour bucket
+        let h2 = h1 + 3_600_000; // current (incomplete) hour bucket
+        let now = h2 + 1_200_000; // 20 min into the current hour
+
+        // Completed previous hour in the 1h table with an hour-wide average
+        // (42.0) that differs wildly from the raw 1s samples (99.0) — the
+        // artifact source this test pins down.
+        {
+            let conn = db.inner.lock().await;
+            conn.execute(
+                "INSERT INTO snapshots_1h \
+                 (engine_key, bucket_ts, prompt_tps_avg, decode_tps_avg, sample_count) \
+                 VALUES (?1, ?2, 10.0, 42.0, 60)",
+                params![key, h1],
+            )
+            .unwrap();
+        }
+
+        // Raw 1s data in the PREVIOUS hour inside the window (un-pruned),
+        // plus some in the current hour. Geometry chosen to make this test
+        // FAIL under the degenerate `min_ts <= since_ms` check (the round-3
+        // regression): `since` = h1+3_000_000 is deliberately UNALIGNED on
+        // the query's 5002ms bucket grid (since % B = 1378), and the first
+        // raw rows sit at since+3624 / since+3800 — inside the NEXT bucket
+        // (bucket_start = since+3624), which is within one bucket width of
+        // `since`, so the coverage check still suppresses. Because the raw
+        // query clamps bucket_ts up to `since` (MAX(bucket, since)), first
+        // rows in `since`'s OWN bucket would collide with the clamped
+        // rollup point and dedupe would mask the artifact; the next-bucket
+        // placement leaves the 42.0 visible if the check ever regresses.
+        for ts in [h1 + 3_003_624, h1 + 3_003_800, h2 + 1000] {
+            db.insert_1s(
+                key,
+                ts,
+                Some(0),
+                Some(0),
+                Some(0),
+                None,
+                Some(99.0),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Same geometry as the pruned case: window starts mid-h1 (10 min
+        // before the boundary), straddling the h1 bucket.
+        let since = now - 1_800_000;
+        let until = now + 1000;
+        assert!(since > h1, "window must straddle the h1/h2 boundary");
+
+        let points = db
+            .query_timeseries(key, "decode_tps", since, until)
+            .await
+            .unwrap();
+
+        // The h1 rollup bucket (42.0) is GONE — raw 1s rows cover that
+        // stretch. Only raw-derived points remain, none carrying 42.0.
+        assert!(
+            points.iter().all(|p| (p.value - 42.0).abs() > f64::EPSILON),
+            "straddle rollup bucket must be suppressed when 1s data covers the stretch: {points:?}"
+        );
+        // The pre-boundary raw rows survive (the window's left stretch is
+        // covered by real data, not an hour-wide average).
+        assert!(
+            points
+                .iter()
+                .any(|p| p.timestamp_ms >= since && p.timestamp_ms < h2),
+            "raw 1s rows from the previous hour must remain, got {points:?}"
+        );
+        // Every point still sits inside the window (clamp contract holds).
+        assert!(
+            points
+                .iter()
+                .all(|p| p.timestamp_ms >= since && p.timestamp_ms <= until),
+            "all points must stay inside [since, until], got {points:?}"
+        );
+    }
+
+    /// Companion to the suppression test above: when the raw 1s rows do
+    /// NOT reach back to the window's start, the straddling rollup bucket
+    /// must be KEPT — it is the only source covering [since, first raw
+    /// sample). The discriminating geometry vs the OLD per-bucket
+    /// existence check: raw rows exist INSIDE the straddling hour but
+    /// after `since` (engine restarted 5 min before the hour boundary) —
+    /// the old check suppressed the bucket there (leaving a hole), the
+    /// window-edge coverage check keeps it.
+    #[tokio::test]
+    async fn test_timeseries_straddle_bucket_kept_when_raw_misses_window_start() {
+        let db = test_db();
+        let key = "gap-engine";
+        // Same fixed epoch geometry: window starts 10 min before the h1/h2
+        // boundary; raw 1s data exists ONLY in the current hour h2.
+        let h1 = 360_000_000_000i64;
+        let h2 = h1 + 3_600_000;
+        let now = h2 + 1_200_000; // 20 min into the current hour
+
+        // Completed previous hour in the 1h table (hour-wide avg 42.0).
+        {
+            let conn = db.inner.lock().await;
+            conn.execute(
+                "INSERT INTO snapshots_1h \
+                 (engine_key, bucket_ts, prompt_tps_avg, decode_tps_avg, sample_count) \
+                 VALUES (?1, ?2, 10.0, 42.0, 60)",
+                params![key, h1],
+            )
+            .unwrap();
+        }
+
+        // Raw 1s data starts INSIDE the straddling hour but well after the
+        // window's start (since = h2 - 600_000): an engine restart 5 min
+        // before the h1/h2 boundary. Under the old per-bucket check this
+        // geometry suppressed the bucket (hole); the window-edge check
+        // keeps it.
+        for ts in [h2 - 300_000, h2 - 299_500, h2 + 1000] {
+            db.insert_1s(
+                key,
+                ts,
+                Some(0),
+                Some(0),
+                Some(0),
+                None,
+                Some(99.0),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let since = now - 1_800_000; // 10 min before the h1/h2 boundary
+        let until = now + 1000;
+        assert!(since > h1, "window must straddle the h1/h2 boundary");
+
+        let points = db
+            .query_timeseries(key, "decode_tps", since, until)
+            .await
+            .unwrap();
+
+        // The straddle bucket (42.0) is KEPT: raw coverage starts 5 min
+        // into the window (post-restart), so the hourly average is the
+        // only coverage for the [since, h2 - 300_000) stretch. Its
+        // timestamp is clamped to `since`.
+        let straddle = points
+            .iter()
+            .find(|p| (p.value - 42.0).abs() < f64::EPSILON)
+            .expect("straddle rollup bucket must be kept when raw misses window start");
+        assert_eq!(
+            straddle.timestamp_ms, since,
+            "straddle bucket must be clamped to the window start"
+        );
+        // Raw points from the current hour are present alongside it. (The
+        // raw bucket floor can land a hair before h2 when bucket_ms doesn't
+        // divide the hour — value, not position, identifies raw points here.)
+        assert!(
+            points.iter().any(|p| (p.value - 99.0).abs() < f64::EPSILON),
+            "raw 1s points must be present, got {points:?}"
         );
     }
 
