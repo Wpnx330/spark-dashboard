@@ -437,6 +437,16 @@ export function ChartWithTimeScale({
       return pre.filter((p) => p.timestamp >= t0)
     }
 
+    // Final trim to at most sliceCount points from the NEWEST end. Keeps the
+    // array handed to TimeSeriesChart at ≤ maxPoints so padData's stride
+    // rule never engages: the merged/live array otherwise oscillates
+    // 300 ↔ 301 around the threshold (WS tick vs window slide land ~100ms
+    // apart each second), flipping stride-1/stride-2 on alternating ticks —
+    // the visible chart "blink". Prevents stride-1/stride-2 alternation at
+    // the maxPoints boundary.
+    const trimToSlice = (arr: DataPoint[]): DataPoint[] =>
+      arr.length > sliceCount ? arr.slice(-sliceCount) : arr
+
     let chartData: DataPoint[] | undefined
     let chartSeries: ChartSeries[] | undefined
 
@@ -451,8 +461,11 @@ export function ChartWithTimeScale({
         })
         // Dense path returns `cutLive` by reference (already ≥ t0) — skip
         // the second filter/copy. The merged path can carry seed points
-        // outside the window, so it always gets filtered.
-        return { ...s, data: merged === cutLive ? merged : merged.filter((p) => p.timestamp >= t0) }
+        // outside the window, so it always gets filtered. Either way the
+        // result is trimmed to sliceCount: the dense steady-state buffer
+        // also holds 301+ in-window points and blinks identically.
+        const inWindow = merged === cutLive ? merged : merged.filter((p) => p.timestamp >= t0)
+        return { ...s, data: trimToSlice(inWindow) }
       })
     } else if (bufferData) {
       const cutLive = cut(bufferData)
@@ -460,7 +473,8 @@ export function ChartWithTimeScale({
         denseThreshold,
         valueMap: seedValueMap,
       })
-      chartData = merged === cutLive ? merged : merged.filter((p) => p.timestamp >= t0)
+      const inWindow = merged === cutLive ? merged : merged.filter((p) => p.timestamp >= t0)
+      chartData = trimToSlice(inWindow)
     }
 
     // Always render the FULL time domain, even when samples are sparse:

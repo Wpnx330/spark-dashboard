@@ -6,6 +6,22 @@ import {
   applySeedResults,
 } from '@/components/charts/ChartWithTimeScale'
 
+// Capture the props handed to TimeSeriesChart while still rendering the real
+// component, so tests can assert on the exact data array ChartWithTimeScale
+// passes onward (point counts, trimming) without duplicating its logic.
+const chartCapture = vi.hoisted(() => ({
+  props: [] as Array<{ data?: Array<{ timestamp: number; value: number }> }>,
+}))
+
+vi.mock('@/components/charts/TimeSeriesChart', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/components/charts/TimeSeriesChart')>()
+  const ChartCapture = (props: Parameters<typeof actual.TimeSeriesChart>[0]) => {
+    chartCapture.props.push(props)
+    return <actual.TimeSeriesChart {...props} />
+  }
+  return { ...actual, TimeSeriesChart: ChartCapture }
+})
+
 // --- Mock fetch ---
 type FetchHandler = (url: string) => Promise<unknown>
 let fetchHandler: FetchHandler = async () => ({ points: [] })
@@ -30,6 +46,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals()
+  vi.restoreAllMocks()
   fetchHandler = async () => ({ points: [] })
 })
 
@@ -603,5 +620,148 @@ describe('ChartWithTimeScale buffer seeding', () => {
     // Give effects a tick; no fetch calls should have happened.
     await new Promise((r) => setTimeout(r, 20))
     expect(fetch).not.toHaveBeenCalled()
+  })
+})
+
+// Regression tests for the 1m/5m chart "blink": the data array handed to
+// TimeSeriesChart must never exceed maxPoints (BUFFER_SLICE). This prevents
+// stride-1/stride-2 alternation at the maxPoints boundary (chart blink) in
+// padData — a merged/live array oscillating 300 ↔ 301 around the threshold
+// used to flip between full-density and half-density rendering every tick.
+describe('ChartWithTimeScale buffer slice trim', () => {
+  const T0 = 1_700_000_000_000
+
+  beforeEach(() => {
+    // Isolate the shared prop recorder: lastChartProps() must only ever see
+    // renders from the current test.
+    chartCapture.props.length = 0
+  })
+
+  /** Pin Date.now (the buffer window and seed fetch derive from it). */
+  const pinNow = (ms: number) => {
+    let now = ms
+    return {
+      advance: (next: number) => {
+        now = next
+      },
+      spy: vi.spyOn(Date, 'now').mockImplementation(() => now),
+    }
+  }
+
+  const makePoints = (fromMs: number, count: number, stepMs = 1000, value = 50) =>
+    Array.from({ length: count }, (_, i) => ({
+      timestamp: fromMs + i * stepMs,
+      value,
+    }))
+
+  const lastChartProps = () => {
+    expect(chartCapture.props.length).toBeGreaterThan(0)
+    return chartCapture.props[chartCapture.props.length - 1]
+  }
+
+  const toRaw = (pts: Array<{ timestamp: number; value: number }>) =>
+    pts.map((p) => ({ timestamp_ms: p.timestamp, value: p.value }))
+
+  it('trims a 301-point merged array to 300 and keeps it at 300 across a simulated second tick', async () => {
+    const { advance } = pinNow(T0)
+    // Seed covers [T0 − 300s, T0] inclusive at 1s → 301 points. The single
+    // live point collides with the seed point at T0, so the merge yields
+    // exactly 301 points — one past the 5m maxPoints boundary.
+    fetchHandler = async () => ({
+      points: toRaw(makePoints(T0 - 300_000, 301)),
+    })
+
+    const { rerender } = render(
+      <ChartWithTimeScale
+        bufferData={[{ timestamp: T0, value: 99 }]}
+        engineEndpoint="http://localhost:8000"
+        historyMetrics={['gpu_util']}
+        unit="%"
+      />,
+    )
+
+    // Without the trim, padData would see 301 > 300 points and downsample
+    // with stride 2 (~151 rendered points) on this tick and full density on
+    // the next — the blink. The handed-onward array must be exactly 300.
+    await waitFor(() => expect(lastChartProps().data).toHaveLength(300))
+
+    // Simulated second tick: one more live sample arrives, the window slides
+    // 1s forward (the oldest seed point ages out of [T0 − 299s, T0 + 1s]).
+    // The merged array is 301 again; the trim must keep the handed-onward
+    // length pinned at 300 (same density as the previous tick).
+    advance(T0 + 1000)
+    rerender(
+      <ChartWithTimeScale
+        bufferData={[
+          { timestamp: T0, value: 99 },
+          { timestamp: T0 + 1000, value: 100 },
+        ]}
+        engineEndpoint="http://localhost:8000"
+        historyMetrics={['gpu_util']}
+        unit="%"
+      />,
+    )
+    const after = lastChartProps().data ?? []
+    expect(after).toHaveLength(300)
+    // Trim keeps the NEWEST end: the fresh live sample survives.
+    expect(after[after.length - 1]).toEqual({ timestamp: T0 + 1000, value: 100 })
+  })
+
+  it('trims a 601-point dense live array to 300 (5m)', async () => {
+    pinNow(T0)
+    // 601 in-window samples at 500ms spacing → dense path (≥ denseThreshold
+    // 225), returned by reference from mergeSeedIntoLive, then trimmed.
+    fetchHandler = async () => ({ points: [] })
+    render(
+      <ChartWithTimeScale
+        bufferData={makePoints(T0 - 300_000, 601, 500)}
+        engineEndpoint="http://localhost:8000"
+        historyMetrics={['gpu_util']}
+        unit="%"
+      />,
+    )
+    const data = lastChartProps().data ?? []
+    expect(data).toHaveLength(300)
+    // Newest end preserved.
+    expect(data[data.length - 1]).toEqual({ timestamp: T0, value: 50 })
+  })
+
+  it('passes arrays at or below the slice count through unchanged (5m, 100 points)', async () => {
+    pinNow(T0)
+    fetchHandler = async () => ({ points: [] })
+    const live = makePoints(T0 - 99_000, 100)
+    render(
+      <ChartWithTimeScale
+        bufferData={live}
+        engineEndpoint="http://localhost:8000"
+        historyMetrics={['gpu_util']}
+        unit="%"
+      />,
+    )
+    // Under the limit: no trim, all points intact (identity is fine — the
+    // time filter may already have copied the array).
+    expect(lastChartProps().data).toEqual(live)
+  })
+
+  it('trims a 61-point dense live array to 60 (1m)', async () => {
+    pinNow(T0)
+    fetchHandler = async () => ({ points: [] })
+    // 61 points spanning exactly the 1m window ([T0 − 60s, T0] at 1s).
+    render(
+      <ChartWithTimeScale
+        bufferData={makePoints(T0 - 60_000, 61)}
+        engineEndpoint="http://localhost:8000"
+        historyMetrics={['gpu_util']}
+        unit="%"
+      />,
+    )
+    // Cycle 5m → 1h → 24h → 1m.
+    fireEvent.click(screen.getByRole('button'))
+    fireEvent.click(screen.getByRole('button'))
+    fireEvent.click(screen.getByRole('button'))
+    expect(screen.getByText('1m')).toBeInTheDocument()
+    // 61 > 60 would flip padData to stride 2 (the 1m blink); the trim pins
+    // the handed-onward array at exactly 60.
+    expect(lastChartProps().data).toHaveLength(60)
   })
 })
