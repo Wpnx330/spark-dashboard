@@ -4,6 +4,19 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::info;
 
+/// How many recent days the 1h→1d rollup re-aggregates on each tick: the
+/// current (partial) day plus the previous `DAILY_ROLLUP_LOOKBACK_DAYS - 1`
+/// completed days. Days older than this window are NEVER touched by the
+/// rollup.
+///
+/// WHY bounded: the same rollup prunes hourly rows older than 30 days, so
+/// re-aggregating an old day from its (partially pruned) hourly sources
+/// OVERWRITES the stored daily totals with a shrinking remainder — the cause
+/// of the ever-decreasing "All time" cost-avoided total. Once a day's last
+/// hourly row is pruned, the daily row would be frozen at whatever the last
+/// partial aggregation produced (e.g. sample_count=3600 instead of 86400).
+const DAILY_ROLLUP_LOOKBACK_DAYS: i64 = 3;
+
 /// Thread-safe handle to the history database.
 #[derive(Clone)]
 pub struct HistoryDb {
@@ -492,6 +505,43 @@ impl HistoryDb {
         let _ = db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
         let now_ms = chrono_now_ms();
         let current_day_start = (now_ms / 86_400_000) * 86_400_000;
+        // Key of the current (incomplete) day bucket on the shifted-day grid
+        // the daily table uses ((t - offset) floored to UTC day, + offset).
+        // The lookback bound is aligned to this grid — NOT to UTC midnights —
+        // so a day bucket is either fully re-aggregated or not touched at all.
+        // A UTC-midnight bound would straddle day buckets whenever
+        // utc_offset != 0 and partially rewrite them on their way out of the
+        // window (the same frozen-partial-row defect as pruned sources).
+        let shifted_today_start =
+            ((now_ms - day_offset_ms) / 86_400_000) * 86_400_000 + day_offset_ms;
+        let lookback_start = shifted_today_start - (DAILY_ROLLUP_LOOKBACK_DAYS - 1) * 86_400_000;
+
+        // Merge duplicate daily buckets before the re-aggregation. Rows
+        // written before the utc_offset feature was introduced are keyed at
+        // UTC midnights, rows written after are keyed on the shifted grid, so
+        // the same calendar day can exist twice (double-counted in range
+        // sums). Partition rows by the day-bucket formula the rollup itself
+        // uses; keep the row with the most samples (tie-break: more prompt
+        // tokens) and delete the rest. Idempotent: once a single row remains
+        // per day bucket, every row ranks rn = 1 and nothing is deleted.
+        // Safe to run on every rollup tick.
+        let deduped = db.execute(
+            "WITH ranked AS (
+                 SELECT rowid AS rid, ROW_NUMBER() OVER (
+                     PARTITION BY engine_key,
+                                  ((bucket_ts - ?1) / 86400000) * 86400000 + ?1
+                     ORDER BY sample_count DESC,
+                              COALESCE(total_prompt_tokens, 0) DESC,
+                              rowid ASC
+                 ) AS rn
+                 FROM snapshots_1d
+             )
+             DELETE FROM snapshots_1d WHERE rowid IN (SELECT rid FROM ranked WHERE rn > 1)",
+            params![day_offset_ms],
+        )?;
+        if deduped > 0 {
+            info!("History: merged {} duplicate daily bucket rows", deduped);
+        }
 
         // Same latency-column + ON CONFLICT DO UPDATE pattern as the 1s→1h
         // rollup: ON CONFLICT refreshes ALL columns. The 1h table stores
@@ -524,9 +574,9 @@ impl HistoryDb {
                AVG(kv_cache_pct_avg), MAX(kv_cache_pct_max), AVG(prefix_cache_hit_avg),
                AVG(cpu_util_avg), SUM(sample_count), MAX(preemptions_total),
                AVG(queue_time_ms_avg), AVG(tpot_ms_avg), AVG(spec_decode_acceptance_rate_avg)
-              FROM snapshots_1h
-             WHERE bucket_ts < ?1
-             GROUP BY engine_key, ((bucket_ts - ?2) / 86400000) * 86400000 + ?2
+               FROM snapshots_1h
+              WHERE bucket_ts < ?1 AND bucket_ts >= ?3
+              GROUP BY engine_key, ((bucket_ts - ?2) / 86400000) * 86400000 + ?2
              ON CONFLICT(engine_key, bucket_ts) DO UPDATE SET
                total_prompt_tokens = excluded.total_prompt_tokens,
                total_gen_tokens = excluded.total_gen_tokens,
@@ -553,7 +603,7 @@ impl HistoryDb {
                queue_time_ms_avg = excluded.queue_time_ms_avg,
                tpot_ms_avg = excluded.tpot_ms_avg,
                spec_decode_acceptance_rate_avg = excluded.spec_decode_acceptance_rate_avg",
-            params![current_day_start, day_offset_ms],
+            params![current_day_start, day_offset_ms, lookback_start],
         )?;
 
         // Prune hourly data older than 30 days
@@ -3264,5 +3314,230 @@ mod tests {
             "peak queued should be MAX(2, 3) = 3"
         );
         assert_eq!(merged.source_table, "mixed");
+    }
+
+    // -----------------------------------------------------------------
+    // Daily rollup lookback + duplicate-bucket dedupe
+    // -----------------------------------------------------------------
+
+    /// Defect 1 regression: a daily row older than the lookback window must
+    /// NOT be rewritten by rollup_1h_to_1d even when its hourly source rows
+    /// have been partially pruned. Before the fix, the rollup re-aggregated
+    /// ALL hourly rows and overwrote old daily totals with the shrinking
+    /// remainder (the shrinking "All time" cost-avoided bug).
+    #[tokio::test]
+    async fn test_rollup_1h_to_1d_does_not_rewrite_days_outside_lookback() {
+        let db = test_db();
+        let key = "old-engine";
+        let now = chrono_now_ms();
+        let current_day_start = (now / 86_400_000) * 86_400_000;
+        // 10 days ago: far outside the 3-day lookback, inside the 30-day
+        // hourly retention so this is exactly the live-DB failure window.
+        let old_day = current_day_start - 10 * 86_400_000;
+
+        {
+            let c = db.inner.lock().await;
+            // Four hourly source rows for the old day...
+            for h in 0..4 {
+                c.execute(
+                    "INSERT INTO snapshots_1h \
+                     (engine_key, bucket_ts, total_prompt_tokens, sample_count) \
+                     VALUES (?1, ?2, ?3, 3600)",
+                    params![key, old_day + h * 3_600_000, 1000 + h],
+                )
+                .unwrap();
+            }
+            // ...the daily row holding the ORIGINAL full-day totals, and a
+            // simulated pruning that leaves only the first hour standing.
+            c.execute(
+                "INSERT INTO snapshots_1d \
+                 (engine_key, bucket_ts, total_prompt_tokens, sample_count) \
+                 VALUES (?1, ?2, 8640000, 86400)",
+                params![key, old_day],
+            )
+            .unwrap();
+            c.execute(
+                "DELETE FROM snapshots_1h WHERE engine_key = ?1 AND bucket_ts >= ?2",
+                params![key, old_day + 3_600_000],
+            )
+            .unwrap();
+        }
+
+        db.rollup_1h_to_1d(None).await.unwrap();
+
+        let (tokens, sc): (i64, i64) = {
+            let c = db.inner.lock().await;
+            c.query_row(
+                "SELECT total_prompt_tokens, sample_count FROM snapshots_1d \
+                 WHERE engine_key = ?1 AND bucket_ts = ?2",
+                params![key, old_day],
+                |r| Ok((r.get(0).unwrap(), r.get(1).unwrap())),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            tokens, 8640000,
+            "old daily row must not be rewritten from pruned hourly sources"
+        );
+        assert_eq!(sc, 86400, "old daily sample_count must stay intact");
+    }
+
+    /// Companion to the lookback regression: a daily row WITHIN the lookback
+    /// window is still re-aggregated normally from its hourly sources.
+    #[tokio::test]
+    async fn test_rollup_1h_to_1d_updates_recent_day_within_lookback() {
+        let db = test_db();
+        let key = "recent-engine";
+        let now = chrono_now_ms();
+        let current_day_start = (now / 86_400_000) * 86_400_000;
+        let yesterday = current_day_start - 86_400_000;
+
+        {
+            let c = db.inner.lock().await;
+            // Stale daily row that must be refreshed...
+            c.execute(
+                "INSERT INTO snapshots_1d \
+                 (engine_key, bucket_ts, total_prompt_tokens, sample_count) \
+                 VALUES (?1, ?2, 1, 1)",
+                params![key, yesterday],
+            )
+            .unwrap();
+            // ...and four hourly source rows totalling 2000 tokens / 14400s.
+            for h in 0..4 {
+                c.execute(
+                    "INSERT INTO snapshots_1h \
+                     (engine_key, bucket_ts, total_prompt_tokens, sample_count) \
+                     VALUES (?1, ?2, 500, 3600)",
+                    params![key, yesterday + h * 3_600_000],
+                )
+                .unwrap();
+            }
+        }
+
+        db.rollup_1h_to_1d(None).await.unwrap();
+
+        let (tokens, sc): (i64, i64) = {
+            let c = db.inner.lock().await;
+            c.query_row(
+                "SELECT total_prompt_tokens, sample_count FROM snapshots_1d \
+                 WHERE engine_key = ?1 AND bucket_ts = ?2",
+                params![key, yesterday],
+                |r| Ok((r.get(0).unwrap(), r.get(1).unwrap())),
+            )
+            .unwrap()
+        };
+        assert_eq!(tokens, 2000, "recent day re-aggregated from hourly rows");
+        assert_eq!(sc, 14400, "recent day sample_count = SUM(4 x 3600)");
+    }
+
+    /// Defect 2 regression: duplicate daily buckets for the same shifted day
+    /// (legacy UTC-keyed + offset-keyed) collapse to one row; the survivor is
+    /// the row with the larger sample_count (tie-break: larger
+    /// total_prompt_tokens); running the rollup again is a no-op. Rows of
+    /// other engines sharing the same calendar day are left untouched.
+    #[tokio::test]
+    async fn test_rollup_1h_to_1d_dedupes_duplicate_day_buckets() {
+        let db = test_db();
+        db.set_setting("utc_offset", "-4").await.unwrap();
+        let key = "dup-engine";
+        let guard_key = "guard-engine";
+        let tie_key = "tie-engine";
+        let now = chrono_now_ms();
+        let current_day_start = (now / 86_400_000) * 86_400_000;
+        let utc_day = current_day_start - 5 * 86_400_000;
+        let ofs_ms = -4 * 3_600_000;
+        // Same day-bucket formula the rollup/dedupe uses: a legacy UTC-midnight
+        // row and the offset-keyed row both map to this shifted-day key.
+        let shifted_key = ((utc_day - ofs_ms) / 86_400_000) * 86_400_000 + ofs_ms;
+        assert_ne!(
+            shifted_key, utc_day,
+            "offset-keyed row differs from UTC key"
+        );
+
+        {
+            let c = db.inner.lock().await;
+            // Duplicate pair for `key`: legacy UTC-keyed row (full day) vs
+            // offset-keyed row (degraded by the pruned-source rewrite bug).
+            c.execute(
+                "INSERT INTO snapshots_1d \
+                 (engine_key, bucket_ts, total_prompt_tokens, sample_count) \
+                 VALUES (?1, ?2, 5000, 86400)",
+                params![key, utc_day],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO snapshots_1d \
+                 (engine_key, bucket_ts, total_prompt_tokens, sample_count) \
+                 VALUES (?1, ?2, 100, 3600)",
+                params![key, shifted_key],
+            )
+            .unwrap();
+            // Same-day row of another engine: single row, must survive.
+            c.execute(
+                "INSERT INTO snapshots_1d \
+                 (engine_key, bucket_ts, total_prompt_tokens, sample_count) \
+                 VALUES (?1, ?2, 777, 86400)",
+                params![guard_key, utc_day],
+            )
+            .unwrap();
+            // Tie on sample_count: larger total_prompt_tokens must win.
+            c.execute(
+                "INSERT INTO snapshots_1d \
+                 (engine_key, bucket_ts, total_prompt_tokens, sample_count) \
+                 VALUES (?1, ?2, 700, 86400)",
+                params![tie_key, utc_day],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO snapshots_1d \
+                 (engine_key, bucket_ts, total_prompt_tokens, sample_count) \
+                 VALUES (?1, ?2, 300, 86400)",
+                params![tie_key, shifted_key],
+            )
+            .unwrap();
+        }
+
+        db.rollup_1h_to_1d(None).await.unwrap();
+
+        let read_rows = |c: &Connection, engine: &str| -> Vec<(i64, i64, i64)> {
+            let mut stmt = c
+                .prepare(
+                    "SELECT bucket_ts, total_prompt_tokens, sample_count \
+                     FROM snapshots_1d WHERE engine_key = ?1",
+                )
+                .unwrap();
+            stmt.query_map(params![engine], |r| {
+                Ok((r.get(0).unwrap(), r.get(1).unwrap(), r.get(2).unwrap()))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+
+        {
+            let c = db.inner.lock().await;
+            let rows = read_rows(&c, key);
+            assert_eq!(rows.len(), 1, "duplicate pair collapses to one row");
+            assert_eq!(rows[0].0, utc_day, "survivor keeps the larger-sample row");
+            assert_eq!(rows[0].1, 5000);
+            assert_eq!(rows[0].2, 86400);
+
+            let guard = read_rows(&c, guard_key);
+            assert_eq!(guard.len(), 1, "single-row day is untouched");
+            assert_eq!(guard[0].1, 777);
+
+            let tie = read_rows(&c, tie_key);
+            assert_eq!(tie.len(), 1, "tied pair collapses to one row");
+            assert_eq!(tie[0].1, 700, "tie-break keeps more prompt tokens");
+        }
+
+        // Idempotent: a second rollup tick changes nothing further.
+        db.rollup_1h_to_1d(None).await.unwrap();
+        {
+            let c = db.inner.lock().await;
+            assert_eq!(read_rows(&c, key).len(), 1, "dedupe is a no-op on rerun");
+            assert_eq!(read_rows(&c, guard_key).len(), 1);
+            assert_eq!(read_rows(&c, tie_key).len(), 1);
+        }
     }
 }
