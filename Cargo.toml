@@ -1,0 +1,49 @@
+[package]
+name = "spark-dashboard"
+version = "0.12.0"
+edition = "2021"
+rust-version = "1.95"
+description = "Real-time hardware and LLM inference monitoring for Linux hosts with NVIDIA GPUs"
+license = "MIT"
+repository = "https://github.com/niklasfrick/spark-dashboard"
+readme = "README.md"
+keywords = ["monitoring", "gpu", "nvml", "dgx-spark", "vllm"]
+categories = ["command-line-utilities", "visualization"]
+# frontend/dist is produced by `npm run build` before `cargo publish`; it is
+# gitignored but must ship in the published crate so rust-embed can pick it up
+# during `cargo install`. Same for the systemd unit + config example — they are
+# embedded in the binary via include_str! for the `service` subcommand.
+include = [
+    "/src/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+    "/frontend/dist/**",
+    "/deploy/host/systemd/spark-dashboard.service",
+    "/deploy/host/config.env.example",
+]
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+sysinfo = "0.39"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tower-http = { version = "0.7", features = ["cors", "fs"] }
+rust-embed = { version = "8", features = ["axum"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+mime_guess = "2"
+reqwest = { version = "0.13", features = ["json"] }
+async-trait = "0.1"
+prometheus-parse = "0.2"
+futures-util = "0.3"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nvml-wrapper = "0.12"
+procfs = "0.18"
+bollard = "0.21"

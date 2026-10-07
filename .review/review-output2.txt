@@ -1,0 +1,550 @@
+[0m
+> build · glm53-nothinking
+[0m
+[0m→ [0mRead .review/fixB_review_diff.txt
+Let me start by reading the diff under review and the relevant files. The user wants an adversarial code review of FIX B (buffer seeding) plus FIX A (backend clamp). Let me read the diff file first, then the actual source files to verify behavior beyond the diff.
+
+Plan:
+1. Read .review/fixB_review_diff.txt
+2. Read src/history.rs (relevant parts)
+3. Read frontend/src/components/charts/ChartWithTimeScale.tsx
+4. Read frontend/src/components/engines/EngineCard.tsx (call sites)
+5. Read frontend/src/__tests__/ChartWithTimeScale.test.tsx
+6. Check Dashboard.tsx for how charts are created (inline arrays, configs)
+7. Check src/history.rs query_timeseries ORDER BY, bucket_size_ms, query_summary
+8. Check mergeSeedIntoLive, useBufferSeed etc.
+
+Let me do this efficiently with parallel reads.
+[0m→ [0mRead frontend/src/components/charts/ChartWithTimeScale.tsx
+Now let me read the actual source files to verify behavior beyond the diff. Key things to check:
+
+1. `src/history.rs` — query_timeseries, ORDER BY, bucket_size_ms, query_summary
+2. `frontend/src/components/charts/ChartWithTimeScale.tsx` — full file
+3. `frontend/src/hooks/useHistoryTimeseries.ts` — how history mode fetches (window sizes, bucket sizes)
+4. `frontend/src/components/engines/EngineCard.tsx` — call sites, E2E_HISTORY config
+5. `frontend/src/components/Dashboard.tsx` — inline arrays at 1Hz
+
+Let me read these in parallel.Now let me read the actual source files to verify behavior beyond the diff:
+[0m→ [0mRead frontend/src/hooks/useHistoryTimeseries.ts
+[0m
+[0m$ [0mrg -n "query_timeseries|bucket_size_ms|fn query_summary|ORDER BY|since_hour|until_ms" /home/cwykel/spark-dashboard-prs/pr46/src/history.rs | head -60
+584:    pub async fn query_summary(
+588:        until_ms: i64,
+621:                    until_ms,
+640:            let result = query_summary_one_table(&db, engine_key, since_ms, until_ms, *table_info)?;
+660:    pub async fn query_timeseries(
+665:        until_ms: i64,
+706:        let range_ms = until_ms.saturating_sub(since_ms);
+726:                     ORDER BY bucket_ts ASC",
+732:                let since_hour = (since_ms / 3_600_000) * 3_600_000;
+734:                    .query_map(params![engine_key, since_hour, until_ms], |r| {
+758:            let bucket_ms = bucket_size_ms(range_ms);
+765:                 ORDER BY bucket_ts ASC",
+772:                .query_map(params![engine_key, since_ms, until_ms], |r| {
+811:                 ORDER BY {ts_col} ASC",
+815:                .query_map(params![engine_key, since_ms, until_ms], |r| {
+832:                if until_ms >= current_hour_start {
+844:                         ORDER BY bucket_ts ASC",
+850:                        .query_map(params![engine_key, current_hour_start, until_ms], |r| {
+936:fn query_summary_one_table(
+940:    until_ms: i64,
+994:    let result = db.query_row(&sql, params![engine_key, since_ms, until_ms], |r| {
+1127:/// A single time-series data point returned by [`HistoryDb::query_timeseries`].
+1152:/// [`HistoryDb::query_timeseries`]. Targets ~360 buckets across the range,
+1154:fn bucket_size_ms(range_ms: i64) -> i64 {
+1732:    // query_timeseries tests
+1799:            .query_timeseries(key, "decode_tps", base, base + 2000)
+1850:    fn test_bucket_size_ms() {
+1852:            bucket_size_ms(3_600_000),
+1857:            bucket_size_ms(900_000),
+1862:            bucket_size_ms(2_000),
+1866:        assert_eq!(bucket_size_ms(0), 1_000, "zero range uses the 1s floor");
+1911:            .query_timeseries(key, "active_requests", base, base + 3_600_000)
+1923:            .query_timeseries(key, "prompt_tps", base, base + 3_600_000)
+1943:            .query_timeseries("ghost", "prompt_tps", 0, 1_000_000)
+1953:            .query_timeseries("any", "bogus_metric", 0, 1_000_000)
+1984:            .query_timeseries("e1", "prompt_tps", 0, 7_200_000)
+1995:            .query_timeseries("e1", "decode_tps", 0, 7_200_000)
+2020:            .query_timeseries("e1", "power_watts", 0, 7_200_000)
+2095:            .query_timeseries(key, "decode_tps", since, until)
+2175:            .query_timeseries(key, "decode_tps", since, until)
+2265:            .query_timeseries(key, "decode_tps", since, until)
+2331:            .query_timeseries(key, "mem_used_pct", base, base + 2000)
+2339:            .query_timeseries(key, "mem_used_pct", 0, 7_200_000)
+2381:            .query_timeseries(key, "queue_time_ms", base, base + 2000)
+2389:            .query_timeseries(key, "tpot_ms", base, base + 2000)
+2397:            .query_timeseries(key, "total_requests", base, base + 2000)
+2472:            .query_timeseries(key, "queue_time_ms", range_start, range_end)
+2480:            .query_timeseries(key, "tpot_ms", range_start, range_end)
+2489:            .query_timeseries(key, "total_requests", range_start, range_end)
+[0m
+Now let me read src/history.rs to check the backend: query_timeseries, bucket_size_ms, ORDER BY, query_summary, and the clamp context.Now the backend. Let me look at `src/history.rs` around the clamp and the query_timeseries function:
+[0m→ [0mRead src/history.rs[90m [offset=660, limit=280][0m
+[0m
+[0m$ [0mrg -n "E2E_HISTORY|e2eSeries" /home/cwykel/spark-dashboard-prs/pr46/frontend/src/components/engines/EngineCard.tsx | head -20
+112:const E2E_HISTORY: HistorySeriesConfig[] = ['e2e_ms']
+260:  const e2eSeries = chartData
+273:  const e2eTrend: Trend = chartData ? computeTrend(e2eSeries) : 'stable'
+438:                        bufferData={e2eSeries.map(p => ({ ...p, value: p.value / 1000 }))}
+440:                        historyMetrics={E2E_HISTORY}
+612:                bufferData={e2eSeries.map(p => ({ ...p, value: p.value / 1000 }))}
+614:                historyMetrics={E2E_HISTORY}
+[0m
+Very important finding! Look at lines 706-708:
+
+```rust
+let range_ms = until_ms.saturating_sub(since_ms);
+
+if range_ms <= HOUR_MS {
+```
+
+And the clamp at line 743: `let ts = ts.max(since_ms);`
+
+This clamp is applied in the `range_ms <= HOUR_MS` branch — which includes **the 1s raw-data path used by the buffer seeding too**. Wait, no — the clamp is only applied to `agg_points` (Part 1, from snapshots_1h) in the ≤1h branch. The 1s raw points (Part 2) are queried with `ts >= since_ms` so they're already in-window.
+
+But here's the key adversarial question: **the ≤1h branch is used by the 1m/5m seed fetches too** (60s/300s ranges). For those small ranges, `since_hour = (since_ms / 3_600_000) * 3_600_000` — the hour start. So the seed query for a 60s window will ALSO pull the completed-hour bucket(s) covering the whole hour. If the current hour is incomplete (no 1h row yet — rollup only writes completed hours), then there's no straddling bucket yet. But wait — the PREVIOUS completed hour bucket has bucket_ts = hour start. For a 60s window at, say, 10:30:00, since_hour = 10:00:00. Is there a snapshots_1h row with bucket_ts = 10:00:00? No — the rollup only writes COMPLETE hours, so at 10:30 the 10:00 hour is incomplete and not yet in snapshots_1h. The most recent completed hour is 09:00. So `bucket_ts >= 10:00:00` filter excludes it. Good — no straddle bucket for 60s windows unless since_hour floor catches the previous hour... since_hour = floor of since to hour = 10:00, and only buckets >= 10:00 are included. The 09:00 bucket is < 10:00 → excluded. So the seed fetch does NOT get polluted by the hour bucket. OK.
+
+BUT WAIT — there's a subtle issue: `bucket_ts >= since_hour` where since_hour = floor(since). The comment says "Include the complete hour STRADDLING `since`". The floor of since IS the hour containing since. If since = 10:30, since_hour = 10:00. A bucket at 10:00 would only exist if the 10:00 hour is COMPLETE, i.e., now >= 11:00. But since <= until <= now, and the range is ≤ 1h, so until <= since + 1h <= 11:30. Hmm, if since = 10:30 and now = 11:15, a 45-min range: since_hour = 10:00, and the 10:00 bucket EXISTS (completed at 11:00). Its raw ts = 10:00:00 < since = 10:30 → clamped to 10:30. That's the straddle case, and it's what FIX A handles. Good.
+
+Now the adversarial questions:
+
+**Q1: Does the clamp distort semantics?** The clamped point claims the hourly average value at timestamp `since`. For a 1h chart where since = now-60min: if since is mid-hour, the straddle bucket's average covers [since, next-hour-start) only — actually no! The bucket covers the ENTIRE previous hour [h1, h2). The window only overlaps part of it. Reporting the FULL hourly average at a clamped timestamp means the value shown at the left edge of the chart is the average of the whole hour, most of which is OUTSIDE the window. That's a data-semantics distortion, but it's the standard trade-off and the comment acknowledges it. It's arguably the best available data. Severity: MINOR (documented trade-off). Actually wait — is there a worse case? What about the ≤1h branch being used for the **1m/5m seed**? For a 60s window, since_hour floors to the current hour start. If now = 11:05 (5 min into hour 11:00), since = 11:04, since_hour = 11:00. The 11:00 hour bucket does NOT exist (incomplete). The 10:00 bucket < 11:00 → excluded. So Part 1 returns nothing for seed fetches. Good — the seed is pure 1s data. 
+
+Hmm wait, but actually there's an edge: what if since is exactly at an hour boundary or the range spans exactly 1h and now is just past an hour boundary? E.g., 1h history view: since = now - 3600000. If now = 11:30, since = 10:30, since_hour = 10:00, 10:00 bucket exists (completed) → clamped to 10:30. Fine, that's the intended straddle fix.
+
+But what about the **24h regression check**: range > HOUR_MS goes to the else branch (lines 787+), which is untouched. query_summary untouched — confirmed, the clamp is only in query_timeseries Part 1. But wait — the else branch (1h table for ranges ≤ 24h, lines 793+) does NOT have the straddle issue? For a 24h range, since_hour... the else branch queries `bucket_ts >= since_ms` directly (line 810, params since_ms, until_ms). The bucket straddling `since` (bucket_ts < since but covering since) is EXCLUDED there — pre-existing behavior, not touched by this diff. The 24h chart doesn't clamp or include straddle. That's a pre-existing inconsistency, not a regression. Could note as NIT.
+
+**Q2: Dedupe/sort interaction.** After the clamp, points.sort_by_key (line 785). Could the clamped straddle bucket collide with a 1s raw bucket_ts? The raw part queries `ts >= since_ms`, bucketed to bucket_ms. The straddle bucket clamped to since_ms... the first 1s bucket could be exactly at since_ms if a sample lands there. bucket alignment: 1s buckets are aligned to bucket_ms multiples ((ts / bucket_ms) * bucket_ms). The straddle bucket ts = h1 (hour-aligned). Clamped to since_ms which is mid-hour — unlikely to equal a 1s bucket_ts unless since_ms is bucket-aligned. If since_ms == bucket_ts of a 1s bucket AND the straddle clamps to exactly since_ms, you'd get two points with the same timestamp (hourly avg + 1s avg) → duplicate x values. sort_by_key is stable in Rust (sort_by_key is stable), so order = agg first, then raw. Duplicate timestamps in chart data — TimeSeriesChart may handle or not. Probability low (requires since_ms bucket-aligned AND data at that instant). Severity: MINOR/NIT. Actually wait, can since_ms be exactly hour-aligned AND equal to a 1s bucket? 1m/5m seed: since = now - 60000; until = now. These are Date.now() values — ms precision, essentially never bucket-aligned. 1h view: since = now - 3600000 — also arbitrary ms. So collision requires (ts/bucket)*bucket == since_ms, probability ~ bucket_ms/window. Tiny. NIT.
+
+Actually, hold on. There's a subtler duplicate: in the ≤1h branch, Part 1 (1h buckets) and Part 2 (1s data) can overlap in time when 1s data hasn't been pruned yet! The comment says "1h bucket_ts and 1s ts won't overlap" — but that's only true after pruning. The rollup writes the 1h bucket AND THEN prunes 1s data (or maybe prune is separate). If rollup happened but 1s prune is delayed/behind, both tables have data for the same hour → duplicate timestamps → sort puts them adjacent → chart shows doubled points. Is this pre-existing? Yes — this branch predates the diff (the diff only added the clamp). Actually let me check git — the ≤1h branch with both parts... the diff context shows the since_hour line was ADDED in this diff (line 732 `let since_hour = ...` is in the diff context at + lines? Let me re-check the diff: lines 406-421 of the diff show `@@ -733,6 +733,14 @@` with only the clamp added; `since_hour` at 732 was pre-existing (it's context). Actually the diff hunk starts at line 733 with `let agg_points = stmt` as context. So since_hour query and straddle inclusion are PRE-EXISTING; the diff only adds the clamp. OK.
+
+**Q3: query_summary untouched** — confirmed, clamp only in query_timeseries. ✓
+
+Now the frontend. Let me analyze the adversarial checklist:
+
+**1. Hook rules:**
+- `useBufferSeed` — hooks called unconditionally. ✓
+- `neededKey` useMemo deps `[configs, isBuffer]` — configs is `effectiveConfigs` = `useMemo(() => historyMetrics ?? [], [historyMetrics])`. If the parent (EngineCard) passes an inline array `historyMetrics={E2E_HISTORY}`... E2E_HISTORY is presumably a module-level constant. But other call sites may pass inline arrays → identity changes every render → `effectiveConfigs` useMemo recomputes → returns NEW array identity each time (useMemo with changing deps returns new array) → `neededKey` useMemo recomputes but returns same STRING → fetchSeed callback deps include neededKey (string, stable) → fetchSeed identity stable. ✓ Good design. BUT: `useMemo(() => historyMetrics ?? [], [historyMetrics])` — if historyMetrics is an inline array, identity changes every parent render → effectiveConfigs is a new array each render. That's fine for neededKey (JSON string). But `useAllHistoryData` uses `needed = useMemo(() => collectNeededMetrics(configs), [configs])` — new array identity each render → `needed` changes → but useMetricSlot receives `needed[0]` (string) — stable. OK.
+
+Wait — there IS a potential issue: in `useBufferSeed`, `configs` param is `effectiveConfigs`. The useMemo deps for neededKey include `configs` — identity changes per parent render → neededKey recomputed each render → same string → cheap. Fine.
+
+**Infinite loop check:** setSeed → re-render of ChartWithTimeScale → effectiveConfigs unchanged (if historyMetrics prop identity stable) → fetchSeed identity unchanged → effect doesn't re-run. If parent passes INLINE historyMetrics array (not E2E_HISTORY constant), parent re-renders at 1Hz (metrics tick) → effectiveConfigs new identity → neededKey recomputed (same string) → fetchSeed unchanged (neededKey string stable) → no refetch. ✓. But if configs contents CHANGE (e.g. derived compute function identity in an inline DerivedSeries object!) — collectNeededMetrics only uses sourceMetrics strings, so JSON is stable. ✓.
+
+Hmm wait — but what about `seedPointsFor` with a derived config whose `compute` is an inline closure? `cfg.compute(sources)` at render — fine, called during render each time. No state updates during render. ✓.
+
+**Set state after unmount:** `fetchSeed` async — after unmount, `setSeed` still called. React 18: no warning anymore (warning removed in 18). But the genRef pattern doesn't guard unmount — a stale fetch completing after unmount calls setSeed on unmounted component. In React 18 this is a no-op, not a leak (no infinite loop). Severity: NIT. Actually, is there any real issue? The fetch itself holds no subscription. Minor.
+
+**Fetch race (gen counter):** `const gen = ++genRef.current` — incremented in fetchSeed. Two concurrent invocations: visibilitychange fires while a mount fetch is in flight → gen bumps → old fetch discarded. ✓. BUT: the visibilitychange listener ALSO calls fetchSeed, and fetchSeed is in the deps of the effect that ADDS the listener — when fetchSeed changes, listener re-registered. Fine.
+
+**Subtle race:** `setSeed((prev) => (map.size > 0 ? map : prev))` — on total failure keep prev. But if the NEW fetch succeeded for a DIFFERENT scale (window changed), prev seed has points from the old window — they get clipped at render by `.filter(p => p.timestamp >= t0)`? Wait — mergeSeedIntoLive does NOT clip seed by window! Look: seed points are used directly; the final `.filter((p) => p.timestamp >= t0)` happens after merge (line 382, 389). So stale seed points ARE clipped by t0. ✓ comment accurate.
+
+BUT: seed points NEWER than now? untilMs was captured at fetch time; render's `now = Date.now()` is later → seed timestamps < render t0 always (since seed until < fetch time < render now... wait t0 = now - windowMs; seed points are in [fetchSince, fetchUntil]; render window [renderNow - windowMs, renderNow]. If fetch happened long ago and render now is much later, seed points could be older than render t0 → clipped. Points between fetchUntil and renderNow are missing — gap in the middle? No: live buffer covers the recent portion; seed fills before live[0]. If live is empty (WS down), chart shows seed data ending at fetchUntil — a gap at the right edge. Visual only, no crash. Fine.
+
+**2. Infinite render/fetch loops:**
+- The visibilitychange refetch: every time tab becomes visible → refetch → setSeed with new Map → re-render. Map identity always new → seed state changes → re-render → but no effect depends on `seed` → no loop. ✓.
+- One more: `useBufferSeed` returns seed; used in render only. ✓.
+
+**3. mergeSeedIntoLive correctness:**
+- **Duplicate timestamps at seam:** cutoff = live[0].timestamp - 2500. Seed points with ts < cutoff prepended. live[0] could be... wait, `live` here is `cut(s.data)` — TIME-cut to [t0, now]. live[0] is the oldest IN-WINDOW live point. Seed covers [fetchSince, fetchUntil]. Seed points between cutoff and live[0] are DROPPED — that's the overlap guard, fine. But what about seed points NEWER than live's newest? E.g., live buffer stale (tab hidden 10 min, buffer has points up to T_hidden), tab visible again: live[0] = oldest in-window point. If the live buffer's last point is old (WS throttled), new live points arrive. Seed covers [now-60s, now]. cutoff = live[0].ts - 2500. Seed points < cutoff prepended — including seed points from the GAP between live's last point and now? Those are < cutoff only if they're before live[0]. Seed points AFTER live[0] (in the gap between live points) are dropped entirely — the chart shows live (sparse/stale) + seed prefix. Any seed data in gaps AFTER live[0] is discarded. Hmm — is that a problem? Scenario: tab hidden 5 min → WS messages throttled but still some arrive (browsers throttle timers to 1/min). Live buffer has points at 1/min for the hidden period + dense points after visible. cut() → last 120 points... The chart would show sparse middle. Seed could have filled the middle but merge only prepends. Result: chart with a hole in the middle rather than backfilled. Is that "real defect"? It's a design limitation — merge is prepend-only. The visible symptom: after returning to a tab hidden >2.5min... actually wait: if tab hidden for 4 min, live has ~4 points (1/min). live.length = 4 < denseThreshold (45 for 1m). cut → in-window points only. live[0] = ~4 min ago (in window for 5m scale). Seed covers last 5 min. cutoff = live[0] - 2.5s. Seed points before that prepended (~1 min worth). The 3-minute hole between live points stays. Chart shows: 1 min of seed + 4 scattered points + dense recent. Hmm, that's the pre-existing live data quality; seeding can't fix mid-holes with this merge. MINOR design limitation, arguably acceptable. Actually the FIX's stated goal is "seed when the live buffer is sparse" — this case (sparse middle) isn't fully handled. I'd call it MINOR.
+
+- **Unsorted seed arrays:** backend returns sorted (ORDER BY bucket_ts ASC + final sort_by_key). But `seedPointsFor` for DERIVED configs calls `cfg.compute(sources)` — the compute function could produce unsorted output? The computes are defined at call sites (EngineCard). History mode has the same property, so parity. If backend sorted, compute presumably preserves order. OK.
+
+- **Dense threshold boundary:** `live.length >= opts.denseThreshold` returns live. denseThreshold = floor(60*0.75)=45 for 1m, floor(300*0.75)=225 for 5m. live = cut(bufferData) — IN-WINDOW count. When exactly 45 in-window points: dense → no seed. Byte-identical requirement: for dense buffers, mergeSeedIntoLive returns `live` — the SAME array reference (no copy). Then `.filter(p => p.timestamp >= t0)` at line 382/389 — WAIT. Previously the code was `chartSeries = bufferSeries.map((s) => ({...s, data: cut(s.data)}))`. Now it's `mergeSeedIntoLive(cut(s.data), ...).filter(p => p.timestamp >= t0)`. cut() already filters `p.timestamp >= t0`! So the second filter is a SECOND full array copy+filter pass on EVERY render (every WebSocket tick at 1Hz × every chart). For dense buffers: cut() returns filtered array (new array each render), mergeSeed returns it as-is, then .filter() creates ANOTHER new array with identical content. Functionally identical output, but doubles allocation per tick per series. Performance NIT/MINOR — "byte-identical" output yes (same points, same order), but extra allocation per second. Also: `merged.filter(...)` when merged === live and no points < t0 exist → new array anyway. Pre-fix code did ONE filter (inside cut). Post-fix does TWO. For 5m with 300 points × ~10 charts × 1Hz — negligible but real. NIT.
+
+- **valueMap applied consistently:** In dense path, valueMap NOT applied to live — correct, live is already transformed at call site. In empty-live path, map applied to seed. In prefix path, map applied. ✓ consistent.
+
+BUT WAIT — **the bufferSeries path with derived configs**: `seedPointsFor(effectiveConfigs[i], seedData)` — for i beyond configs length → undefined → null → merge returns live. ✓.
+
+**MISMATCH: valueMap applied to derived compute output?** For E2E chart: bufferData = e2eSeries.map(p => ({...p, value: p.value/1000})). seedValueMap = v => v/1000. E2E_HISTORY — need to check what it is. If it's a string metric 'e2e_ms', seed values are ms → map → s. ✓.
+
+But here's a subtle one: the SEED fetch for the 1m/5m window queries ≤1h branch → Part 1 (1h rollup buckets) + Part 2 (1s raw). For a 60s window, since_hour floors to the hour start — but only buckets >= since_hour are included. Edge case: **seed fetch at HH:00:30 for the 1m chart**: since = HH:59:30... no wait, since = now-60s = HH-1:59:30? If now = 00:00:30, since = 23:59:30 (previous day possibly). since_hour = 23:00. The 23:00 bucket EXISTS (completed at 00:00). Its bucket_ts = 23:00 < since(23:59:30) → wait, the SQL filter is bucket_ts >= since_hour = 23:00 → the 23:00 bucket IS included! And bucket_ts <= until_ms ✓. So Part 1 returns the 23:00 hourly bucket, clamped to 23:59:30. Part 2 returns 1s data from 23:59:30. So the SEED for a 60s window contains ONE point at 23:59:30 with the value = AVERAGE OF THE WHOLE 23:00 HOUR. That's... a wrong-valued point in the 1m chart! The point claims e.g. gpu_util = hourly average at the left edge of the 1m chart. Visual impact: one point at the far-left edge with hourly-average value; then 1s points. At 1s granularity the line would show a jump from hourly-avg to current values at the left edge. Is that wrong? The straddle bucket legitimately covers [23:59:30, 00:00:00) — 30 seconds of the 60s window. Its value (whole-hour avg) is the best available data IF the 1s data for 23:59:30-00:00 was pruned. But 1s retention is ~1h — at 00:00:30, the 1s data for 23:59:30 STILL EXISTS (only 60s old)! So Part 2 covers the whole window with real 1s data, AND Part 1 adds a spurious hourly-average point at the window start. DUPLICATE COVERAGE: the straddle point (clamped to since) plus 1s buckets at the same region. Both plotted → potential doubled points / value jump at the left edge.
+
+Concretely for the SEED path (1m/5m): Part 1 includes the completed-hour bucket whenever since_hour < since (mid-hour start). since_hour = floor(since). The completed previous-hour bucket has ts = since_hour. It passes `bucket_ts >= since_hour` ✓ and `<= until` ✓. So YES — every seed fetch that starts mid-hour includes the previous hour's FULL-HOUR AVERAGE as a point clamped to the window start. For the 5m chart: since = now-300s; if now is 4 min past the hour, since = 56 min into previous hour → previous hour bucket included, clamped to since. Its value = entire-hour average — plotted at 4 min before the hour. Then 1s data covers [since, now] fully (1s retention 1h >> 5m window). So the leftmost point of every 5m chart rendered in the first 5 minutes of an hour is the previous hour's average — a visible outlier/spike (e.g. decode_tps hourly avg vs live instantaneous). 
+
+Is this pre-existing behavior? The since_hour straddle-inclusion logic was pre-existing (for the 1h view). But FIX B (seed fetches) newly EXPOSES this path to 1m/5m charts. Before FIX B, ≤1h queries with tiny ranges happened... were there any? The frontend only queried 1h/24h. So FIX B introduces tiny-range queries for the first time → newly hits the straddle-inclusion → chart shows an hourly-average outlier point at the left edge. Severity: MAJOR (visible data distortion on the exact charts this fix targets, in the first minutes after each hour boundary) — or MINOR? Let me think about magnitude: the point is at the extreme left edge, value = hourly avg. For metrics with stable values, invisible. For spiky metrics (decode_tps idle vs busy), a visible wrong point. Also the point at clamped since: the 1s bucket at since also exists → two points within the same bucket → the line dips/jumps. I'll call it MAJOR with a suggested fix: skip Part 1 when range is small (e.g. range < some threshold like 5 min) or when 1s data covers the window, or clamp+dedupe prefer 1s. Actually simpler: in the ≤1h branch, only include agg buckets when they're not already covered by 1s data, or for ranges ≤ 10 min skip Part 1 entirely (1s retention is 1h, so 1s data always covers a ≤10min window... unless pruning lag). Hmm — retention: "~1h retention" per the prompt. A 60s/300s window is always fully covered by 1s data (unless engine was down). So Part 1 is pure noise for seed windows. Suggested fix: `if range_ms <= HOUR_MS && range_ms > SMALL_RANGE_FLOOR` or filter agg points to bucket_ts >= since_ms BEFORE clamping (i.e., only include buckets that START inside the window). Wait — that would break the original straddle fix for the 1h view (where the straddle bucket is NEEDED because 1s data was pruned). The correct discriminator: include straddle bucket only if 1s data does NOT already cover [since, ...]. Could check if Part 2's earliest bucket > since + something → then include straddle. Simplest: in the ≤1h branch, when since_hour < since_ms (mid-hour start), only include the straddle bucket if the 1s part yields no points before the next hour start. That's more logic than review should prescribe; I'll suggest: skip Part 1 for ranges where 1s retention guarantees coverage (e.g. range ≤ 10 min), or dedupe by dropping agg points whose bucket range is fully covered by 1s buckets.
+
+Hold on, let me double-check the SQL: `WHERE engine_key = ?1 AND bucket_ts >= ?2 AND bucket_ts <= ?3` with params [engine_key, since_hour, until_ms]. since_hour = floor(since/HOUR)*HOUR. For a 1m window at 00:00:30: since_hour = 23:00:00. The 23:00 bucket ts=23:00:00 >= 23:00:00 ✓. So yes included. And what if since is exactly hour-aligned? since_hour == since; bucket at since → ts = since → clamp no-op → still included. For a 1m window starting exactly at hour boundary (probability ~0 with Date.now()). OK.
+
+Also for the **1h history view** itself (range = 3_600_000 exactly): range_ms <= HOUR_MS → true (<=). since = now - 3600000. since_hour = floor(since). Straddle bucket included if since is mid-hour → clamped to since. That's the FIX A intent. ✓. And the 24h view: range > HOUR → else branch → NO straddle inclusion, NO clamp — pre-existing, untouched. The prompt asks: "Regression risk to 24h/7d paths" — 7d? range 7d > DAY_MS → snapshots_1d. Untouched. ✓.
+
+**Q4: does the clamp distort the 1h summary path?** query_summary untouched ✓ (clamp only at line 743 in query_timeseries).
+
+**Q5: byte-identical dense path:** mergeSeedIntoLive returns `live` by reference when dense ✓ (line 118). But then `.filter()` creates a copy — output values identical. "Byte-identical" in terms of rendered data: yes, same points same order (cut already filtered >= t0, filter again is idempotent). Extra allocation only. NIT.
+
+**Q6: Security:**
+- URL: engine & metric encodeURIComponent'd ✓. since/until are numbers ✓.
+- JSON.parse(neededKey) — neededKey is generated internally via JSON.stringify, not user input. Safe. But if neededKey were corrupt, JSON.parse throws inside... where? `JSON.parse(neededKey)` inside fetchSeed (async, called via void fetchSeed() in effect) → throw inside async function → rejected promise → `void` swallows it → unhandled rejection? Actually `void fetchSeed()` — the promise rejects, unhandledrejection event. If JSON.parse throws synchronously at the start of the async fn, the returned promise rejects → unhandled. Only if neededKey is invalid, which it never is (it's from JSON.stringify). NIT at most. Actually — hmm, `JSON.parse(neededKey)` result is used as `needed: string[]` — no type check, but again internally generated. Fine.
+
+- **SSRF-ish:** engine endpoint is embedded in query param; the backend fetches from its own DB keyed by engine_key — no server-side fetch. Fine.
+
+**Q7: Performance:**
+- Seed fetch fan-out: per ChartWithTimeScale in buffer mode with engineEndpoint + historyMetrics. How many charts on the dashboard? Up to ~10+ per engine card × N engines. Each chart fetches collectNeededMetrics(configs) metrics per mount. E2E_HISTORY — check. If each chart needs 1-2 metrics, 10 charts = 10-20 requests on mount, plus on EVERY visibilitychange. And engines × that. Also useAllHistoryData at 1h/24h does the same. Mount-time burst is bounded. visibilitychange refetch: only for buffer-mode charts — all of them refetch simultaneously → burst. Acceptable but worth noting. Also: **no debounce/interval re-seed while tab stays visible** — after the initial seed, if the WS is down for 10 min, the seed goes stale (clipped away) and the chart empties again. The seed is only refreshed on visibilitychange/scale change — NOT on an interval. Scenario: page loads with WS down → seeded OK. WS stays down 2 min → live empty-ish? Actually if live stays empty, seed stays (never replaced, still displayed, but stale — points older than t0 clipped → chart gradually empties from the left until empty). No refetch to reseed. The stated bug (chart resets) recurs during prolonged WS outage. MINOR.
+
+- **localStorage storms:** none.
+
+**Memory/perf in merge:** `[...prefix, ...live]` per series per render (every WS tick) when sparse. Sparse means < 45 points — small. Fine.
+
+**Now — the BIG one I should check: `useBufferSeed` + `effectiveConfigs` identity + neededKey JSON round-trip loop.** The checklist item 2 hints: "configs identity changes from inline arrays in Dashboard.tsx at ~1Hz". effectiveConfigs = useMemo([historyMetrics]) — if historyMetrics prop is a NEW ARRAY each parent render, effectiveConfigs is a new array each render. neededKey useMemo deps [configs, isBuffer] → recompute every render → returns the same STRING → neededKey stable → fetchSeed deps [engineEndpoint, isBuffer, neededKey, scale] stable → effect not re-run. ✓ NO loop. Good.
+
+BUT `useAllHistoryData`'s `needed` useMemo → new array identity each render → slots receive needed[i] as string — stable → useMetricSlot → useHistoryTimeseries deps [engineEndpoint, metric, scale, isHistory] — stable → no refetch. ✓.
+
+**Wait — actual hook-order bug check in useBufferSeed:** `isBuffer` is computed INSIDE the hook from scale. When scale flips 5m→1h: neededKey memo recomputes → '[]' (isBuffer false) → fetchSeed deps change → effect runs → fetchSeed early-returns (isBuffer false) — but seed state RETAINS the old buffer seed. Harmless (history mode doesn't use seedData). When flipping back 1h→5m: neededKey recomputed → fetch again. ✓.
+
+**genRef counter shared issue:** genRef increments on every fetchSeed call including early-returns? No — early return happens BEFORE `++genRef.current` (line 263-265: guard first, then gen = ++). ✓ good.
+
+**Unmount safety:** after unmount, in-flight fetch completes → gen check: genRef still holds last gen (no cleanup resets) → gen === genRef.current → setSeed called on unmounted component. React 18 no-op, no warning. NIT.
+
+**Race between visibilitychange handler and effect cleanup:** listener removed on cleanup; in-flight fetch guarded by gen. When fetchSeed changes identity (scale flip), old listener removed. ✓.
+
+**One more merge issue — timestamp units:** seed timestamps = p.timestamp_ms (ms). Live buffer timestamps — DataPoint timestamp in ms (comparisons with t0 = Date.now()-windowMs in ms). ✓ consistent.
+
+**seedValueMap double-application risk:** E2E history mode: historyMetrics E2E_HISTORY — in history mode, the chart displays historyData raw (NOT divided by 1000)? Line 479-495: history mode uses historyData.get(cfg) directly WITHOUT seedValueMap! The e2e_ms history values are in ms; buffer values divided to s. So switching a sparse-buffer E2E chart to 1h shows ms, but 1m shows s?? Wait — history mode at 1h: chartData = historyData.get('e2e_ms') — values in ms, unit="s" label. Pre-existing? Let me check: was seedValueMap described as "History mode is untouched"? Yes — the prop comment says history mode untouched. But that means the E2E chart shows MILLISECONDS on the y-axis in 1h/24h mode and SECONDS in 1m/5m mode. Is that pre-existing behavior or newly introduced? The bufferData prop was already mapped /1000 at the call site (pre-existing per diff context: `bufferData={e2eSeries.map(p => ({ ...p, value: p.value / 1000 }))}` is context, unchanged). History mode raw ms — pre-existing. So the unit inconsistency across scales is pre-existing; the diff only keeps seed consistent with buffer (s). ✓ Not a new defect. Could note as observation. Actually wait — is it? If history mode shows ms and buffer shows s for the same chart, users see 5000 vs 5. Pre-existing though. NIT/observation.
+
+**seedPointsFor cfg undefined handling:** `if (!cfg) return null` — handles undefined ✓. But `typeof cfg === 'object'` — cfg could be an array? No, type is string | DerivedSeries | undefined. ✓.
+
+**effectiveConfigs[i] alignment with bufferSeries:** bufferSeries order must match historyMetrics order — contract at call sites. If misaligned, wrong seed metric → wrong values. Trust call sites; E2E_HISTORY — let me check it's defined and aligned.
+
+**Dense threshold uses cut() length, but seed merge happens per-series; for multi-series charts, one series may be dense and another sparse → merged differently per series. Fine.
+
+**Test-only observations:** test asserts `out.filter(p => p.timestamp >= 47_500)).toEqual(live)` — hmm, live = [{50000},{51000}], both >= 47500 ✓. But the merge doesn't filter live by cutoff — live points with ts < cutoff?? live[0] IS the cutoff basis. Fine.
+
+**ChartWithTimeScale buffer-mode early return BEFORE hooks?** Lines 338-353: all hooks (useState, useAllHistoryData, useBufferSeed, useCallback) run before the `if (isBuffer) return ...` at 358. ✓ conditional RETURN is fine, hooks are unconditional.
+
+Wait — actually there's `useMemo` for effectiveConfigs at 342, useAllHistoryData 345, useBufferSeed 353, handleCycle 355 — all before the early return at 358. ✓.
+
+**Dashboard.tsx inline arrays:** the prompt says configs identity changes from inline arrays at ~1Hz. Let me verify EngineCard's usage and E2E_HISTORY definition. Also check whether OTHER call sites pass historyMetrics inline (creating neededKey churn — no, JSON stable).
+
+**Another perf angle: `mergeSeedIntoLive` empty-live path returns `seed` array BY REFERENCE when no map** (line 124: `return seed`). chartData then = seed filtered → new array. But if no filter matches... always filtered. The returned seed array is the SAME array stored in seedData Map → TimeSeriesChart receives it; if TimeSeriesChart mutates... it shouldn't. Also memoization: TimeSeriesChart re-renders anyway each tick. Fine.
+
+**Missing re-seed interval** — mentioned above.
+
+**Now FIX A details — dedupe interaction:** points.sort_by_key stable; clamped straddle ts could EQUAL a raw 1s bucket ts (both = some bucket-aligned ms). If since_ms happens to be bucket-aligned AND a 1s sample bucket exists at exactly since_ms → duplicate timestamps. For the 1h view: since = now-3600000 (ms precision) — collision requires (ts/1000)*1000 == since exactly → 1/1000 chance per query... roughly. Two points same x → chart draws a vertical segment/duplicate tooltip entries. MINOR.
+
+Actually — more likely collision: for the **seed path** (1m/5m), Part 1 clamps straddle to since_ms; Part 2's first bucket could also be near since. bucket_ms for range 60000 = (60000/360).max(1000) = 1000ms. Bucket ts = floor(ts/1000)*1000. since_ms arbitrary → collision improbable. Fine, MINOR/NIT.
+
+**Backend: `let ts = ts.max(since_ms)` — but until_ms clamp missing?** bucket_ts <= until_ms already in SQL. ✓.
+
+**What about range_ms < 0 or since > until?** saturating_sub guards negative. Not diff-related.
+
+**Frontend: `useBufferSeed` fetches with `untilMs = Date.now()` — server clamp: points up to until_ms. 1s data at until_ms exists → seed includes points ~now. Live empty → seed IS chart. Then live starts arriving at now+1s — live[0].ts ≈ now+1s; cutoff = live[0]-2500 ≈ now-1.5s → seed points < that kept → prefix + live → seam fine. ✓.
+
+**Potential double-render loop via seed state identity:** setSeed(prev => map.size>0 ? map : prev) — if map.size===0, returns prev → SAME reference → React bails out of re-render (Object.is). ✓ nice.
+
+**fetch failure keeps previous seed** — but gen check: if the newer fetch fails and an older one succeeded... gen ordering handles. If fetch A (gen1) succeeds then fetch B (gen2) fails: B's setSeed keeps A's result ✓.
+
+**BUT — race: gen checked AFTER await Promise.all; two visibilitychange events in quick succession → two fetches; gen1 discarded even if it returns later with fresher... no, gen2 started later → its untilMs is newer → correct to keep gen2. ✓.
+
+**Now the E2E_HISTORY check and Dashboard/EngineCard inline arrays. Let me read EngineCard around the call sites and find E2E_HISTORY.**
+
+Also check TimeSeriesChart for how it handles data (pad=false etc.) — probably not needed deeply.
+
+Also need to verify the claim "backend returns sorted" — yes: Part 1 ORDER BY bucket_ts ASC, Part 2 ORDER BY bucket_ts ASC, then combined sort_by_key ✓. And derived compute functions in EngineCard — check they don't unsort.
+
+Let me also check the test for 'does not fetch seed when engineEndpoint is null' — expects fetch not called: useAllHistoryData receives isBuffer? engineEndpoint=null → showButton false; useBufferSeed early-returns ✓; useAllHistoryData gets engineEndpoint (isBuffer ? null : engineEndpoint) — scale default '5m' → isBuffer → null → useMetricSlot(null endpoint) → useHistoryTimeseries(null,...) → no fetch ✓.
+
+One more: **the `seedValueMap` prop is a NEW inline arrow at call sites** `(v) => v / 1000` — new identity every EngineCard render → passed to mergeSeedIntoLive via opts object — no memoization issue since merge happens at render anyway. No effect deps on it. ✓.
+
+**Check `useAllHistoryData` unused when buffer mode — it's still CALLED with configs=[] → neededKey... wait that's useBufferSeed. useAllHistoryData with configs=[] → collectNeededMetrics([]) = [] → 8 slots with null metric → useHistoryTimeseries(null, '__none__', '5m') → isHistory false → setData(null) etc. — effect runs but early-returns. Fine.
+
+Hmm — wait, actually there's one REAL hook-rule subtlety: `useAllHistoryData(engineEndpoint, isBuffer ? [] : effectiveConfigs, scale)` — the `[]` inline array literal is a NEW identity every render → `needed` useMemo deps [configs] → recompute → new [] identity → but slots keyed on needed[i] ?? null → null stable ✓.
+
+Now — let me look at EngineCard E2E_HISTORY and the metric strings, plus check the derived compute functions for sort order. And check TimeSeriesChart's handling of unsorted/duplicate data quickly. Also confirm rollup only writes complete hours (to validate the "60s/300s seed window cannot hit partial rollup rows" claim — but actually my analysis shows the straddle bucket DOES hit the seed window! The claim in the prompt says "a 60s/300s seed window cannot hit partial rollup rows" — partial rollup rows for the CURRENT hour don't exist, but the PREVIOUS completed hour's row IS hit by the since_hour floor. That's exactly my MAJOR finding.)
+
+Wait, wait. Let me re-derive. For a 60s window ending at 00:00:30 (30s past midnight hour): since = 23:59:30. since_hour = floor(23:59:30 / 3600000)*3600000 = 23:00:00. snapshots_1h contains bucket 23:00 (completed at 00:00). SQL: bucket_ts >= 23:00:00 AND <= 00:00:30 → matches bucket 23:00. → clamped to 23:59:30, value = 23:00-hour average. YES — the seed contains the hourly-avg point. Confirmed MAJOR.
+
+For a 60s window ending at 00:30:00: since = 00:29:00. since_hour = 00:00. buckets >= 00:00 → the 00:00 bucket is INCOMPLETE (rollup writes only complete hours → not in table) → Part 1 empty. ✓ normal case. So the anomaly only occurs for windows straddling an hour boundary — i.e., during the first windowMs of each hour (first 60s for 1m charts, first 300s for 5m charts). Every hour, for up to 5 minutes, 5m charts render an hourly-average outlier at the left edge. And 1h charts intentionally get it (FIX A). So: real, recurring, user-visible. MAJOR.
+
+Hmm, actually let me reconsider severity. The value plotted is a legitimate average of the hour that OVERLAPS the window start — for the 5m chart, 4 of the 5 window minutes... no: bucket covers [23:00, 00:00), window [23:55, 00:00) → overlap = 5 min of the 60-min bucket. The value = avg of FULL hour including 55 min outside the window. Displayed at the window's left edge as if it were the value at 23:55. For steady metrics fine; for spiky ones, an outlier point. And it COEXISTS with the true 1s points (which exist — retention 1h) → duplicate coverage: line jumps from hourly-avg to 1s values. Visually: a spike/dip at the left edge every hour for the first 5 min. I'll rate MAJOR (data correctness on the primary fixed surface) — though arguably MINOR since transient. Given the adversarial brief, MAJOR with fix: in the ≤1h branch, only include the straddle agg bucket when 1s data doesn't already cover the window start (e.g. drop agg points whose bucket end <= earliest 1s bucket, or skip Part 1 when range_ms is small enough that 1s retention covers it — but server doesn't know retention... simplest: filter agg points to `bucket_ts >= since_ms` pre-clamp AND additionally include straddle only if raw part is empty).
+
+Hmm, but careful — that changes FIX A behavior for the 1h view where the straddle bucket IS needed (1s pruned). The cleanest fix: include straddle bucket only if Part 2 returns no buckets older than the straddle bucket's end... Server-side: after collecting raw_points, if raw_points non-empty and raw_points[0].timestamp_ms <= straddle bucket_ts + HOUR, drop the straddle point. I'll suggest something like that in one line.
+
+Actually — hmm, one more consideration: does the 1h HISTORY view (range exactly 3600000) suffer the same duplicate? since = now-3600000 mid-hour; straddle bucket clamped to since; 1s data for [since, ...] — if 1s data still retained (< 1h old), BOTH exist → duplicate coverage at the left edge of the 1h chart too! Was that pre-existing? The since_hour inclusion was pre-existing (per diff context). The CLAMP is new. Pre-clamp, the straddle point sat at bucket_ts < since → outside the fixed x-domain → invisible (clipped by chart) but present in data. Post-clamp it's AT since → visible. So FIX A newly surfaces the duplicate-coverage point on the 1h view whenever 1s data hasn't been pruned for the straddle region yet. Pruning: 1s retention ~1h — the straddle bucket covers [h1, h2); window starts at now-60min. If now-h1 < 1h... h1 = hour start; now is up to 60 min past h2? Let me compute: window [now-3600s, now]. Straddle bucket h1 where h1 <= since < h2 → since - h1 ∈ [0, 3600s). 1s data exists for ts >= now - retention(~1h). since >= now-3600s → 1s data likely covers [since, h2) entirely (retention ≈ 1h, boundary cases aside). So on the 1h chart, the clamped straddle point (full-hour avg at left edge) coexists with real 1s points for the same stretch → SAME duplicate-coverage artifact on the 1h chart! Pre-FIX A the straddle point was off-screen (ts < since) so no artifact... but then the chart had a GAP from since to h2 if 1s pruned... The FIX A comment says the bug was "1h chart rendered a ~2h axis with data scrunched" — meaning the client x-domain was NOT fixed/expanding. With timeDomain fixed [nowMs-rangeMs, nowMs] in ChartWithTimeScale... hmm, the comment says clients with fixed domain — but pre-fix the point EXPANDED the domain (TimeSeriesChart must auto-expand when data < domain min? or timeDomain is a hint?). Whatever — the artifact: for the first ~60 min of each hour (while 1s data for the straddle stretch is still retained), the 1h chart shows the hourly-average value AT the window start IN ADDITION to 1s-derived buckets → value discontinuity at left edge. This is inherent to the straddle inclusion (pre-existing) made visible by the clamp (new). Severity: MINOR-to-MAJOR. It's the deliberate trade-off documented in the test. The dedupe comment at 783 says "1h bucket_ts and 1s ts won't overlap" — timestamps don't collide exactly (bucket ts vs 1s bucket ts differ), so no exact duplicates; it's semantic overlap, not literal duplicates. I'll fold this into one MAJOR finding about seed/1h charts showing a full-hour average at the window start when 1s data already covers that stretch.
+
+Hmm, let me reconsider once more whether raw Points and the clamped point can literally collide: clamped ts = since_ms exactly; raw bucket ts = floor(ts/1000)*1000 for range ≤1h (bucket_ms=1000 for ranges ≤ 360*1000). Collision iff since_ms ≡ 0 mod 1000 AND a sample in [since, since+1000). ~0.1% per render. NIT.
+
+OK now — **checklist item 3: "valueMap applied consistently"** — one more spot: line 124 empty-live path applies map ✓; line 134 prefix path ✓. But what about `chartSeries` path when live dense — map NOT applied to live ✓ correct (live pre-transformed). ✓.
+
+**Item 8 — go hunting:**
+- `BUFFER_WINDOW_MS['1m']` used for both fetch window and render window ✓ consistent.
+- `fetchSeed` closure captures `scale` — gen guard covers scale races ✓.
+- **`useBufferSeed` runs even when engineEndpoint === null but historyMetrics undefined?** If engineEndpoint null → early return, seed stays empty Map ✓.
+- **Memory: seed Map holds up to 300 pts/metric/chart — trivial.
+- **`seedPointsFor` called during render for EVERY series EVERY render (1Hz × series) — map lookups cheap ✓.
+- **The `/** Hook: fetch all unique metrics needed for history mode. */` dangling comment at line 177 — docstring separated from its function (pre-existing? line 177-179: comment then "Individual hook slot" — looks like a misplaced comment. Pre-existing, NIT, not in diff... actually the diff shows `/** Hook: fetch all unique metrics needed for history mode. */` as context around the new code. Skip.
+- **Test mock: `fetchHandler` global — tests fine.
+- **`mergeSeedIntoLive` export added — used by tests ✓.
+- **JSDoc on props duplicated: `/** Pass-through to TimeSeriesChart. */` immediately above the seedValueMap JSDoc — stray comment misplacement (diff line 147-156): the original `/** Pass-through to TimeSeriesChart. */` now docments seedValueMap incorrectly, and color lost its doc. NIT.
+- **`denseThreshold` when sliceCount... 1m: floor(45)=45; live counts after cut — cut pre-trims to sliceCount*2=120 then filters ≥ t0 → live.length ≤ 60ish ✓ threshold 45 sensible.
+- **`live[0]` — is `live` (cut output) guaranteed sorted ascending? Buffer data presumably appended chronologically ✓. If buffer had out-of-order (clock skew), cutoff logic off — pre-existing.
+- **Live buffer timestamps could be engine clock vs seed = server clock (Date.now() client). If client clock skewed vs engine/server, seam overlap guard (2.5s) may misbehave: seed timestamps from SERVER (timestamp_ms from DB, engine-reported ts?) vs live buffer timestamps (client receipt time?). If clocks differ by > 2.5s, seed prefix could be dropped entirely (seed all newer than cutoff → treated as overlap → ignored) or the seam shows a gap. What timestamps does the live buffer use? Need to check how bufferData timestamps are produced (client Date.now() at receipt, or engine sample ts). If both derive from engine sample ts (WS payload ts), and DB ts = engine ts, consistent ✓. Let me check the WS buffer code briefly. If client-receipt time is used for live and DB stores engine-side ts, skew = network latency + clock drift — typically small; the 2.5s overlap guard absorbs it. Worth a MINOR note re clock-skew assumption.
+
+Let me quickly check how bufferData/E2E series timestamps are produced, E2E_HISTORY, and glance at TimeSeriesChart timeDomain handling for the "domain expansion" claim. Also verify rollup writes only complete hours (grep rollup_1s_to_1h).
+
+Then write the review. Let me do these greps/reads in parallel.Now let me check the EngineCard call sites, E2E_HISTORY definition, how live buffer timestamps are produced, and the rollup logic:
+[0m$ [0mrg -n "fn rollup_1s_to_1h" -A 30 /home/cwykel/spark-dashboard-prs/pr46/src/history.rs | head -50
+388:    pub async fn rollup_1s_to_1h(&self) -> rusqlite::Result<u64> {
+389-        let db = self.inner.lock().await;
+390-        // Checkpoint WAL to prevent "disk I/O error" on large rollups.
+391-        let _ = db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+392-        // Find all complete hours that haven't been rolled up yet.
+393-        // We compute the latest hour boundary from the data.
+394-        // A "complete hour" is one whose all-60-minutes-worth of data has
+395-        // passed — i.e., the current time has moved past that hour.
+396-        let now_ms = chrono_now_ms();
+397-        let current_hour_start = (now_ms / 3_600_000) * 3_600_000;
+398-
+399-        // Roll up every complete hour that has data. The latency columns
+400-        // (ttft_ms_p95, itl_ms_p95, e2e_ms_p95) use AVG() as an approximation
+401-        // of the p95 since SQLite has no built-in PERCENTILE. The column
+402-        // names are kept for API/metrics-contract compatibility. ON CONFLICT
+403-        // DO UPDATE refreshes ALL columns so existing rows are fully
+404-        // backfilled when new 1s data arrives in a subsequent rollup run.
+405-        let rows = db.execute(
+406-            "INSERT INTO snapshots_1h
+407-             (engine_key, bucket_ts,
+408-              total_prompt_tokens, total_gen_tokens, total_requests,
+409-              prompt_tps_avg, prompt_tps_max,
+410-              decode_tps_avg, decode_tps_max,
+411-              ttft_ms_p95, itl_ms_p95, e2e_ms_p95,
+412-              power_watts_sum,
+413-              gpu_util_avg, gpu_temp_avg, gpu_temp_max,
+414-              active_requests_max, queued_requests_max,
+415-              kv_cache_pct_avg, kv_cache_pct_max, prefix_cache_hit_avg,
+416-              cpu_util_avg, sample_count, preemptions_total,
+417-              queue_time_ms_avg, tpot_ms_avg, spec_decode_acceptance_rate_avg)
+418-             SELECT
+[0m
+[0m→ [0mRead frontend/src/components/engines/EngineCard.tsx[90m [limit=60, offset=240][0m
+[0m
+[0m$ [0mrg -n "timeDomain" /home/cwykel/spark-dashboard-prs/pr46/frontend/src/components/charts/TimeSeriesChart.tsx | head
+99:   timeDomain?: [number, number]
+217:  timeDomain,
+290:            domain={timeDomain ?? ['dataMin', 'dataMax']}
+296:            ticks={timeDomain ? generateTicks(timeDomain[0], timeDomain[1]) : undefined}
+[0m
+Key: `domain={timeDomain ?? ['dataMin', 'dataMax']}` — in buffer mode timeDomain IS passed (bufferTimeDomain) so the x-domain is fixed [t0, now]. In history mode timeDomain is passed too. So where did the "~2h axis" bug come from? Probably history mode before timeDomain was fixed, or dataMin expansion... Actually in the 1h view timeDomain IS provided ([nowMs - rangeMs, nowMs]) at line 525. Hmm, but the FIX A comment says "clients with a fixed x-domain expand that domain backwards". If domain is fixed [since, now], a point at ts < since would be CLIPPED visually (recharts domain fixed doesn't expand). Unless... the 1h view pre-dates timeDomain, or other consumers of query_timeseries (the summary view?) don't fix the domain. Not my problem to fully resolve — the clamp is defensible. But wait: with a fixed domain and clip, pre-FIX-A the straddle point was just off-screen (harmless), so what did FIX A actually fix? Maybe TimeSeriesChart's domain when timeDomain is undefined somewhere (e.g., 7d view? summary sparkline?). Let me check other consumers of /api/history/timeseries... Actually EngineCard charts all use ChartWithTimeScale. Hmm, there may be other API consumers (e.g., a details panel). Not critical for the review — the clamp is backwards-compatible for fixed-domain clients and fixes auto-domain clients.
+
+One more important check: the seed fetch response shape — `json.points ?? []` matches API response `{points: [...]}` ✓ (same as useHistoryTimeseries).
+
+Now the missing piece: how are live buffer timestamps generated (client clock vs engine clock)? Let me check where bufferData comes from — chartData.tps etc. from a useEngineMetrics hook or similar. Quick grep.Let me check how live buffer timestamps are generated (client vs engine clock) — this matters for the seam logic:
+[0m$ [0mrg -ln "buildChartData|chartData\.tps|useEngineMetrics" /home/cwykel/spark-dashboard-prs/pr46/frontend/src --include-zero | head -5; rg -rn "timestamp: Date.now|timestamp: p.timestamp_ms|ts_ms" /home/cwykel/spark-dashboard-prs/pr46/frontend/src/hooks 2>/dev/null | head -10
+/home/cwykel/spark-dashboard-prs/pr46/frontend/src/components/engines/EngineCard.tsx
+[0m
+[0m$ [0mrg -n "chartData\s*=|computeChart|useEngineSamples|buffer" /home/cwykel/spark-dashboard-prs/pr46/frontend/src/components/engines/EngineCard.tsx | head -15
+313:                        bufferSeries={prefillTokenSeries(chartData)}
+348:                        bufferSeries={decodeTokenSeries(chartData)}
+386:                        bufferSeries={[
+438:                        bufferData={e2eSeries.map(p => ({ ...p, value: p.value / 1000 }))}
+480:                        bufferSeries={[
+547:                        bufferSeries={[
+576:                bufferSeries={prefillTokenSeries(chartData)}
+586:                bufferSeries={decodeTokenSeries(chartData)}
+596:                bufferSeries={[
+612:                bufferData={e2eSeries.map(p => ({ ...p, value: p.value / 1000 }))}
+623:                bufferSeries={[
+637:                bufferSeries={[
+[0m
+[0m$ [0mrg -n "chartData = |const chartData|buildChart" /home/cwykel/spark-dashboard-prs/pr46/frontend/src/components/engines/EngineCard.tsx /home/cwykel/spark-dashboard-prs/pr46/frontend/src/lib/*.ts /home/cwykel/spark-dashboard-prs/pr46/frontend/src/hooks/*.ts 2>/dev/null | head; rg -rn "timestamp: " /home/cwykel/spark-dashboard-prs/pr46/frontend/src/lib/chartData.ts 2>/dev/null | head -5
+(no output)
+[0m
+[0m$ [0mrg -n "chartData" /home/cwykel/spark-dashboard-prs/pr46/frontend/src/components/engines/EngineCard.tsx | head -8; rg -ln "tps:" /home/cwykel/spark-dashboard-prs/pr46/frontend/src/lib /home/cwykel/spark-dashboard-prs/pr46/frontend/src/hooks 2>/dev/null | head
+39:function decodeTokenSeries(chartData: {
+45:    { data: chartData.tps, label: 'Live', color: '#76B900' },
+46:    { data: chartData.avgTps, label: 'Avg', color: '#3b82f6' },
+47:    { data: chartData.perReqTps, label: 'Per-req', color: '#a855f7' },
+51:function prefillTokenSeries(chartData: {
+57:    { data: chartData.promptTps, label: 'Live', color: '#76B900' },
+58:    { data: chartData.avgPromptTps, label: 'Avg', color: '#3b82f6' },
+59:    { data: chartData.perReqPromptTps, label: 'Per-req', color: '#a855f7' },
+/home/cwykel/spark-dashboard-prs/pr46/frontend/src/lib/engineAggregate.test.ts
+/home/cwykel/spark-dashboard-prs/pr46/frontend/src/lib/format.ts
+/home/cwykel/spark-dashboard-prs/pr46/frontend/src/lib/engineAggregate.ts
+/home/cwykel/spark-dashboard-prs/pr46/frontend/src/hooks/useMetrics.ts
+/home/cwykel/spark-dashboard-prs/pr46/frontend/src/hooks/useMetricsHistory.ts
+[0m
+[0m$ [0mrg -n "timestamp" /home/cwykel/spark-dashboard-prs/pr46/frontend/src/hooks/useMetricsHistory.ts | head -10; rg -n "Date.now\(\)" /home/cwykel/spark-dashboard-prs/pr46/frontend/src/hooks/useMetricsHistory.ts | head -5
+6:  timestamp: number
+108:    if (!metrics || metrics.timestamp_ms === lastTimestampRef.current) return
+109:    lastTimestampRef.current = metrics.timestamp_ms
+111:    const ts = metrics.timestamp_ms
+117:        buffers[key].push({ timestamp: ts, value: val })
+131:          gb[key].push({ timestamp: ts, value: val })
+176:          eb.tps.push({ timestamp: ts, value: engine.metrics.tokens_per_sec })
+179:          eb.avgTps.push({ timestamp: ts, value: engine.metrics.avg_tokens_per_sec })
+182:          eb.perReqTps.push({ timestamp: ts, value: engine.metrics.per_request_tps })
+185:          eb.ttft.push({ timestamp: ts, value: engine.metrics.ttft_ms })
+[0m
+[0m$ [0mrg -n "timestamp_ms" /home/cwykel/spark-dashboard-prs/pr46/frontend/src/hooks/useMetrics.ts | head -5; rg -n "timestamp_ms" /home/cwykel/spark-dashboard-prs/pr46/src/*.rs /home/cwykel/spark-dashboard-prs/pr46/src/**/*.rs 2>/dev/null | rg -i "now|utc|chrono" | head -5
+/home/cwykel/spark-dashboard-prs/pr46/src/metrics/mod.rs:125:        let timestamp_ms = SystemTime::now()
+/home/cwykel/spark-dashboard-prs/pr46/src/metrics/mod.rs:317:        let timestamp_ms = SystemTime::now()
+[0m
+Live buffer timestamps = `metrics.timestamp_ms` = server-side `SystemTime::now()` at metrics snapshot. The history DB `ts` — check insert_1s: it presumably stores the engine-reported timestamp too, or its own now. Both server-side clocks (dashboard backend receives from engine? or engine reports timestamp_ms?). Either way both come from server clocks — client Date.now() only defines the fetch window [since, until]. If the CLIENT clock is skewed relative to the server, the seed window [clientNow-60s, clientNow] may not align with server timestamps: e.g., client clock 10s behind server → until = clientNow-10s in server time → the newest 10s of live data excluded from seed — harmless. Client clock 30s AHEAD → since/until 30s in the future → seed misses the most recent 30s but includes older — harmless-ish. Also render t0 = clientNow-60s vs live timestamps in server time — if client clock skew > 0, `cut()` filter `p.timestamp >= t0` could clip live points wrongly. That's PRE-EXISTING (cut existed before). The merge's SEED_OVERLAP_MS=2.5s guard assumes seed and live timestamps share a clock — they do (server-side both), assuming insert_1s stores the same metrics.timestamp_ms. Quick check of insert_1s usage: metrics timestamp_ms → snapshot → insert_1s(ts). Likely consistent. So clock-skew risk is client-vs-server only for windowing — pre-existing. I'll mention as NIT.
+
+Now, one more check per checklist: the `useBufferSeed` visibilitychange effect re-registers when fetchSeed changes (deps [isBuffer, fetchSeed]) ✓. And the mount effect [fetchSeed] refires on scale flip 1m↔5m → refetch with new window ✓ — needed since window differs.
+
+Also: **scale flip 1m→5m**: fetchSeed gen++ → new fetch. During in-flight, seed = old 1m seed (60s of points) → merged into 5m chart — sparse live + 60s seed → chart shows partial backfill until new seed arrives. Transient, fine.
+
+**Scale flip 5m→1m→...**: no issue.
+
+**historyMetrics undefined + engineEndpoint set**: showButton false; but useBufferSeed still runs with configs=[] → neededKey='[]' → early return ✓. Wait — neededKey = isBuffer ? JSON.stringify(collectNeededMetrics(configs)) : '[]' — collectNeededMetrics([]) = [] → '[]' → fetchSeed early-returns ✓.
+
+**Charts WITHOUT history support but WITH engineEndpoint**: seedValueMap... fine.
+
+Now, let me also double check `useBufferSeed` is invoked with `effectiveConfigs` — the same array used for history. For buffer mode, effectiveConfigs[i] must align with bufferSeries indices ✓ (E2E_HISTORY = ['e2e_ms'] matches single bufferData).
+
+**One more real hunt — `mergeSeedIntoLive` line 124 returns `seed` BY REFERENCE (no map case)**: chartData === seed array from the seedData Map. `.filter()` at line 389 creates a new array anyway → the returned-by-ref seed isn't handed to the chart directly. Actually line 385-389: `chartData = mergeSeedIntoLive(...).filter(...)`. So always a fresh array. ✓ no shared-mutation risk.
+
+**Recharts downsample/maxPoints**: buffer mode maxPoints=60 for 1m — with seed prefix + live, total could exceed 60 → TimeSeriesChart downsamples? Pre-fix sparse live < 60 anyway; seeded chart may have 60 seed + sparse live > 60 → downsampling (LTTB?) could DROP seed points unevenly. 1m chart: seed fills 60 points + live up to 44 sparse → up to ~104 → maxPoints 60 → downsample. That's the point of maxPoints; visual density fine. Not a defect per se.
+
+Wait — actually for the **5m** chart maxPoints=300, seed 300 + live → ≤ ~575 → downsample to 300. OK.
+
+**Test-file check**: `import { mergeSeedIntoLive }` — tests cover boundary cases. The dense test: live 51 pts, threshold 45 → dense ✓ toBe(live) reference check ✓.
+
+Now — anything about FIX A interacting with the **1h chart when since lands EXACTLY on hour start**: since_hour == since; bucket at since included; clamp no-op ✓.
+
+**FIX A: negative? ts.max(since_ms) — if since_ms > until_ms (bad client params)? saturating range; clamp could push ts beyond... ts <= until from SQL but clamp to since > until → point at ts=since > until — malformed but client's fault. NIT, skip.
+
+**One more potential MAJOR: the seed fetch does NOT pass `metric` validation client-side; unknown metric → backend returns Ok(Vec::new()) → empty → map.set skipped → fine.
+
+**Engine key = engineEndpoint (URL)**: `engine_key` in DB — is it the endpoint string? insert path uses engine endpoint as key presumably. seed fetch passes engine=engineEndpoint ✓ same as useHistoryTimeseries ✓ consistent.
+
+**Performance fan-out quantification**: EngineCard has ~8+ ChartWithTimeScale instances (tps, prefill, decode, e2e, queue, itl, tpot, batch, kv...) × N engines. Each with 1-3 needed metrics → on MOUNT: ~8×N×(1..3) requests; on EVERY visibilitychange: same burst. Plus useAllHistoryData at 1h/24h: 8 slots each with own interval. The mount burst is new (FIX B). With 4 engines → ~30-50 parallel fetches on tab focus. Server: SQLite reads ~360s of 1s data × metrics — trivial per query. Acceptable but flag as MINOR (no debounce/jitter; thundering herd on visibilitychange with many engines/charts).
+
+Also — **visibilitychange fires refetch but there's NO re-seed on interval while visible**: covered above as MINOR (prolonged WS outage → chart decays to empty again; the original bug partially recurs).
+
+**One more: `useBufferSeed` fetch has NO abort/timeout** — slow responses pile up on rapid visibility toggles; gen guard discards stale results but requests still consume sockets. NIT.
+
+**Error swallow: `catch { return null }`** — network errors silently ignored; seed silently stale. Acceptable for non-critical data; NIT (maybe console.debug would help).
+
+**JSON.parse of neededKey** — internal, safe ✓.
+
+**XSS/injection** — metric strings are constants; engine endpoint is a URL string encodeURIComponent'd ✓. Backend interpolates metric into SQL via match whitelist → no injection ✓ (raw_col/agg_col from fixed map; format! with {col} safe).
+
+Now the misplaced JSDoc: lines 47-53 — `/** Pass-through to TimeSeriesChart. */` now sits above the seedValueMap doc block, and `color?` lost its doc. The seedValueMap doc says "Pass-through to TimeSeriesChart" which is WRONG for seedValueMap. NIT.
+
+Line 177: dangling `/** Hook: fetch all unique metrics needed for history mode. */` — pre-existing? The diff at line 213-215 shows context `/** Hook: fetch all unique metrics needed for history mode. */` then `/** Individual hook slot...` — hmm, in the diff (lines 213-215 of diff file) it shows these as context lines around the +useBufferSeed block. Actually diff hunk `@@ -96,6 +151,29 @@` ends at line 218 `return Array.from(metrics)` then `+` new code, then context `/** Hook: fetch all unique metrics needed for history mode. */` + `/** Individual hook slot — always called...`. So the dangling comment is pre-existing. Skip or NIT.
+
+Now assemble findings with severity:
+
+1. **MAJOR** — src/history.rs:723-751 (+ frontend exposure via seed fetch): For tiny ranges (60s/300s seed windows), `since_hour` floor still includes the previous COMPLETED hour bucket whenever the window starts mid-hour (i.e., during the first ≤5 min of every hour). The clamped point carries the FULL-hour average and is plotted at the window start alongside real 1s data (1s retention ~1h covers the whole seed window) → a value discontinuity/outlier at the left edge of every 1m/5m chart during the first minutes after each hour boundary. FIX A made this visible for 1h views too when 1s data is un-pruned. Fix: only include the straddle agg bucket when Part 2 (1s) doesn't already cover the window start (e.g., drop agg points whose bucket is ≥ the earliest raw bucket, or skip Part 1 for ranges where 1s retention provably covers the window).
+
+Wait — I should double-check `since_hour` was pre-existing vs added in this diff. Diff hunk: `@@ -733,6 +733,14 @@` — context starts at `let agg_points = stmt` (733). `let since_hour` is at 732 — line BEFORE the hunk context → pre-existing. The hunk only adds the clamp lines 736-743. So the straddle-inclusion predates; the clamp makes the point in-window (visible). For the seed path, the straddle-inclusion itself was pre-existing backend behavior, but FIX B creates the first tiny-range callers → the artifact is newly user-visible. The clamp (FIX A) is what pulls the off-screen point INTO the window for fixed-domain clients. Both combine. I'll report as one MAJOR against the combined behavior with file:line src/history.rs:743 + ChartWithTimeScale.tsx:270-275 (seed URL construction).
+
+Hmm, actually — hold on. For the 1h history view, pre-FIX-A: point at raw bucket_ts < since. timeDomain fixed [since, now] → recharts domain=[since,now] fixed → point off-screen left → NOT rendered → but ALSO: was the "~2h axis" bug real then? The comment says clients with a fixed x-domain expand backwards — with recharts `domain={[t0, now]}` (exact) it does NOT expand. Unless... `generateTicks(timeDomain[0], timeDomain[1])` — ticks from fixed domain. So the "~2h axis" complaint suggests somewhere domain wasn't fixed. Maybe the 1h chart in question is a DIFFERENT consumer (summary panel sparkline?) — whatever, the fix direction is fine.
+
+2. **MINOR** — mergeSeedIntoLive only prepends; mid-buffer holes (tab hidden several minutes → 1/min throttled samples) stay unfilled: seed data covering the gap between live points is discarded (only points older than live[0]−2.5s are used). Chart shows scattered dots after refocusing. Fix: fill gaps by walking seed and live merged by timestamp with live-wins dedupe, instead of prefix-only.
+
+Actually wait — is that right? Tab hidden → WS keeps delivering? WebSocket messages keep flowing when hidden (network not throttled; timers are). If the app appends on WS message events (not setInterval), buffer keeps filling even hidden! Unless processing uses setInterval/setTimeout (throttled to ≥1s or 1/min in background). Chrome intensive throttling: timers in background tabs → 1/min after 5 min. If samples flow via WS onmessage → not throttled → buffer stays dense → dense path → no seed → identical behavior ✓. The "hidden tab throttle" concern applies to timer-based sampling. Given the fix description mentions throttle, likely there IS timer involvement. Either way, gap-filling limitation stands. MINOR.
+
+3. **MINOR** — No periodic re-seed while visible: if the WS stays down >windowMs after the initial seed, stale seed points get clipped by `t0` and the chart empties again (original bug recurs during prolonged WS outage). Fix: re-seed on an interval (e.g. 30s) when live buffer is below dense threshold, or refetch on WS reconnect event.
+
+4. **NIT** — ChartWithTimeScale.tsx:382/389: `mergeSeedIntoLive(...).filter(p => p.timestamp >= t0)` — cut() already filtered ≥ t0; for dense buffers the extra filter is a redundant per-tick array copy per series (allocation churn at 1Hz × every chart). Byte-identical output though. Fix: skip the second filter when merged === cut output (dense), or filter seed prefix only.
+
+Actually — wait, is the second filter redundant for the SPARSE path too? Seed prefix points come from seedData fetched with [fetchSince, fetchUntil]; render t0 = renderNow − windowMs. If seed fetched at mount and render happens 10s later, t0 moves forward; seed points between fetchSince and new t0 must be dropped → the filter is needed for sparse. For dense: merged === cut(s.data) which is already ≥ t0 — but t0 was computed THIS render from the same `now` used in cut → same t0 → filter redundant for dense only. Fine as stated.
+
+5. **NIT** — Props interface: stray `/** Pass-through to TimeSeriesChart. */` now documents `seedValueMap` (it isn't a pass-through) and `color` lost its doc — move the stray comment.
+
+6. **NIT** — src/history.rs:743 + sort at 785: clamped straddle point can (rarely) share a timestamp with a raw 1s bucket (requires since_ms bucket-aligned + sample present) → duplicate x values. Fix: after sort, dedupe by timestamp preferring the raw point.
+
+7. **NIT** — useBufferSeed: `setSeed` after unmount (no cancelled flag for unmount; gen only guards newer fetches). React 18-safe no-op, but the genRef pattern could add a mountedRef. Also `JSON.parse(neededKey)` — throw inside async → unhandled rejection; internally-generated so effectively impossible.
+
+8. **NIT** — clock-domain assumption: SEED_OVERLAP_MS=2.5s assumes seed (server DB ts) and live (metrics.timestamp_ms server clock) share one clock; they do (both server-side), but client Date.now() defines the window — large client-server skew shifts/shrinks the seed window. Pre-existing windowing behavior; note only.
+
+9. **MINOR perf** — visibilitychange triggers a simultaneous burst: every buffer chart × every metric refetches (8+ charts × N engines). With many engines this is a fan-out spike on every tab focus. Fix: debounce/coalesce per endpoint (module-level cache keyed by endpoint+window with in-flight dedupe).
+
+10. Check: **24h/7d regression** — else-branch untouched ✓; query_summary untouched ✓. **Dense path byte-identical** — mergeSeedIntoLive returns live by reference ✓ (test asserts toBe). Output equality holds; only the extra .filter copy (NIT above).
+
+11. One more hunt — **`seedPointsFor` with derived configs: `cfg.compute(sources)`** — compute for e.g. per-req tps = decode/active: if active_requests seed missing (any=false handles) — if decode present but active missing → sources.active_requests=null → compute must handle nulls (same as history mode ✓ parity). E2E_HISTORY is a plain string ✓.
+
+12. **`E2E_HISTORY` module constant** → stable identity → effectiveConfigs stable → fine. Other call sites (Dashboard) may pass inline arrays — neededKey JSON handles ✓.
+
+13. Backend security: metric → whitelist match ✓; engine_key parameterized ✓; format! interpolates only whitelist cols ✓.
+
+14. **Test gap hunting** — tests don't cover: seed fetch failure keeps prev seed; scale flip race (gen); merge with unsorted seed; valueMap in prefix path (only empty path tested); hour-boundary straddle artifact in seed (the MAJOR). Mention briefly.
+
+Also — one more possible MAJOR: **`useBufferSeed` fetches even when chart is in buffer mode but `bufferData`/`bufferSeries` prop is undefined**? If a chart has historyMetrics + endpoint but no buffer props... it wouldn't render buffer lines; seed harmless.
+
+**Another: line 263 guard `engineEndpoint === null`** — but showButton requires historyMetrics !== undefined; seed fetch requires neededKey !== '[]'. A chart with endpoint + configs in buffer mode whose parent intends history-only... fine.
+
+**Stale closure in onVisible**: fetchSeed captured — deps include fetchSeed → re-registered on change ✓.
+
+**Double-effect invocation in StrictMode**: mount effect runs twice in dev → two fetches, gen handles ✓. visibilitychange listener added twice? cleanup runs between → fine.
+
+Let me also verify `BUFFER_WINDOW_MS['1m']` = 60_000 vs BUFFER_SLICE 60 — dense threshold floor(60*0.75)=45. cut() pre-trims `pts.length > sliceCount ? slice(-sliceCount*2)` → 120 → filter t0 → ≤60ish... pre-trim to 120 then filter: if buffer holds 900s of samples and window 60s, last 120 samples span 120s → filter keeps ~60 ✓.
+
+Edge: **live.length === 0 && seed non-null → return seed (mapped)** — then `.filter(≥ t0)` — seed fetched with window [fetchNow-60s, fetchNow]; render now later → t0 later → oldest seed clipped progressively ✓ matches "stale points clipped" comment.
+
+I think I have a solid list. Let me also double-check the claim about sort: `points.sort_by_key(|p| p.timestamp_ms)` — stable sort; agg part added first; clamped straddle ts = since_ms; raw first bucket ≥ since_ms → straddle sorts first (or equal). ✓.
+
+One more scan of the diff for anything missed... the test at diff line 66: `expect(out.filter((p) => p.timestamp >= 47_500)).toEqual(live)` — live has 2 pts at 50000/51000; merged = prefix(seed < 47500... cutoff = 50000-2500=47500; seed 10000..52000 step1000 → prefix = 10000..47000) + live → filter ≥47500 → live ✓.
+
+And `mergeSeedIntoLive` dense test: live 51 pts threshold 45 → returns live ✓ toBe.
+
+Let me now also quickly verify TimeSeriesChart line ~290 domain usage — `domain={timeDomain ?? ['dataMin','dataMax']}` — buffer & history both pass timeDomain ✓ fixed. So FIX A's "expand domain" applies to non-timeDomain consumers — fine.
+
+Also check: does anything else call query_timeseries with range ≤ 1h besides the API handler? e.g., summary? rg quickly... The API route. Fine.
+
+Final check on "1h chart must span exactly 60 min" constraint: with the clamp, points[0].timestamp_ms ≥ since ✓ tested. And "ZERO regressions to 24h/5m history views": 5m history view?? There is no 5m history view (5m is buffer). 24h untouched ✓.
+
+Potential issue with the clamp + **bucket_ts <= until_ms filter and clamp to since_ms**: if since_ms > until_ms (caller error) → clamp ts to since > until → point beyond until — degenerate input, skip.
+
+Verdict: 1 MAJOR, 3 MINOR, rest NITs.
+
+Wait — one more serious hunt: **`useBufferSeed`'s `setSeed` when `map.size > 0` replaces the ENTIRE seed even if some metrics failed this round** — partial failure: metric A ok, metric B failed → map has only A → prev had A+B → B's seed LOST (map replaces prev wholesale). Next successful visibility fetch restores. Transient; derived configs needing B compute with null → series may vanish for a cycle. MINOR/NIT. Suggested fix: merge per-metric into prev (Map with fallback per key). I'll include as NIT.
+
+Also **gen guard placement**: `if (gen !== genRef.current) return` — AFTER Promise.all — correct.
+
+**visibilitychange when hidden→visible fires fetchSeed; hidden→hidden no. Initial mount visible → effect fetch ✓.**
+
+Alright — also confirm there's no `useBufferSeed` call when `engineEndpoint === null` but isBuffer true — guarded inside ✓ (test asserts no fetch).
+
+Output format: severity-ordered list, file:line, one-line fix each, verdict line. Also brief test-gap note. Keep it tight. No need for the full reporting boilerplate (this is a review-only task — read-only, no code changes). The user asked only for the review output format. I'll comply with their format: severity-ordered list + verdict.
+
+Line numbers to cite (verified against actual files):
+- src/history.rs:743 (clamp), :732 (since_hour), :785 (sort), :708 (≤1h branch)
+- ChartWithTimeScale.tsx:270-275 (seed URL), :113-139 (merge), :127 (cutoff), :118 (dense), :124 (return seed ref), :382/:389 (double filter), :300 (setSeed replace), :264 (JSON.parse), :47-53 (stray JSDoc), :307-314 (visibility listener)
+- EngineCard.tsx:439-441, :613-615 (inline seedValueMap — fine, no issue; skip)
+
+Ordering: MAJOR first.
+
+Double-check my MAJOR once more — is it really true that for a 5m window straddling the hour the completed bucket is included? since = now−300_000. Say now = 01:02:00 → since = 00:57:00 → since_hour = 00:00 → buckets ≥ 00:00: the 00:00 bucket is INCOMPLETE (completes at 01:00 — wait no! At now=01:02, hour 00:00–01:00 IS complete (completed at 01:00, rollup ran at 01:00+). The 01:00 hour is incomplete. since_hour = 00:00 → the 00:00 bucket EXISTS and passes bucket_ts ≥ 00:00 ✓ ≤ until ✓. Clamped to 00:57. Its value = full-hour 00:00–01:00 average plotted at 00:57, while 1s data for 00:57–01:02 exists → duplicate coverage + value jump at left edge. YES — happens for any window whose since falls in the PREVIOUS hour, i.e., during the first `windowMs` of each hour. Confirmed. And for the 1m chart same: first 60s of each hour. Also affects the 1h history view for its whole... no — 1h view since = now−3600s; since falls in previous hour when now is < 60min past the hour → i.e., ALWAYS except exactly at hour boundaries... wait: now = 01:02 → since = 00:02 → since_hour = 00:00 → 00:00 bucket exists (completed) → straddle → clamped to 00:02 → coexists with 1s data (00:02 is < 1h old → retained). So the 1h chart ALWAYS shows the clamped straddle point at its left edge with full-hour-average value + 1s points for the same stretch. That's FIX A working as designed (test asserts exactly this) — the "value semantics" distortion the checklist asked about (item 4: "point now claims a bucket value at a timestamp it does not cover" — actually it DOES cover part of the window; it claims the FULL-hour average though). For the 1h view it's the intended trade-off. For 1m/5m seeds it's an unintended artifact. Solid MAJOR (arguably could be MINOR since transient & left-edge only — I'll present as MAJOR with clear reasoning, letting Chris downgrade).
+
+Also note interplay: for seed windows, is the artifact actually visible? The seed prefix is prepended only when live is sparse; after refresh (live empty) the seed IS the chart → the very first point = hourly avg → line starts at hourly-avg value then jumps to 1s values. Visible on refresh during first minutes of an hour. Yes.
+
+One more: does the ≤1h branch's Part-1 also affect the **1m/5m seed when metric has no agg col** (mem_used_pct → None) → Part 1 skipped ✓.
+
+Write the final review now. Format per request. Keep each finding tight. End with VERDICT line. Also they asked: "If the diff is genuinely clean, say so explicitly." It's not — 1 major.
+
+Count: 1 critical? No. MAJOR 1, MINOR 3-4, NIT ~5. Verdict: "VERDICT: 1 major, 4 minor, 5 nits" per format "N issues (X critical, Y major)".# Adversarial Review — FIX A + FIX B
+
+Verified against full sources (`src/history.rs` query path, `ChartWithTimeScale.tsx`, `EngineCard.tsx`, `useMetricsHistory.ts`, `TimeSeriesChart.tsx`, rollup logic). Hook order is clean (all hooks run before the buffer-mode early return), `neededKey` JSON round-trip does NOT loop (string identity stable → `fetchSeed` deps stable → effect doesn't refire), gen-counter race handling is correct, and the dense path returns `live` by reference (test asserts `toBe`). Backend metric strings are whitelisted before SQL interpolation; engine/metric are `encodeURIComponent`'d. 24h/7d branches and `query_summary` are untouched.
+
+Findings:
+
+---
+
+**[MAJOR] src/history.rs:732-743 (+ exposed by ChartWithTimeScale.tsx:270-275)** — For tiny ranges the `since_hour` floor still pulls the *previous completed* hour bucket into the result: a 60s/300s seed window starting mid-hour (i.e. during the first ≤5 min of every hour) matches `bucket_ts >= since_hour`, so the seed contains a point clamped to `since` carrying the **full-hour average** — alongside real 1s data that covers the same stretch (1s retention ~1h ≫ 5m window). Result: an outlier/value-jump point at the left edge of every 1m/5m chart on refresh/tab-refocus during the first minutes after each hour boundary; the same full-hour-avg-at-window-start semantics now apply to the 1h view whenever 1s data is un-pruned (pre-clamp it sat off-screen). The prompt's claim "a 60s/300s seed window cannot hit rollup rows" is only true for the *current* hour's partial row — the *previous* hour's completed row is hit.
+*Fix: in the ≤1h branch, include the straddle agg bucket only when Part 2 doesn't already cover that stretch (e.g. drop agg points once raw buckets exist at/below the bucket's end, or skip Part 1 when `raw_points` is non-empty before the next hour start).*
+
+**[MINOR] ChartWithTimeScale.tsx:127-138** — `mergeSeedIntoLive` is prepend-only: seed points falling in *gaps after* `live[0]` (tab hidden ~4 min → 1/min throttled timer samples → scattered live points with holes) are discarded, so mid-chart holes stay unfilled even though the DB has the data. *Fix: merge by timestamp (live wins on collision) instead of prefix-concatenation.*
+
+**[MINOR] ChartWithTimeScale.tsx:303-305** — No periodic re-seed while visible: with the WS down >windowMs after mount, stale seed is clipped by `t0` and the chart decays back to empty — the original bug recurs during prolonged WS outage. *Fix: re-seed on an interval (or WS-reconnect event) while live is below dense threshold.*
+
+**[MINOR] ChartWithTimeScale.tsx:294-300** — A partially successful refetch replaces the whole seed map: metric A ok + metric B failed → prev seed for B is dropped wholesale (derived series vanish for a cycle). *Fix: per-metric merge into `prev` instead of all-or-nothing replace.*
+
+**[MINOR] ChartWithTimeScale.tsx:307-314 (perf)** — Every visibilitychange fans out one fetch per metric per buffer chart (~8+ charts × N engines simultaneously) with no debounce or in-flight dedupe. *Fix: coalesce per endpoint+window in a module-level cache, or debounce ~1s.*
+
+**[NIT] ChartWithTimeScale.tsx:382,389** — `mergeSeedIntoLive(...).filter(p => p.timestamp >= t0)`: for the dense path (merged === `cut()` output, already ≥t0-filtered) this is a redundant second full array copy per series per 1Hz tick. Output stays byte-identical; it's allocation churn only. *Fix: skip the second filter when merge returned the dense `live` reference.*
+
+**[NIT] ChartWithTimeScale.tsx:47-53** — Stray `/** Pass-through to TimeSeriesChart. */` now sits on `seedValueMap` (it isn't a pass-through) and `color` lost its doc. *Fix: move the comment.*
+
+**[NIT] src/history.rs:743+785** — Clamped straddle point can (rarely: `since_ms` bucket-aligned + a sample in that bucket) share a timestamp with a raw 1s bucket → duplicate x values after the stable sort. *Fix: dedupe by `timestamp_ms` post-sort preferring the raw point.*
+
+**[NIT] ChartWithTimeScale.tsx:262-300** — In-flight fetch completing after unmount still calls `setSeed` (harmless React 18 no-op, but the genRef pattern doesn't guard unmount); `JSON.parse(neededKey)` throw would be an unhandled rejection — internally generated, so effectively unreachable. *Fix: add a mounted flag / try-parse guard if you want belt-and-suspenders.*
+
+**[NIT] ChartWithTimeScale.tsx:94,127** — The 2.5s overlap guard assumes seed (server DB `ts`) and live (`metrics.timestamp_ms`, server-side `SystemTime::now()` per src/metrics/mod.rs:125) share one clock — they do, but the *client's* `Date.now()` defines both the fetch window and `t0`, so client-server skew shifts the seed window; pre-existing windowing behavior, note only.
+
+Test gaps worth noting (not defects): no coverage of the hour-boundary seed artifact (the MAJOR), seed-fetch-failure-keeps-prev, the prefix-path `valueMap` (only the empty-live path is tested), or the gen-counter scale-flip race.
+
+VERDICT: 9 issues (0 critical, 1 major)
+EXIT:0

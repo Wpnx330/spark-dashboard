@@ -1,0 +1,840 @@
+diff --git a/frontend/src/__tests__/ChartWithTimeScale.test.tsx b/frontend/src/__tests__/ChartWithTimeScale.test.tsx
+index 6e908c0..31009c3 100644
+--- a/frontend/src/__tests__/ChartWithTimeScale.test.tsx
++++ b/frontend/src/__tests__/ChartWithTimeScale.test.tsx
+@@ -1,6 +1,6 @@
+ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+ import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+-import { ChartWithTimeScale } from '@/components/charts/ChartWithTimeScale'
++import { ChartWithTimeScale, mergeSeedIntoLive } from '@/components/charts/ChartWithTimeScale'
+ 
+ // --- Mock fetch ---
+ type FetchHandler = (url: string) => Promise<unknown>
+@@ -340,3 +340,185 @@ describe('ChartWithTimeScale', () => {
+     })
+   })
+ })
++
++describe('mergeSeedIntoLive', () => {
++  const makeSeed = (from: number, to: number, value = 10) => {
++    const pts: Array<{ timestamp: number; value: number }> = []
++    for (let t = from; t <= to; t += 1000) pts.push({ timestamp: t, value })
++    return pts
++  }
++
++  it('returns live data untouched when the buffer is dense', () => {
++    const live = makeSeed(1_700_000_000_000, 1_700_000_000_000 + 50_000) // 51 pts
++    const s = makeSeed(1_700_000_000_000 - 60_000, 1_700_000_000_000)
++    expect(mergeSeedIntoLive(live, s, { denseThreshold: 45 })).toBe(live)
++  })
++
++  it('returns live untouched when seed is empty or missing', () => {
++    const live = [{ timestamp: 1000, value: 1 }]
++    expect(mergeSeedIntoLive(live, null, { denseThreshold: 45 })).toEqual(live)
++    expect(mergeSeedIntoLive(live, [], { denseThreshold: 45 })).toEqual(live)
++  })
++
++  it('fills the whole window from seed when live is empty (page refresh)', () => {
++    const s = [
++      { timestamp: 1000, value: 5 },
++      { timestamp: 2000, value: 6 },
++    ]
++    expect(mergeSeedIntoLive([], s, { denseThreshold: 45 })).toEqual(s)
++  })
++
++  it('applies valueMap to seed points when live is empty', () => {
++    const s = [{ timestamp: 1000, value: 5000 }]
++    const out = mergeSeedIntoLive([], s, {
++      denseThreshold: 45,
++      valueMap: (v) => v / 1000,
++    })
++    expect(out).toEqual([{ timestamp: 1000, value: 5 }])
++  })
++
++  it('merges seed by timestamp: live wins collisions, seed fills everything else', () => {
++    const live = [
++      { timestamp: 50_000, value: 1 },
++      { timestamp: 51_000, value: 2 },
++    ]
++    const s = makeSeed(10_000, 52_000, 9)
++    const out = mergeSeedIntoLive(live, s, { denseThreshold: 45 })
++    // Strictly increasing timestamps, no duplicates at the seam.
++    expect(
++      out.every((p, i) => i === 0 || p.timestamp > out[i - 1].timestamp),
++    ).toBe(true)
++    // Live points win their own timestamps.
++    expect(out.filter((p) => p.timestamp === 50_000 || p.timestamp === 51_000)).toEqual(live)
++    // Old seed prefix is present.
++    expect(out.some((p) => p.timestamp === 10_000)).toBe(true)
++    // Seed points newer than the newest live sample survive (WS-down case).
++    expect(out[out.length - 1].timestamp).toBe(52_000)
++  })
++
++  it('fills gaps BETWEEN live samples from seed (background-tab throttling)', () => {
++    // Live has scattered points with a hole between 30s and 50s.
++    const live = [
++      { timestamp: 30_000, value: 3 },
++      { timestamp: 50_000, value: 1 },
++    ]
++    const s = makeSeed(10_000, 52_000, 9)
++    const out = mergeSeedIntoLive(live, s, { denseThreshold: 45 })
++    // The hole is filled: seed points 31k..49k are present between the
++    // live samples, and live points win their own timestamps.
++    expect(out.some((p) => p.timestamp === 40_000 && p.value === 9)).toBe(true)
++    expect(out.filter((p) => p.timestamp === 30_000 || p.timestamp === 50_000)).toEqual(live)
++    expect(
++      out.every((p, i) => i === 0 || p.timestamp > out[i - 1].timestamp),
++    ).toBe(true)
++  })
++
++  it('sorts unsorted seed arrays before merging', () => {
++    const live = [{ timestamp: 50_000, value: 1 }]
++    const s = [
++      { timestamp: 52_000, value: 9 },
++      { timestamp: 10_000, value: 9 },
++      { timestamp: 30_000, value: 9 },
++    ]
++    const out = mergeSeedIntoLive(live, s, { denseThreshold: 45 })
++    expect(
++      out.every((p, i) => i === 0 || p.timestamp > out[i - 1].timestamp),
++    ).toBe(true)
++    expect(out[out.length - 1].timestamp).toBe(52_000)
++  })
++
++  it('fills before the live point and hands collisions to live', () => {
++    const live = [{ timestamp: 50_000, value: 1 }]
++    const s = [
++      { timestamp: 49_500, value: 9 },
++      { timestamp: 50_500, value: 8 },
++    ]
++    // 49_500 fills before the live point; 50_500 is newer than live[0], so
++    // it is kept after it (WS-down tail rule).
++    expect(mergeSeedIntoLive(live, s, { denseThreshold: 45 })).toEqual([
++      { timestamp: 49_500, value: 9 },
++      { timestamp: 50_000, value: 1 },
++      { timestamp: 50_500, value: 8 },
++    ])
++  })
++})
++
++describe('ChartWithTimeScale buffer seeding', () => {
++  it('fetches seed data from the history API on mount in buffer mode', async () => {
++    fetchHandler = async (url: string) => {
++      expect(url).toContain('/api/history/timeseries')
++      expect(url).toContain('metric=gpu_util')
++      return { points: [{ timestamp_ms: Date.now() - 5000, value: 42 }] }
++    }
++    render(
++      <ChartWithTimeScale
++        bufferData={[]}
++        engineEndpoint="http://localhost:8000"
++        historyMetrics={['gpu_util']}
++        unit="%"
++      />,
++    )
++    await waitFor(() => {
++      expect(fetch).toHaveBeenCalledWith(
++        expect.stringContaining('metric=gpu_util'),
++      )
++    })
++  })
++
++  it('refetches seed when the tab becomes visible again', async () => {
++    let calls = 0
++    fetchHandler = async () => {
++      calls++
++      return { points: [{ timestamp_ms: Date.now() - 1000, value: 1 }] }
++    }
++    render(
++      <ChartWithTimeScale
++        bufferData={[]}
++        engineEndpoint="http://localhost:8000"
++        historyMetrics={['gpu_util']}
++        unit="%"
++      />,
++    )
++    await waitFor(() => expect(calls).toBeGreaterThanOrEqual(1))
++
++    Object.defineProperty(document, 'visibilityState', {
++      value: 'visible',
++      configurable: true,
++    })
++    document.dispatchEvent(new Event('visibilitychange'))
++    await waitFor(() => expect(calls).toBeGreaterThanOrEqual(2))
++  })
++
++  it('keeps seeding other metrics when one metric fetch fails', async () => {
++    const called: string[] = []
++    fetchHandler = async (url: string) => {
++      if (url.includes('metric=gpu_util')) {
++        called.push('gpu_util')
++        return { points: [{ timestamp_ms: Date.now() - 5000, value: 42 }] }
++      }
++      called.push('kv_cache_pct')
++      return new Response('server error', { status: 500 })
++    }
++    render(
++      <ChartWithTimeScale
++        bufferData={[]}
++        engineEndpoint="http://localhost:8000"
++        historyMetrics={['gpu_util', 'kv_cache_pct']}
++        unit="%"
++      />,
++    )
++    // Both metrics are attempted; the failing one does not abort seeding.
++    await waitFor(() => expect(called).toContain('kv_cache_pct'))
++    expect(called).toContain('gpu_util')
++  })
++
++  it('does not fetch seed when engineEndpoint is null', async () => {
++    fetchHandler = async () => ({ points: [] })
++    render(
++      <ChartWithTimeScale bufferData={[]} engineEndpoint={null} unit="%" />,
++    )
++    // Give effects a tick; no fetch calls should have happened.
++    await new Promise((r) => setTimeout(r, 20))
++    expect(fetch).not.toHaveBeenCalled()
++  })
++})
+diff --git a/frontend/src/components/charts/ChartWithTimeScale.tsx b/frontend/src/components/charts/ChartWithTimeScale.tsx
+index bfb1f7f..9987ce3 100644
+--- a/frontend/src/components/charts/ChartWithTimeScale.tsx
++++ b/frontend/src/components/charts/ChartWithTimeScale.tsx
+@@ -1,4 +1,4 @@
+-import { useState, useMemo, useCallback } from 'react'
++import { useState, useMemo, useCallback, useEffect, useRef } from 'react'
+ import { TimeSeriesChart, type ChartSeries } from './TimeSeriesChart'
+ import { TimeScaleButton, type TimeScale } from './TimeScaleButton'
+ import { useHistoryTimeseries } from '@/hooks/useHistoryTimeseries'
+@@ -44,6 +44,12 @@ interface ChartWithTimeScaleProps {
+    * String = direct DB metric, DerivedSeries = computed, undefined = hidden.
+    */
+   historyMetrics?: HistorySeriesConfig[]
++  /**
++   * Transform applied to seeded (DB) values before display. Needed when the
++   * buffer data is transformed at the call site (e.g. E2E chart divides ms
++   * → s) so seed and live values share one unit. History mode is untouched.
++   */
++  seedValueMap?: (value: number) => number
+   /** Pass-through to TimeSeriesChart. */
+   color?: string
+   yDomain?: [number, number]
+@@ -83,6 +89,81 @@ const BUFFER_SLICE: Record<'1m' | '5m', number> = {
+   '5m': 300,
+ }
+ 
++/**
++ * Merge DB-seeded history points into a sparse live buffer window.
++ *
++ * 1m/5m charts render from an in-memory WebSocket buffer. When the tab is
++ * hidden (background tabs throttle sample processing) or the page reloads,
++ * that buffer goes stale or empty and the chart "resets" even though the
++ * server still holds the 1s data. Seeding backfills the visible window from
++ * `/api/history/timeseries` — the same source the 1h/24h charts use.
++ *
++ * Rules:
++ * - Dense live buffer (≥ denseThreshold in-window points): returned as-is —
++ *   streaming behavior is identical to the pre-seed implementation.
++ * - Empty live buffer: seed fills the whole window (page refresh case).
++ * - Sparse live buffer: merged by timestamp — live wins on collisions, seed
++ *   fills everything else (holes before, between, and after live samples:
++ *   background-tab throttling gaps, or a stalled WebSocket where the DB is
++ *   the freshest source until the stream catches up, at which point the
++ *   collision rule hands the tail back to live).
++ */
++export function mergeSeedIntoLive(
++  live: DataPoint[],
++  seed: DataPoint[] | null | undefined,
++  opts: { denseThreshold: number; valueMap?: (v: number) => number },
++): DataPoint[] {
++  if (live.length >= opts.denseThreshold) return live
++  if (!seed || seed.length === 0) return live
++  const map = opts.valueMap
++  const apply = (p: DataPoint): DataPoint =>
++    map ? { timestamp: p.timestamp, value: map(p.value) } : p
++
++  // No live data at all → the seed IS the chart (page refresh / WS down).
++  if (live.length === 0) return seed.map(apply)
++
++  // Seed must be ascending for the two-pointer merge (backend returns
++  // ORDER BY timestamp; derived computes preserve order). Guard cheaply
++  // instead of trusting every producer.
++  let sorted = seed
++  for (let k = 1; k < seed.length; k++) {
++    if (seed[k].timestamp < seed[k - 1].timestamp) {
++      sorted = [...seed].sort((a, b) => a.timestamp - b.timestamp)
++      break
++    }
++  }
++
++  // Two-pointer merge; on equal timestamps the live point wins (both
++  // pointers advance so the seed duplicate is consumed, not re-emitted).
++  const out: DataPoint[] = []
++  let i = 0
++  let j = 0
++  while (i < sorted.length && j < live.length) {
++    const s = sorted[i]
++    const l = live[j]
++    if (s.timestamp < l.timestamp) {
++      out.push(apply(s))
++      i++
++    } else {
++      out.push(l)
++      j++
++      if (s.timestamp === l.timestamp) i++
++    }
++  }
++  while (j < live.length) {
++    out.push(live[j])
++    j++
++  }
++  // Seed points newer than every live sample: keep them. When the WebSocket
++  // is down the DB holds the freshest seconds; once live catches up the
++  // collision rule above hands those timestamps back to the stream.
++  while (i < sorted.length) {
++    out.push(apply(sorted[i]))
++    i++
++  }
++  return out
++}
++
+ /** Flattened metric list needed for history fetches (direct + derived sources). */
+ function collectNeededMetrics(configs: HistorySeriesConfig[]): string[] {
+   const metrics = new Set<string>()
+@@ -96,6 +177,29 @@ function collectNeededMetrics(configs: HistorySeriesConfig[]): string[] {
+   return Array.from(metrics)
+ }
+ 
++/** Resolve the seed points for one series config from the fetched seed map.
++ * Direct configs look up their metric; derived configs compute from sources —
++ * exactly how history mode resolves them. */
++function seedPointsFor(
++  cfg: HistorySeriesConfig,
++  seedData: Map<string, DataPoint[]>,
++): DataPoint[] | null {
++  if (!cfg) return null
++  if (typeof cfg === 'string') return seedData.get(cfg) ?? null
++  if (typeof cfg === 'object') {
++    const sources: Record<string, DataPoint[] | null> = {}
++    let any = false
++    for (const m of cfg.sourceMetrics) {
++      const d = seedData.get(m) ?? null
++      sources[m] = d
++      if (d && d.length > 0) any = true
++    }
++    if (!any) return null
++    return cfg.compute(sources)
++  }
++  return null
++}
++
+ /** Hook: fetch all unique metrics needed for history mode. */
+ 
+ /** Individual hook slot — always called, returns null if metric is empty. */
+@@ -157,6 +261,102 @@ function useAllHistoryData(
+   return { data: map, loading }
+ }
+ 
++/** Hook: seed data for buffer modes (1m/5m) from the history API.
++ *
++ * Buffer charts otherwise rely solely on in-memory WebSocket samples, which
++ * go stale when the tab is hidden or vanish on reload. This fetches the most
++ * recent window from the DB (same endpoint as 1h/24h mode) on mount, on
++ * scale/endpoint/config change, and whenever the tab becomes visible again.
++ * The merge itself happens at render time via mergeSeedIntoLive — a dense
++ * live buffer never touches the seed. */
++function useBufferSeed(
++  engineEndpoint: string | null,
++  configs: HistorySeriesConfig[],
++  scale: TimeScale,
++): Map<string, DataPoint[]> {
++  const isBuffer = scale === '1m' || scale === '5m'
++  // Content-stable key: callers pass inline arrays (e.g. ['gpu_util']) whose
++  // identity changes every parent render — keying on JSON avoids refetching
++  // the seed on each metrics tick.
++  const neededKey = useMemo(
++    () => (isBuffer ? JSON.stringify(collectNeededMetrics(configs)) : '[]'),
++    [configs, isBuffer],
++  )
++  const [seed, setSeed] = useState<Map<string, DataPoint[]>>(() => new Map())
++  const genRef = useRef(0)
++  const mountedRef = useRef(true)
++  useEffect(() => {
++    mountedRef.current = true
++    return () => {
++      mountedRef.current = false
++    }
++  }, [])
++
++  const fetchSeed = useCallback(async () => {
++    if (!isBuffer || engineEndpoint === null || neededKey === '[]') return
++    const needed: string[] = JSON.parse(neededKey)
++    const gen = ++genRef.current
++    const untilMs = Date.now()
++    const windowMs = scale === '1m' ? BUFFER_WINDOW_MS['1m'] : BUFFER_WINDOW_MS['5m']
++    const sinceMs = untilMs - windowMs
++
++    const results = await Promise.all(
++      needed.map(async (metric) => {
++        const url =
++          `/api/history/timeseries?engine=${encodeURIComponent(engineEndpoint)}` +
++          `&metric=${encodeURIComponent(metric)}` +
++          `&since_ms=${sinceMs}&until_ms=${untilMs}`
++        try {
++          const res = await fetch(url)
++          if (!res.ok) return null
++          const json = await res.json()
++          const pts: DataPoint[] = (json.points ?? []).map(
++            (p: { timestamp_ms: number; value: number }) => ({
++              timestamp: p.timestamp_ms,
++              value: p.value,
++            }),
++          )
++          return [metric, pts] as const
++        } catch {
++          return null
++        }
++      }),
++    )
++    // A newer fetch (scale flip / visibility change) supersedes this one —
++    // and an unmounted component must never set state.
++    if (gen !== genRef.current || !mountedRef.current) return
++    // Merge per metric: a metric that failed this round (network blip, one
++    // 500 among several) keeps its previous seed instead of vanishing for a
++    // cycle. Stale points are clipped by the time window at render anyway.
++    setSeed((prev) => {
++      let changed = false
++      const next = new Map(prev)
++      for (const r of results) {
++        if (r && r[1].length > 0) {
++          next.set(r[0], r[1])
++          changed = true
++        }
++      }
++      return changed ? next : prev
++    })
++  }, [engineEndpoint, isBuffer, neededKey, scale])
++
++  useEffect(() => {
++    void fetchSeed()
++  }, [fetchSeed])
++
++  useEffect(() => {
++    if (!isBuffer) return
++    const onVisible = () => {
++      if (document.visibilityState === 'visible') void fetchSeed()
++    }
++    document.addEventListener('visibilitychange', onVisible)
++    return () => document.removeEventListener('visibilitychange', onVisible)
++  }, [isBuffer, fetchSeed])
++
++  return seed
++}
++
+ export function ChartWithTimeScale({
+   bufferData,
+   bufferSeries,
+@@ -171,6 +371,7 @@ export function ChartWithTimeScale({
+   hideTooltipLabel,
+   tooltipLabel,
+   seriesLabel,
++  seedValueMap,
+   className,
+   events,
+   requests,
+@@ -188,6 +389,10 @@ export function ChartWithTimeScale({
+     scale,
+   )
+ 
++  // DB seed for buffer modes (no-op at 1h/24h). Merged only when the live
++  // buffer is sparse — see mergeSeedIntoLive.
++  const seedData = useBufferSeed(engineEndpoint, effectiveConfigs, scale)
++
+   const handleCycle = useCallback(() => setScale((s) => nextScale(s)), [])
+ 
+   // ── Buffer mode (1m / 5m) ──
+@@ -206,13 +411,27 @@ export function ChartWithTimeScale({
+     let chartData: DataPoint[] | undefined
+     let chartSeries: ChartSeries[] | undefined
+ 
++    const denseThreshold = Math.floor(sliceCount * 0.75)
++
+     if (bufferSeries) {
+-      chartSeries = bufferSeries.map((s) => ({
+-        ...s,
+-        data: cut(s.data),
+-      }))
++      chartSeries = bufferSeries.map((s, i) => {
++        const cutLive = cut(s.data)
++        const merged = mergeSeedIntoLive(cutLive, seedPointsFor(effectiveConfigs[i], seedData), {
++          denseThreshold,
++          valueMap: seedValueMap,
++        })
++        // Dense path returns `cutLive` by reference (already ≥ t0) — skip
++        // the second filter/copy. The merged path can carry seed points
++        // outside the window, so it always gets filtered.
++        return { ...s, data: merged === cutLive ? merged : merged.filter((p) => p.timestamp >= t0) }
++      })
+     } else if (bufferData) {
+-      chartData = cut(bufferData)
++      const cutLive = cut(bufferData)
++      const merged = mergeSeedIntoLive(cutLive, seedPointsFor(effectiveConfigs[0], seedData), {
++        denseThreshold,
++        valueMap: seedValueMap,
++      })
++      chartData = merged === cutLive ? merged : merged.filter((p) => p.timestamp >= t0)
+     }
+ 
+     // Always render the FULL time domain, even when samples are sparse:
+diff --git a/src/history.rs b/src/history.rs
+index 68c1285..5adec1d 100644
+--- a/src/history.rs
++++ b/src/history.rs
+@@ -706,14 +706,48 @@ impl HistoryDb {
+         let range_ms = until_ms.saturating_sub(since_ms);
+ 
+         if range_ms <= HOUR_MS {
+-            // For ranges ≤ 1h we query BOTH the 1h table (completed hour
+-            // buckets that have already been rolled up and pruned from 1s)
+-            // AND the 1s table (current incomplete hour).  This prevents
+-            // empty charts when the rollup has already deleted the 1s data
+-            // for the earlier part of the requested range.
+-            let mut points = Vec::new();
+-
+-            // Part 1: aggregated 1h buckets that fall within the range.
++            // For ranges ≤ 1h we query BOTH the 1s table (raw data for the
++            // current, not-yet-rolled-up stretch) AND the 1h table (completed
++            // hour buckets whose 1s data has already been rolled up and
++            // pruned).  This prevents empty charts when the rollup has
++            // already deleted the 1s data for the earlier part of the
++            // requested range — but a completed-hour bucket is only used
++            // when the raw 1s data does NOT already cover part of that hour
++            // inside the window (see the coverage check below).
++            let bucket_ms = bucket_size_ms(range_ms);
++            let sql_raw = format!(
++                "SELECT MAX((ts / {bucket_ms}) * {bucket_ms}, ?2) AS bucket_ts, \
++                 MIN(ts) AS min_ts, \
++                 {agg_func}({col}) AS value \
++                 FROM snapshots_1s \
++                 WHERE engine_key = ?1 AND ts >= ?2 AND ts <= ?3 \
++                 GROUP BY bucket_ts \
++                 ORDER BY bucket_ts ASC",
++                col = raw_col,
++                bucket_ms = bucket_ms,
++                agg_func = agg_func,
++            );
++            let mut stmt = db.prepare(&sql_raw)?;
++            // (bucket_ts, min sample ts in bucket, aggregated value)
++            let raw_points = stmt
++                .query_map(params![engine_key, since_ms, until_ms], |r| {
++                    let bucket_ts: i64 = r.get(0)?;
++                    let min_ts: i64 = r.get(1)?;
++                    let val: Option<f64> = r.get(2)?;
++                    Ok((bucket_ts, min_ts, val.unwrap_or(0.0)))
++                })?
++                .collect::<rusqlite::Result<Vec<_>>>()?;
++            // Raw points go in first: when both sources produce the same
++            // timestamp after the sort below, the raw 1s value wins.
++            let mut points: Vec<TimeSeriesPoint> = raw_points
++                .iter()
++                .map(|(bucket_ts, _, value)| TimeSeriesPoint {
++                    timestamp_ms: *bucket_ts,
++                    value: *value,
++                })
++                .collect();
++
++            // Completed-hour rollup buckets within the range.
+             if let Some(agg) = agg_col {
+                 let value_expr = if metric == "power_watts" {
+                     format!("{agg} / NULLIF(sample_count, 0)")
+@@ -727,54 +761,50 @@ impl HistoryDb {
+                 );
+                 let mut stmt = db.prepare(&sql_agg)?;
+                 // Include the complete hour STRADDLING `since`: when the
+-                // range starts mid-hour, that earlier bucket is the only
+-                // data covering [since, next-hour-start) after 1s pruning.
++                // range starts mid-hour and the 1s data for that stretch was
++                // already rolled up + pruned, that earlier bucket is the
++                // only data covering [since, next-hour-start).
+                 let since_hour = (since_ms / 3_600_000) * 3_600_000;
+                 let agg_points = stmt
+                     .query_map(params![engine_key, since_hour, until_ms], |r| {
+-                        let ts: i64 = r.get(0)?;
++                        let bucket_ts: i64 = r.get(0)?;
++                        // Clamp the straddling bucket's timestamp INTO the
++                        // requested window. Its value legitimately covers
++                        // [since, next-hour-start), but reporting it at its
++                        // raw (earlier) timestamp makes clients with a fixed
++                        // x-domain expand that domain backwards — the 1h
++                        // chart rendered a ~2h axis with data scrunched into
++                        // the right half.
++                        let ts = bucket_ts.max(since_ms);
+                         let val: Option<f64> = r.get(1)?;
+-                        Ok(TimeSeriesPoint {
+-                            timestamp_ms: ts,
+-                            value: val.unwrap_or(0.0),
+-                        })
++                        Ok((bucket_ts, ts, val.unwrap_or(0.0)))
+                     })?
+                     .collect::<rusqlite::Result<Vec<_>>>()?;
+-                points.extend(agg_points);
++                for (bucket_ts, ts, value) in agg_points {
++                    // Skip the full-hour average when raw 1s rows already
++                    // cover part of that hour inside the window: with ~1h of
++                    // 1s retention a 60s/300s window almost always has raw
++                    // rows, and mixing in the bucket's hour-wide average
++                    // puts an artificial value-jump point at the window's
++                    // left edge. MIN(ts) is the true sample time, so a raw
++                    // bucket whose floor lands just before an hour boundary
++                    // still counts toward the hour its samples belong to.
++                    let covered = raw_points.iter().any(|(_, min_ts, _)| {
++                        *min_ts >= bucket_ts && *min_ts < bucket_ts + HOUR_MS
++                    });
++                    if !covered {
++                        points.push(TimeSeriesPoint {
++                            timestamp_ms: ts,
++                            value,
++                        });
++                    }
++                }
+             }
+ 
+-            // Part 2: raw 1s data for the current (incomplete) hour,
+-            // aggregated into time buckets (~360 across the range) with the
+-            // metric-appropriate function, so gauge peaks aren't averaged
+-            // into a saw-tooth and the returned point count stays bounded.
+-            let bucket_ms = bucket_size_ms(range_ms);
+-            let sql_raw = format!(
+-                "SELECT (ts / {bucket_ms}) * {bucket_ms} AS bucket_ts, \
+-                 {agg_func}({col}) AS value \
+-                 FROM snapshots_1s \
+-                 WHERE engine_key = ?1 AND ts >= ?2 AND ts <= ?3 \
+-                 GROUP BY bucket_ts \
+-                 ORDER BY bucket_ts ASC",
+-                col = raw_col,
+-                bucket_ms = bucket_ms,
+-                agg_func = agg_func,
+-            );
+-            let mut stmt = db.prepare(&sql_raw)?;
+-            let raw_points = stmt
+-                .query_map(params![engine_key, since_ms, until_ms], |r| {
+-                    let ts: i64 = r.get(0)?;
+-                    let val: Option<f64> = r.get(1)?;
+-                    Ok(TimeSeriesPoint {
+-                        timestamp_ms: ts,
+-                        value: val.unwrap_or(0.0),
+-                    })
+-                })?
+-                .collect::<rusqlite::Result<Vec<_>>>()?;
+-            points.extend(raw_points);
+-
+-            // Deduplicate by timestamp (1h bucket_ts and 1s ts won't
+-            // overlap, but sort to be safe).
++            // Sort ascending; drop duplicate timestamps (the raw point,
++            // inserted first, wins the stable sort and the dedupe).
+             points.sort_by_key(|p| p.timestamp_ms);
++            points.dedup_by(|a, b| a.timestamp_ms == b.timestamp_ms);
+             Ok(points)
+         } else {
+             // Aggregated table (1h or 1d).
+@@ -2186,6 +2216,200 @@ mod tests {
+         );
+     }
+ 
++    /// When the requested range starts mid-hour, the completed-hour bucket
++    /// that STRADDLES `since` must be included ONLY when raw 1s data does
++    /// not already cover part of that hour inside the window (1s data was
++    /// rolled up + pruned), and its timestamp must be clamped to `since`
++    /// so clients with a fixed [since, until] x-domain don't expand it
++    /// backwards (~2h axis on a 1h chart).
++    #[tokio::test]
++    async fn test_timeseries_1h_range_includes_straddle_bucket_clamped() {
++        let db = test_db();
++        let key = "straddle-engine";
++        // Fixed epoch — fully deterministic, no wall clock. h1 must be
++        // hour-aligned (divisible by 3_600_000) so the SQL floor matches.
++        let h1 = 360_000_000_000i64; // previous (completed) hour bucket
++        let h2 = h1 + 3_600_000; // current (incomplete) hour bucket
++        let now = h2 + 1_200_000; // 20 min into the current hour
++                                  // → since = now − 30 min = h1 + 50 s*… 50 min into h1: STRADDLE.
++
++        // Completed previous hour in the 1h table (as the rollup would write).
++        {
++            let conn = db.inner.lock().await;
++            conn.execute(
++                "INSERT INTO snapshots_1h \
++                 (engine_key, bucket_ts, prompt_tps_avg, decode_tps_avg, sample_count) \
++                 VALUES (?1, ?2, 10.0, 42.0, 60)",
++                params![key, h1],
++            )
++            .unwrap();
++        }
++
++        // Live 1s data only in the CURRENT hour (previous hour was pruned).
++        db.insert_1s(
++            key,
++            h2 + 1000,
++            Some(0),
++            Some(0),
++            Some(0),
++            None,
++            Some(99.0),
++            None,
++            None,
++            None,
++            None,
++            None,
++            None,
++            None,
++            None,
++            None,
++            None,
++            None,
++            None,
++            None,
++            None,
++            None,
++            None,
++        )
++        .await
++        .unwrap();
++
++        // Window starts mid-PREVIOUS-hour (like the frontend's [now-60min,
++        // now] when now is 30 min past the hour): `since` lands mid-h1, so
++        // the completed h1 bucket STRADDLES the window start.
++        let since = now - 1_800_000;
++        let until = now + 1000;
++        assert!(
++            since > h1,
++            "since must be mid-way through the previous hour (h1)"
++        );
++
++        let points = db
++            .query_timeseries(key, "decode_tps", since, until)
++            .await
++            .unwrap();
++
++        // 2 points: the clamped straddle bucket + the current-hour 1s point.
++        assert_eq!(
++            points.len(),
++            2,
++            "straddle bucket + current-hour point, got {points:?}"
++        );
++        // NO point before the window start — the axis stays 1h wide.
++        assert!(
++            points[0].timestamp_ms >= since,
++            "straddle bucket must be clamped into the window: got {} < {since}",
++            points[0].timestamp_ms
++        );
++        // Its value is the straddle bucket's (42.0), not the current hour's.
++        assert!(
++            (points[0].value - 42.0).abs() < f64::EPSILON,
++            "clamped point should carry the straddle bucket's value, got {}",
++            points[0].value
++        );
++        // The 1s point survives at its own timestamp.
++        assert!(
++            (points[1].value - 99.0).abs() < f64::EPSILON,
++            "current-hour point should be the 1s sample, got {}",
++            points[1].value
++        );
++    }
++
++    /// When raw 1s data ALREADY covers part of the straddling hour inside
++    /// the window (1s retention ≈ 1h ≫ typical 1m/5m seed window), the
++    /// completed-hour rollup bucket must be SUPPRESSED: mixing in its
++    /// hour-wide average puts an artificial value-jump point at the window's
++    /// left edge of every 1m/5m/1h chart queried in the first minutes of an
++    /// hour. The raw 1s rows are the truthful data for that stretch.
++    #[tokio::test]
++    async fn test_timeseries_straddle_bucket_suppressed_when_raw_covers_window() {
++        let db = test_db();
++        let key = "cover-engine";
++        // Fixed epoch — fully deterministic, no wall clock.
++        let h1 = 360_000_000_000i64; // previous (completed) hour bucket
++        let h2 = h1 + 3_600_000; // current (incomplete) hour bucket
++        let now = h2 + 1_200_000; // 20 min into the current hour
++
++        // Completed previous hour in the 1h table with an hour-wide average
++        // (42.0) that differs wildly from the raw 1s samples (99.0) — the
++        // artifact source this test pins down.
++        {
++            let conn = db.inner.lock().await;
++            conn.execute(
++                "INSERT INTO snapshots_1h \
++                 (engine_key, bucket_ts, prompt_tps_avg, decode_tps_avg, sample_count) \
++                 VALUES (?1, ?2, 10.0, 42.0, 60)",
++                params![key, h1],
++            )
++            .unwrap();
++        }
++
++        // Raw 1s data in the PREVIOUS hour inside the window (un-pruned),
++        // plus some in the current hour.
++        for ts in [h1 + 3_000_000, h1 + 3_000_500, h2 + 1000] {
++            db.insert_1s(
++                key,
++                ts,
++                Some(0),
++                Some(0),
++                Some(0),
++                None,
++                Some(99.0),
++                None,
++                None,
++                None,
++                None,
++                None,
++                None,
++                None,
++                None,
++                None,
++                None,
++                None,
++                None,
++                None,
++                None,
++                None,
++                None,
++            )
++            .await
++            .unwrap();
++        }
++
++        // Same geometry as the pruned case: window starts mid-h1 (10 min
++        // before the boundary), straddling the h1 bucket.
++        let since = now - 1_800_000;
++        let until = now + 1000;
++        assert!(since > h1, "window must straddle the h1/h2 boundary");
++
++        let points = db
++            .query_timeseries(key, "decode_tps", since, until)
++            .await
++            .unwrap();
++
++        // The h1 rollup bucket (42.0) is GONE — raw 1s rows cover that
++        // stretch. Only raw-derived points remain, none carrying 42.0.
++        assert!(
++            points.iter().all(|p| (p.value - 42.0).abs() > f64::EPSILON),
++            "straddle rollup bucket must be suppressed when 1s data covers the stretch: {points:?}"
++        );
++        // The pre-boundary raw rows survive (the window's left stretch is
++        // covered by real data, not an hour-wide average).
++        assert!(
++            points
++                .iter()
++                .any(|p| p.timestamp_ms >= since && p.timestamp_ms < h2),
++            "raw 1s rows from the previous hour must remain, got {points:?}"
++        );
++        // Every point still sits inside the window (clamp contract holds).
++        assert!(
++            points
++                .iter()
++                .all(|p| p.timestamp_ms >= since && p.timestamp_ms <= until),
++            "all points must stay inside [since, until], got {points:?}"
++        );
++    }
++
+     #[tokio::test]
+     async fn test_timeseries_mem_used_pct_only_in_1s() {
+         let db = test_db();
