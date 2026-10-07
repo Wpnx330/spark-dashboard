@@ -487,7 +487,10 @@ impl HistoryDb {
         Ok(rows as u64)
     }
 
-    /// Roll up completed days from hourly data.
+    /// Roll up hourly rows into daily buckets keyed on the timezone-shifted
+    /// day grid: the current (partial) day re-aggregated up to now, plus the
+    /// previous `DAILY_ROLLUP_LOOKBACK_DAYS - 1` completed days. Idempotent
+    /// per tick; safe to run repeatedly.
     pub async fn rollup_1h_to_1d(&self, day_offset_ms: Option<i64>) -> rusqlite::Result<u64> {
         let db = self.inner.lock().await;
         let day_offset_ms = match day_offset_ms {
@@ -504,7 +507,6 @@ impl HistoryDb {
         // Checkpoint WAL to prevent "disk I/O error" on large rollups.
         let _ = db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
         let now_ms = chrono_now_ms();
-        let current_day_start = (now_ms / 86_400_000) * 86_400_000;
         // Key of the current (incomplete) day bucket on the shifted-day grid
         // the daily table uses ((t - offset) floored to UTC day, + offset).
         // The lookback bound is aligned to this grid — NOT to UTC midnights —
@@ -548,6 +550,13 @@ impl HistoryDb {
         // ttft_ms_p95/itl_ms_p95/e2e_ms_p95 (AVG approximation) and
         // queue_time_ms_avg/tpot_ms_avg; we average them across hours for
         // the daily bucket.
+        //
+        // The upper bound is `now_ms`, NOT the last UTC midnight: the current
+        // shifted-day bucket straddles UTC midnight whenever utc_offset != 0,
+        // so a UTC-midnight bound would freeze it at its pre-midnight
+        // fragment. Re-aggregating up to now on every tick keeps the partial
+        // day complete; recomputing GROUP BY + SUM over the 1h source makes
+        // repeated ticks idempotent (no double counting).
         let rows = db.execute(
             "INSERT INTO snapshots_1d
              (engine_key, bucket_ts,
@@ -603,7 +612,7 @@ impl HistoryDb {
                queue_time_ms_avg = excluded.queue_time_ms_avg,
                tpot_ms_avg = excluded.tpot_ms_avg,
                spec_decode_acceptance_rate_avg = excluded.spec_decode_acceptance_rate_avg",
-            params![current_day_start, day_offset_ms, lookback_start],
+            params![now_ms, day_offset_ms, lookback_start],
         )?;
 
         // Prune hourly data older than 30 days
@@ -1284,6 +1293,24 @@ mod tests {
                 .unwrap(),
             None => conn.query_row(&sql, params![engine_key], mapper).unwrap(),
         }
+    }
+
+    /// Read (bucket_ts, total_prompt_tokens, sample_count) for every daily
+    /// row of one engine, ordered by bucket_ts.
+    async fn read_1d_rows(db: &HistoryDb, engine_key: &str) -> Vec<(i64, i64, i64)> {
+        let c = db.inner.lock().await;
+        let mut stmt = c
+            .prepare(
+                "SELECT bucket_ts, total_prompt_tokens, sample_count \
+                 FROM snapshots_1d WHERE engine_key = ?1 ORDER BY bucket_ts",
+            )
+            .unwrap();
+        stmt.query_map(params![engine_key], |r| {
+            Ok((r.get(0).unwrap(), r.get(1).unwrap(), r.get(2).unwrap()))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
     }
 
     /// Open an in-memory database for testing (skipping file I/O).
@@ -3219,6 +3246,137 @@ mod tests {
         let want = ((any_t - ofs_ms) / 86_400_000) * 86_400_000 + ofs_ms;
         assert_eq!(bts, want, "daily bucket = LOCAL-midnight key");
         assert_eq!(sum, 4000 + 6, "token sums preserved across boundary");
+    }
+
+    /// REGRESSION (1007): the CURRENT shifted-day bucket straddles UTC
+    /// midnight (utc_offset = -4 => key at 20:00Z). The rollup's upper bound
+    /// must be `now`, not the last UTC midnight, or the current day's row is
+    /// frozen at its pre-midnight fragment (observed in production:
+    /// sample_count 14400 instead of 86400) until the NEXT UTC midnight.
+    /// Expected values are derived with the same day-bucket formula and the
+    /// same `ts < now` bound the rollup uses, so the test is deterministic at
+    /// any wall-clock time; the post-midnight members make it fail on the old
+    /// UTC-midnight bound whenever "now" is past midnight (>= 8pm ET).
+    #[tokio::test]
+    async fn test_rollup_1h_to_1d_current_shifted_day_includes_post_utc_midnight_hours() {
+        let db = test_db();
+        let key = "tz-now";
+        let ofs_ms: i64 = -4 * 3_600_000;
+        let now = chrono_now_ms();
+        let utc_midnight = (now / 86_400_000) * 86_400_000;
+        let day_key = ((now - ofs_ms) / 86_400_000) * 86_400_000 + ofs_ms;
+
+        // Two hours before today's UTC midnight (20:00Z, 21:00Z of the current
+        // ET day) and two after (00:00Z, 01:00Z). Tokens encode the hour so
+        // the expected sum is unambiguous.
+        let hours = [
+            day_key,
+            day_key + 3_600_000,
+            utc_midnight,
+            utc_midnight + 3_600_000,
+        ];
+        {
+            let c = db.inner.lock().await;
+            for ts in hours {
+                let tok = 1000 + (ts - day_key) / 3_600_000;
+                c.execute(
+                    "INSERT INTO snapshots_1h (engine_key,bucket_ts,total_prompt_tokens,sample_count) VALUES (?1,?2,?3,3600)",
+                    rusqlite::params![key, ts, tok],
+                )
+                .unwrap();
+            }
+        }
+
+        db.rollup_1h_to_1d(Some(ofs_ms)).await.unwrap();
+
+        // Same composition rule as the rollup itself: member of the current
+        // shifted day AND below the upper bound (now).
+        let members: Vec<i64> = hours
+            .iter()
+            .filter(|t| **t < now && ((**t - ofs_ms) / 86_400_000) * 86_400_000 + ofs_ms == day_key)
+            .copied()
+            .collect();
+        let want_tok: i64 = members
+            .iter()
+            .map(|ts| 1000 + (ts - day_key) / 3_600_000)
+            .sum();
+        let want_sc: i64 = members.len() as i64 * 3600;
+
+        let rows = read_1d_rows(&db, key).await;
+        let cur: Vec<_> = rows
+            .iter()
+            .filter(|(b, _, _)| *b == day_key)
+            .copied()
+            .collect();
+        assert_eq!(cur.len(), 1, "exactly one daily row for the current day");
+        let (_, p_tok, sc) = cur[0];
+        assert_eq!(
+            p_tok, want_tok,
+            "current-day row must include ALL member hours up to now"
+        );
+        assert_eq!(sc, want_sc, "sample_count must cover the same hours");
+    }
+
+    /// Repeated ticks must converge: ON CONFLICT DO UPDATE recomputes the
+    /// daily rows from the 1h source each time, so two consecutive rollups
+    /// leave identical rows (no double counting).
+    #[tokio::test]
+    async fn test_rollup_1h_to_1d_idempotent_across_ticks() {
+        let db = test_db();
+        let key = "tz-idem";
+        let ofs_ms: i64 = -4 * 3_600_000;
+        let now = chrono_now_ms();
+        let utc_midnight = (now / 86_400_000) * 86_400_000;
+        let day_key = ((now - ofs_ms) / 86_400_000) * 86_400_000 + ofs_ms;
+        {
+            let c = db.inner.lock().await;
+            for ts in [day_key, day_key + 3_600_000, utc_midnight] {
+                c.execute(
+                    "INSERT INTO snapshots_1h (engine_key,bucket_ts,total_prompt_tokens,sample_count) VALUES (?1,?2,?3,3600)",
+                    rusqlite::params![key, ts, 4242],
+                )
+                .unwrap();
+            }
+        }
+        db.rollup_1h_to_1d(Some(ofs_ms)).await.unwrap();
+        let first = read_1d_rows(&db, key).await;
+        db.rollup_1h_to_1d(Some(ofs_ms)).await.unwrap();
+        let second = read_1d_rows(&db, key).await;
+        assert_eq!(first, second, "second tick must not change any daily row");
+    }
+
+    /// A completed shifted day (all 24 hourly rows in the past) aggregates to
+    /// one daily row whose totals equal the sum of its hours — the lookback
+    /// path is unchanged by the current-day fix.
+    #[tokio::test]
+    async fn test_rollup_1h_to_1d_completed_shifted_day_totals() {
+        let db = test_db();
+        let key = "tz-full";
+        let ofs_ms: i64 = -4 * 3_600_000;
+        let now = chrono_now_ms();
+        let cur_key = ((now - ofs_ms) / 86_400_000) * 86_400_000 + ofs_ms;
+        let prev_key = cur_key - 86_400_000; // fully completed ET day
+        {
+            let c = db.inner.lock().await;
+            for h in 0..24 {
+                c.execute(
+                    "INSERT INTO snapshots_1h (engine_key,bucket_ts,total_prompt_tokens,sample_count) VALUES (?1,?2,?3,3600)",
+                    rusqlite::params![key, prev_key + h * 3_600_000, 100 + h],
+                )
+                .unwrap();
+            }
+        }
+        db.rollup_1h_to_1d(Some(ofs_ms)).await.unwrap();
+        let rows = read_1d_rows(&db, key).await;
+        let prev: Vec<_> = rows
+            .iter()
+            .filter(|(b, _, _)| *b == prev_key)
+            .copied()
+            .collect();
+        assert_eq!(prev.len(), 1, "one row for the completed day");
+        let (_, p_tok, sc) = prev[0];
+        assert_eq!(p_tok, (100..124).sum::<i64>());
+        assert_eq!(sc, 24 * 3600);
     }
 
     /// FIX 2: migrate() backfills legacy NULL sample_count/power.
