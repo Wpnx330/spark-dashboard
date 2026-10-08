@@ -26,6 +26,7 @@ jobs:
           filters: |
             rust:
               - 'src/**'
+              - 'rust-toolchain.toml'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'frontend/**'
