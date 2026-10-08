@@ -1,2 +1,6 @@
+# Pinned to the toolchain that builds the deployed DGX binaries (1.96.1).
+# Components declared here so CI's rustup install (minimal profile) gets
+# rustfmt + clippy, matching what the release builds use.
 [toolchain]
 channel = "1.96.1"
+components = ["rustfmt", "clippy"]

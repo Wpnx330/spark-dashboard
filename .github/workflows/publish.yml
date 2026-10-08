@@ -17,6 +17,10 @@ jobs:
   crates-io:
     name: Publish to crates.io
     runs-on: ubuntu-24.04-arm
+    # secrets context is NOT allowed in step-level `if:` — gate via job env
+    # (job env MAY use secrets) so the step conditions only read env.
+    env:
+      CARGO_TOKEN_SET: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -41,11 +45,11 @@ jobs:
         run: cargo package --list --locked --allow-dirty
 
       - name: Note (fork does not publish to crates.io)
-        if: ${{ secrets.CARGO_REGISTRY_TOKEN == '' }}
+        if: env.CARGO_TOKEN_SET == 'false'
         run: echo "CARGO_REGISTRY_TOKEN not set — skipping crates.io publish (name owned by upstream niklasfrick). Releases are tag-only for this fork."
 
       - name: Publish
+        if: env.CARGO_TOKEN_SET == 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        if: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
         run: cargo publish --locked --allow-dirty
