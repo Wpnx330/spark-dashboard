@@ -8,6 +8,9 @@ permissions:
   contents: write
   pull-requests: write
 
+# Tags + changelog + version-bump PRs only. No crates.io publishing:
+# the crate name is owned by upstream niklasfrick; deploys are
+# `cargo install --path` on-node, so releases are tag-only for this fork.
 jobs:
   release-please:
     runs-on: ubuntu-latest
@@ -21,11 +24,3 @@ jobs:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
-
-  publish:
-    needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
-    uses: ./.github/workflows/publish.yml
-    with:
-      tag_name: ${{ needs.release-please.outputs.tag_name }}
-    secrets: inherit
