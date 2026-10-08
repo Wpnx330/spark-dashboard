@@ -4,6 +4,19 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::info;
 
+/// How many recent days the 1h→1d rollup re-aggregates on each tick: the
+/// current (partial) day plus the previous `DAILY_ROLLUP_LOOKBACK_DAYS - 1`
+/// completed days. Days older than this window are NEVER touched by the
+/// rollup.
+///
+/// WHY bounded: the same rollup prunes hourly rows older than 30 days, so
+/// re-aggregating an old day from its (partially pruned) hourly sources
+/// OVERWRITES the stored daily totals with a shrinking remainder — the cause
+/// of the ever-decreasing "All time" cost-avoided total. Once a day's last
+/// hourly row is pruned, the daily row would be frozen at whatever the last
+/// partial aggregation produced (e.g. sample_count=3600 instead of 86400).
+const DAILY_ROLLUP_LOOKBACK_DAYS: i64 = 3;
+
 /// Thread-safe handle to the history database.
 #[derive(Clone)]
 pub struct HistoryDb {
@@ -474,7 +487,10 @@ impl HistoryDb {
         Ok(rows as u64)
     }
 
-    /// Roll up completed days from hourly data.
+    /// Roll up hourly rows into daily buckets keyed on the timezone-shifted
+    /// day grid: the current (partial) day re-aggregated up to now, plus the
+    /// previous `DAILY_ROLLUP_LOOKBACK_DAYS - 1` completed days. Idempotent
+    /// per tick; safe to run repeatedly.
     pub async fn rollup_1h_to_1d(&self, day_offset_ms: Option<i64>) -> rusqlite::Result<u64> {
         let db = self.inner.lock().await;
         let day_offset_ms = match day_offset_ms {
@@ -491,13 +507,56 @@ impl HistoryDb {
         // Checkpoint WAL to prevent "disk I/O error" on large rollups.
         let _ = db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
         let now_ms = chrono_now_ms();
-        let current_day_start = (now_ms / 86_400_000) * 86_400_000;
+        // Key of the current (incomplete) day bucket on the shifted-day grid
+        // the daily table uses ((t - offset) floored to UTC day, + offset).
+        // The lookback bound is aligned to this grid — NOT to UTC midnights —
+        // so a day bucket is either fully re-aggregated or not touched at all.
+        // A UTC-midnight bound would straddle day buckets whenever
+        // utc_offset != 0 and partially rewrite them on their way out of the
+        // window (the same frozen-partial-row defect as pruned sources).
+        let shifted_today_start =
+            ((now_ms - day_offset_ms) / 86_400_000) * 86_400_000 + day_offset_ms;
+        let lookback_start = shifted_today_start - (DAILY_ROLLUP_LOOKBACK_DAYS - 1) * 86_400_000;
+
+        // Merge duplicate daily buckets before the re-aggregation. Rows
+        // written before the utc_offset feature was introduced are keyed at
+        // UTC midnights, rows written after are keyed on the shifted grid, so
+        // the same calendar day can exist twice (double-counted in range
+        // sums). Partition rows by the day-bucket formula the rollup itself
+        // uses; keep the row with the most samples (tie-break: more prompt
+        // tokens) and delete the rest. Idempotent: once a single row remains
+        // per day bucket, every row ranks rn = 1 and nothing is deleted.
+        // Safe to run on every rollup tick.
+        let deduped = db.execute(
+            "WITH ranked AS (
+                 SELECT rowid AS rid, ROW_NUMBER() OVER (
+                     PARTITION BY engine_key,
+                                  ((bucket_ts - ?1) / 86400000) * 86400000 + ?1
+                     ORDER BY sample_count DESC,
+                              COALESCE(total_prompt_tokens, 0) DESC,
+                              rowid ASC
+                 ) AS rn
+                 FROM snapshots_1d
+             )
+             DELETE FROM snapshots_1d WHERE rowid IN (SELECT rid FROM ranked WHERE rn > 1)",
+            params![day_offset_ms],
+        )?;
+        if deduped > 0 {
+            info!("History: merged {} duplicate daily bucket rows", deduped);
+        }
 
         // Same latency-column + ON CONFLICT DO UPDATE pattern as the 1s→1h
         // rollup: ON CONFLICT refreshes ALL columns. The 1h table stores
         // ttft_ms_p95/itl_ms_p95/e2e_ms_p95 (AVG approximation) and
         // queue_time_ms_avg/tpot_ms_avg; we average them across hours for
         // the daily bucket.
+        //
+        // The upper bound is `now_ms`, NOT the last UTC midnight: the current
+        // shifted-day bucket straddles UTC midnight whenever utc_offset != 0,
+        // so a UTC-midnight bound would freeze it at its pre-midnight
+        // fragment. Re-aggregating up to now on every tick keeps the partial
+        // day complete; recomputing GROUP BY + SUM over the 1h source makes
+        // repeated ticks idempotent (no double counting).
         let rows = db.execute(
             "INSERT INTO snapshots_1d
              (engine_key, bucket_ts,
@@ -524,9 +583,9 @@ impl HistoryDb {
                AVG(kv_cache_pct_avg), MAX(kv_cache_pct_max), AVG(prefix_cache_hit_avg),
                AVG(cpu_util_avg), SUM(sample_count), MAX(preemptions_total),
                AVG(queue_time_ms_avg), AVG(tpot_ms_avg), AVG(spec_decode_acceptance_rate_avg)
-              FROM snapshots_1h
-             WHERE bucket_ts < ?1
-             GROUP BY engine_key, ((bucket_ts - ?2) / 86400000) * 86400000 + ?2
+               FROM snapshots_1h
+              WHERE bucket_ts < ?1 AND bucket_ts >= ?3
+              GROUP BY engine_key, ((bucket_ts - ?2) / 86400000) * 86400000 + ?2
              ON CONFLICT(engine_key, bucket_ts) DO UPDATE SET
                total_prompt_tokens = excluded.total_prompt_tokens,
                total_gen_tokens = excluded.total_gen_tokens,
@@ -553,7 +612,7 @@ impl HistoryDb {
                queue_time_ms_avg = excluded.queue_time_ms_avg,
                tpot_ms_avg = excluded.tpot_ms_avg,
                spec_decode_acceptance_rate_avg = excluded.spec_decode_acceptance_rate_avg",
-            params![current_day_start, day_offset_ms],
+            params![now_ms, day_offset_ms, lookback_start],
         )?;
 
         // Prune hourly data older than 30 days
@@ -706,14 +765,48 @@ impl HistoryDb {
         let range_ms = until_ms.saturating_sub(since_ms);
 
         if range_ms <= HOUR_MS {
-            // For ranges ≤ 1h we query BOTH the 1h table (completed hour
-            // buckets that have already been rolled up and pruned from 1s)
-            // AND the 1s table (current incomplete hour).  This prevents
-            // empty charts when the rollup has already deleted the 1s data
-            // for the earlier part of the requested range.
-            let mut points = Vec::new();
+            // For ranges ≤ 1h we query BOTH the 1s table (raw data for the
+            // current, not-yet-rolled-up stretch) AND the 1h table (completed
+            // hour buckets whose 1s data has already been rolled up and
+            // pruned).  This prevents empty charts when the rollup has
+            // already deleted the 1s data for the earlier part of the
+            // requested range — but a completed-hour bucket is only used
+            // when the raw 1s data does NOT already reach back to the
+            // window's start (see the coverage check below).
+            let bucket_ms = bucket_size_ms(range_ms);
+            let sql_raw = format!(
+                "SELECT MAX((ts / {bucket_ms}) * {bucket_ms}, ?2) AS bucket_ts, \
+                 MIN(ts) AS min_ts, \
+                 {agg_func}({col}) AS value \
+                 FROM snapshots_1s \
+                 WHERE engine_key = ?1 AND ts >= ?2 AND ts <= ?3 \
+                 GROUP BY bucket_ts \
+                 ORDER BY bucket_ts ASC",
+                col = raw_col,
+                bucket_ms = bucket_ms,
+                agg_func = agg_func,
+            );
+            let mut stmt = db.prepare(&sql_raw)?;
+            // (bucket_ts, min sample ts in bucket, aggregated value)
+            let raw_points = stmt
+                .query_map(params![engine_key, since_ms, until_ms], |r| {
+                    let bucket_ts: i64 = r.get(0)?;
+                    let min_ts: i64 = r.get(1)?;
+                    let val: Option<f64> = r.get(2)?;
+                    Ok((bucket_ts, min_ts, val.unwrap_or(0.0)))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            // Raw points go in first: when both sources produce the same
+            // timestamp after the sort below, the raw 1s value wins.
+            let mut points: Vec<TimeSeriesPoint> = raw_points
+                .iter()
+                .map(|(bucket_ts, _, value)| TimeSeriesPoint {
+                    timestamp_ms: *bucket_ts,
+                    value: *value,
+                })
+                .collect();
 
-            // Part 1: aggregated 1h buckets that fall within the range.
+            // Completed-hour rollup buckets within the range.
             if let Some(agg) = agg_col {
                 let value_expr = if metric == "power_watts" {
                     format!("{agg} / NULLIF(sample_count, 0)")
@@ -727,54 +820,59 @@ impl HistoryDb {
                 );
                 let mut stmt = db.prepare(&sql_agg)?;
                 // Include the complete hour STRADDLING `since`: when the
-                // range starts mid-hour, that earlier bucket is the only
-                // data covering [since, next-hour-start) after 1s pruning.
+                // range starts mid-hour and the 1s data for that stretch was
+                // already rolled up + pruned, that earlier bucket is the
+                // only data covering [since, next-hour-start).
                 let since_hour = (since_ms / 3_600_000) * 3_600_000;
                 let agg_points = stmt
                     .query_map(params![engine_key, since_hour, until_ms], |r| {
-                        let ts: i64 = r.get(0)?;
+                        let bucket_ts: i64 = r.get(0)?;
+                        // Clamp the straddling bucket's timestamp INTO the
+                        // requested window. Its value legitimately covers
+                        // [since, next-hour-start), but reporting it at its
+                        // raw (earlier) timestamp makes clients with a fixed
+                        // x-domain expand that domain backwards — the 1h
+                        // chart rendered a ~2h axis with data scrunched into
+                        // the right half.
+                        let ts = bucket_ts.max(since_ms);
                         let val: Option<f64> = r.get(1)?;
-                        Ok(TimeSeriesPoint {
-                            timestamp_ms: ts,
-                            value: val.unwrap_or(0.0),
-                        })
+                        Ok((bucket_ts, ts, val.unwrap_or(0.0)))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
-                points.extend(agg_points);
+                // Skip the full-hour average when raw 1s rows already reach
+                // back to the window's start: with ~1h of 1s retention a
+                // 60s/300s window almost always has raw rows, and mixing in
+                // the bucket's hour-wide average puts an artificial
+                // value-jump point at the window's left edge. "Reached the
+                // start" means the earliest raw sample sits within one
+                // bucket width of `since_ms`. The raw query filters
+                // `ts >= since_ms`, so min_ts >= since_ms always — a
+                // `<= since_ms` comparison would degenerate to
+                // exact-millisecond equality, which continuous 1s sampling
+                // (arbitrary sub-second phase vs the client's Date.now())
+                // essentially never produces. `min_ts < since_ms +
+                // bucket_ms` holds for continuous coverage (the first
+                // sample lands within ~1s of `since` and bucket_ms >= 1s)
+                // and fails whenever raw starts late (post-prune or engine
+                // restart), in which case the hour-wide average still
+                // fills the uncovered stretch.
+                let covered = raw_points
+                    .iter()
+                    .any(|(_, min_ts, _)| *min_ts < since_ms + bucket_ms);
+                for (_bucket_ts, ts, value) in agg_points {
+                    if !covered {
+                        points.push(TimeSeriesPoint {
+                            timestamp_ms: ts,
+                            value,
+                        });
+                    }
+                }
             }
 
-            // Part 2: raw 1s data for the current (incomplete) hour,
-            // aggregated into time buckets (~360 across the range) with the
-            // metric-appropriate function, so gauge peaks aren't averaged
-            // into a saw-tooth and the returned point count stays bounded.
-            let bucket_ms = bucket_size_ms(range_ms);
-            let sql_raw = format!(
-                "SELECT (ts / {bucket_ms}) * {bucket_ms} AS bucket_ts, \
-                 {agg_func}({col}) AS value \
-                 FROM snapshots_1s \
-                 WHERE engine_key = ?1 AND ts >= ?2 AND ts <= ?3 \
-                 GROUP BY bucket_ts \
-                 ORDER BY bucket_ts ASC",
-                col = raw_col,
-                bucket_ms = bucket_ms,
-                agg_func = agg_func,
-            );
-            let mut stmt = db.prepare(&sql_raw)?;
-            let raw_points = stmt
-                .query_map(params![engine_key, since_ms, until_ms], |r| {
-                    let ts: i64 = r.get(0)?;
-                    let val: Option<f64> = r.get(1)?;
-                    Ok(TimeSeriesPoint {
-                        timestamp_ms: ts,
-                        value: val.unwrap_or(0.0),
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            points.extend(raw_points);
-
-            // Deduplicate by timestamp (1h bucket_ts and 1s ts won't
-            // overlap, but sort to be safe).
+            // Sort ascending; drop duplicate timestamps (the raw point,
+            // inserted first, wins the stable sort and the dedupe).
             points.sort_by_key(|p| p.timestamp_ms);
+            points.dedup_by(|a, b| a.timestamp_ms == b.timestamp_ms);
             Ok(points)
         } else {
             // Aggregated table (1h or 1d).
@@ -1195,6 +1293,24 @@ mod tests {
                 .unwrap(),
             None => conn.query_row(&sql, params![engine_key], mapper).unwrap(),
         }
+    }
+
+    /// Read (bucket_ts, total_prompt_tokens, sample_count) for every daily
+    /// row of one engine, ordered by bucket_ts.
+    async fn read_1d_rows(db: &HistoryDb, engine_key: &str) -> Vec<(i64, i64, i64)> {
+        let c = db.inner.lock().await;
+        let mut stmt = c
+            .prepare(
+                "SELECT bucket_ts, total_prompt_tokens, sample_count \
+                 FROM snapshots_1d WHERE engine_key = ?1 ORDER BY bucket_ts",
+            )
+            .unwrap();
+        stmt.query_map(params![engine_key], |r| {
+            Ok((r.get(0).unwrap(), r.get(1).unwrap(), r.get(2).unwrap()))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
     }
 
     /// Open an in-memory database for testing (skipping file I/O).
@@ -2186,6 +2302,305 @@ mod tests {
         );
     }
 
+    /// When the requested range starts mid-hour, the completed-hour bucket
+    /// that STRADDLES `since` must be included ONLY when raw 1s data does
+    /// not already cover part of that hour inside the window (1s data was
+    /// rolled up + pruned), and its timestamp must be clamped to `since`
+    /// so clients with a fixed [since, until] x-domain don't expand it
+    /// backwards (~2h axis on a 1h chart).
+    #[tokio::test]
+    async fn test_timeseries_1h_range_includes_straddle_bucket_clamped() {
+        let db = test_db();
+        let key = "straddle-engine";
+        // Fixed epoch — fully deterministic, no wall clock. h1 must be
+        // hour-aligned (divisible by 3_600_000) so the SQL floor matches.
+        let h1 = 360_000_000_000i64; // previous (completed) hour bucket
+        let h2 = h1 + 3_600_000; // current (incomplete) hour bucket
+        let now = h2 + 1_200_000; // 20 min into the current hour
+                                  // → since = now − 30 min = 50 min into h1: STRADDLE.
+
+        // Completed previous hour in the 1h table (as the rollup would write).
+        {
+            let conn = db.inner.lock().await;
+            conn.execute(
+                "INSERT INTO snapshots_1h \
+                 (engine_key, bucket_ts, prompt_tps_avg, decode_tps_avg, sample_count) \
+                 VALUES (?1, ?2, 10.0, 42.0, 60)",
+                params![key, h1],
+            )
+            .unwrap();
+        }
+
+        // Live 1s data only in the CURRENT hour (previous hour was pruned).
+        db.insert_1s(
+            key,
+            h2 + 1000,
+            Some(0),
+            Some(0),
+            Some(0),
+            None,
+            Some(99.0),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Window starts mid-PREVIOUS-hour (like the frontend's [now-60min,
+        // now] when now is 30 min past the hour): `since` lands mid-h1, so
+        // the completed h1 bucket STRADDLES the window start.
+        let since = now - 1_800_000;
+        let until = now + 1000;
+        assert!(
+            since > h1,
+            "since must be mid-way through the previous hour (h1)"
+        );
+
+        let points = db
+            .query_timeseries(key, "decode_tps", since, until)
+            .await
+            .unwrap();
+
+        // 2 points: the clamped straddle bucket + the current-hour 1s point.
+        assert_eq!(
+            points.len(),
+            2,
+            "straddle bucket + current-hour point, got {points:?}"
+        );
+        // NO point before the window start — the axis stays 1h wide.
+        assert!(
+            points[0].timestamp_ms >= since,
+            "straddle bucket must be clamped into the window: got {} < {since}",
+            points[0].timestamp_ms
+        );
+        // Its value is the straddle bucket's (42.0), not the current hour's.
+        assert!(
+            (points[0].value - 42.0).abs() < f64::EPSILON,
+            "clamped point should carry the straddle bucket's value, got {}",
+            points[0].value
+        );
+        // The 1s point survives at its own timestamp.
+        assert!(
+            (points[1].value - 99.0).abs() < f64::EPSILON,
+            "current-hour point should be the 1s sample, got {}",
+            points[1].value
+        );
+    }
+
+    /// When raw 1s data ALREADY covers part of the straddling hour inside
+    /// the window (1s retention ≈ 1h ≫ typical 1m/5m seed window), the
+    /// completed-hour rollup bucket must be SUPPRESSED: mixing in its
+    /// hour-wide average puts an artificial value-jump point at the window's
+    /// left edge of every 1m/5m/1h chart queried in the first minutes of an
+    /// hour. The raw 1s rows are the truthful data for that stretch.
+    #[tokio::test]
+    async fn test_timeseries_straddle_bucket_suppressed_when_raw_covers_window() {
+        let db = test_db();
+        let key = "cover-engine";
+        // Fixed epoch — fully deterministic, no wall clock.
+        let h1 = 360_000_000_000i64; // previous (completed) hour bucket
+        let h2 = h1 + 3_600_000; // current (incomplete) hour bucket
+        let now = h2 + 1_200_000; // 20 min into the current hour
+
+        // Completed previous hour in the 1h table with an hour-wide average
+        // (42.0) that differs wildly from the raw 1s samples (99.0) — the
+        // artifact source this test pins down.
+        {
+            let conn = db.inner.lock().await;
+            conn.execute(
+                "INSERT INTO snapshots_1h \
+                 (engine_key, bucket_ts, prompt_tps_avg, decode_tps_avg, sample_count) \
+                 VALUES (?1, ?2, 10.0, 42.0, 60)",
+                params![key, h1],
+            )
+            .unwrap();
+        }
+
+        // Raw 1s data in the PREVIOUS hour inside the window (un-pruned),
+        // plus some in the current hour. Geometry chosen to make this test
+        // FAIL under the degenerate `min_ts <= since_ms` check (the round-3
+        // regression): `since` = h1+3_000_000 is deliberately UNALIGNED on
+        // the query's 5002ms bucket grid (since % B = 1378), and the first
+        // raw rows sit at since+3624 / since+3800 — inside the NEXT bucket
+        // (bucket_start = since+3624), which is within one bucket width of
+        // `since`, so the coverage check still suppresses. Because the raw
+        // query clamps bucket_ts up to `since` (MAX(bucket, since)), first
+        // rows in `since`'s OWN bucket would collide with the clamped
+        // rollup point and dedupe would mask the artifact; the next-bucket
+        // placement leaves the 42.0 visible if the check ever regresses.
+        for ts in [h1 + 3_003_624, h1 + 3_003_800, h2 + 1000] {
+            db.insert_1s(
+                key,
+                ts,
+                Some(0),
+                Some(0),
+                Some(0),
+                None,
+                Some(99.0),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Same geometry as the pruned case: window starts mid-h1 (10 min
+        // before the boundary), straddling the h1 bucket.
+        let since = now - 1_800_000;
+        let until = now + 1000;
+        assert!(since > h1, "window must straddle the h1/h2 boundary");
+
+        let points = db
+            .query_timeseries(key, "decode_tps", since, until)
+            .await
+            .unwrap();
+
+        // The h1 rollup bucket (42.0) is GONE — raw 1s rows cover that
+        // stretch. Only raw-derived points remain, none carrying 42.0.
+        assert!(
+            points.iter().all(|p| (p.value - 42.0).abs() > f64::EPSILON),
+            "straddle rollup bucket must be suppressed when 1s data covers the stretch: {points:?}"
+        );
+        // The pre-boundary raw rows survive (the window's left stretch is
+        // covered by real data, not an hour-wide average).
+        assert!(
+            points
+                .iter()
+                .any(|p| p.timestamp_ms >= since && p.timestamp_ms < h2),
+            "raw 1s rows from the previous hour must remain, got {points:?}"
+        );
+        // Every point still sits inside the window (clamp contract holds).
+        assert!(
+            points
+                .iter()
+                .all(|p| p.timestamp_ms >= since && p.timestamp_ms <= until),
+            "all points must stay inside [since, until], got {points:?}"
+        );
+    }
+
+    /// Companion to the suppression test above: when the raw 1s rows do
+    /// NOT reach back to the window's start, the straddling rollup bucket
+    /// must be KEPT — it is the only source covering [since, first raw
+    /// sample). The discriminating geometry vs the OLD per-bucket
+    /// existence check: raw rows exist INSIDE the straddling hour but
+    /// after `since` (engine restarted 5 min before the hour boundary) —
+    /// the old check suppressed the bucket there (leaving a hole), the
+    /// window-edge coverage check keeps it.
+    #[tokio::test]
+    async fn test_timeseries_straddle_bucket_kept_when_raw_misses_window_start() {
+        let db = test_db();
+        let key = "gap-engine";
+        // Same fixed epoch geometry: window starts 10 min before the h1/h2
+        // boundary; raw 1s data exists ONLY in the current hour h2.
+        let h1 = 360_000_000_000i64;
+        let h2 = h1 + 3_600_000;
+        let now = h2 + 1_200_000; // 20 min into the current hour
+
+        // Completed previous hour in the 1h table (hour-wide avg 42.0).
+        {
+            let conn = db.inner.lock().await;
+            conn.execute(
+                "INSERT INTO snapshots_1h \
+                 (engine_key, bucket_ts, prompt_tps_avg, decode_tps_avg, sample_count) \
+                 VALUES (?1, ?2, 10.0, 42.0, 60)",
+                params![key, h1],
+            )
+            .unwrap();
+        }
+
+        // Raw 1s data starts INSIDE the straddling hour but well after the
+        // window's start (since = h2 - 600_000): an engine restart 5 min
+        // before the h1/h2 boundary. Under the old per-bucket check this
+        // geometry suppressed the bucket (hole); the window-edge check
+        // keeps it.
+        for ts in [h2 - 300_000, h2 - 299_500, h2 + 1000] {
+            db.insert_1s(
+                key,
+                ts,
+                Some(0),
+                Some(0),
+                Some(0),
+                None,
+                Some(99.0),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let since = now - 1_800_000; // 10 min before the h1/h2 boundary
+        let until = now + 1000;
+        assert!(since > h1, "window must straddle the h1/h2 boundary");
+
+        let points = db
+            .query_timeseries(key, "decode_tps", since, until)
+            .await
+            .unwrap();
+
+        // The straddle bucket (42.0) is KEPT: raw coverage starts 5 min
+        // into the window (post-restart), so the hourly average is the
+        // only coverage for the [since, h2 - 300_000) stretch. Its
+        // timestamp is clamped to `since`.
+        let straddle = points
+            .iter()
+            .find(|p| (p.value - 42.0).abs() < f64::EPSILON)
+            .expect("straddle rollup bucket must be kept when raw misses window start");
+        assert_eq!(
+            straddle.timestamp_ms, since,
+            "straddle bucket must be clamped to the window start"
+        );
+        // Raw points from the current hour are present alongside it. (The
+        // raw bucket floor can land a hair before h2 when bucket_ms doesn't
+        // divide the hour — value, not position, identifies raw points here.)
+        assert!(
+            points.iter().any(|p| (p.value - 99.0).abs() < f64::EPSILON),
+            "raw 1s points must be present, got {points:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_timeseries_mem_used_pct_only_in_1s() {
         let db = test_db();
@@ -2833,6 +3248,137 @@ mod tests {
         assert_eq!(sum, 4000 + 6, "token sums preserved across boundary");
     }
 
+    /// REGRESSION (1007): the CURRENT shifted-day bucket straddles UTC
+    /// midnight (utc_offset = -4 => key at 20:00Z). The rollup's upper bound
+    /// must be `now`, not the last UTC midnight, or the current day's row is
+    /// frozen at its pre-midnight fragment (observed in production:
+    /// sample_count 14400 instead of 86400) until the NEXT UTC midnight.
+    /// Expected values are derived with the same day-bucket formula and the
+    /// same `ts < now` bound the rollup uses, so the test is deterministic at
+    /// any wall-clock time; the post-midnight members make it fail on the old
+    /// UTC-midnight bound whenever "now" is past midnight (>= 8pm ET).
+    #[tokio::test]
+    async fn test_rollup_1h_to_1d_current_shifted_day_includes_post_utc_midnight_hours() {
+        let db = test_db();
+        let key = "tz-now";
+        let ofs_ms: i64 = -4 * 3_600_000;
+        let now = chrono_now_ms();
+        let utc_midnight = (now / 86_400_000) * 86_400_000;
+        let day_key = ((now - ofs_ms) / 86_400_000) * 86_400_000 + ofs_ms;
+
+        // Two hours before today's UTC midnight (20:00Z, 21:00Z of the current
+        // ET day) and two after (00:00Z, 01:00Z). Tokens encode the hour so
+        // the expected sum is unambiguous.
+        let hours = [
+            day_key,
+            day_key + 3_600_000,
+            utc_midnight,
+            utc_midnight + 3_600_000,
+        ];
+        {
+            let c = db.inner.lock().await;
+            for ts in hours {
+                let tok = 1000 + (ts - day_key) / 3_600_000;
+                c.execute(
+                    "INSERT INTO snapshots_1h (engine_key,bucket_ts,total_prompt_tokens,sample_count) VALUES (?1,?2,?3,3600)",
+                    rusqlite::params![key, ts, tok],
+                )
+                .unwrap();
+            }
+        }
+
+        db.rollup_1h_to_1d(Some(ofs_ms)).await.unwrap();
+
+        // Same composition rule as the rollup itself: member of the current
+        // shifted day AND below the upper bound (now).
+        let members: Vec<i64> = hours
+            .iter()
+            .filter(|t| **t < now && ((**t - ofs_ms) / 86_400_000) * 86_400_000 + ofs_ms == day_key)
+            .copied()
+            .collect();
+        let want_tok: i64 = members
+            .iter()
+            .map(|ts| 1000 + (ts - day_key) / 3_600_000)
+            .sum();
+        let want_sc: i64 = members.len() as i64 * 3600;
+
+        let rows = read_1d_rows(&db, key).await;
+        let cur: Vec<_> = rows
+            .iter()
+            .filter(|(b, _, _)| *b == day_key)
+            .copied()
+            .collect();
+        assert_eq!(cur.len(), 1, "exactly one daily row for the current day");
+        let (_, p_tok, sc) = cur[0];
+        assert_eq!(
+            p_tok, want_tok,
+            "current-day row must include ALL member hours up to now"
+        );
+        assert_eq!(sc, want_sc, "sample_count must cover the same hours");
+    }
+
+    /// Repeated ticks must converge: ON CONFLICT DO UPDATE recomputes the
+    /// daily rows from the 1h source each time, so two consecutive rollups
+    /// leave identical rows (no double counting).
+    #[tokio::test]
+    async fn test_rollup_1h_to_1d_idempotent_across_ticks() {
+        let db = test_db();
+        let key = "tz-idem";
+        let ofs_ms: i64 = -4 * 3_600_000;
+        let now = chrono_now_ms();
+        let utc_midnight = (now / 86_400_000) * 86_400_000;
+        let day_key = ((now - ofs_ms) / 86_400_000) * 86_400_000 + ofs_ms;
+        {
+            let c = db.inner.lock().await;
+            for ts in [day_key, day_key + 3_600_000, utc_midnight] {
+                c.execute(
+                    "INSERT INTO snapshots_1h (engine_key,bucket_ts,total_prompt_tokens,sample_count) VALUES (?1,?2,?3,3600)",
+                    rusqlite::params![key, ts, 4242],
+                )
+                .unwrap();
+            }
+        }
+        db.rollup_1h_to_1d(Some(ofs_ms)).await.unwrap();
+        let first = read_1d_rows(&db, key).await;
+        db.rollup_1h_to_1d(Some(ofs_ms)).await.unwrap();
+        let second = read_1d_rows(&db, key).await;
+        assert_eq!(first, second, "second tick must not change any daily row");
+    }
+
+    /// A completed shifted day (all 24 hourly rows in the past) aggregates to
+    /// one daily row whose totals equal the sum of its hours — the lookback
+    /// path is unchanged by the current-day fix.
+    #[tokio::test]
+    async fn test_rollup_1h_to_1d_completed_shifted_day_totals() {
+        let db = test_db();
+        let key = "tz-full";
+        let ofs_ms: i64 = -4 * 3_600_000;
+        let now = chrono_now_ms();
+        let cur_key = ((now - ofs_ms) / 86_400_000) * 86_400_000 + ofs_ms;
+        let prev_key = cur_key - 86_400_000; // fully completed ET day
+        {
+            let c = db.inner.lock().await;
+            for h in 0..24 {
+                c.execute(
+                    "INSERT INTO snapshots_1h (engine_key,bucket_ts,total_prompt_tokens,sample_count) VALUES (?1,?2,?3,3600)",
+                    rusqlite::params![key, prev_key + h * 3_600_000, 100 + h],
+                )
+                .unwrap();
+            }
+        }
+        db.rollup_1h_to_1d(Some(ofs_ms)).await.unwrap();
+        let rows = read_1d_rows(&db, key).await;
+        let prev: Vec<_> = rows
+            .iter()
+            .filter(|(b, _, _)| *b == prev_key)
+            .copied()
+            .collect();
+        assert_eq!(prev.len(), 1, "one row for the completed day");
+        let (_, p_tok, sc) = prev[0];
+        assert_eq!(p_tok, (100..124).sum::<i64>());
+        assert_eq!(sc, 24 * 3600);
+    }
+
     /// FIX 2: migrate() backfills legacy NULL sample_count/power.
     #[tokio::test]
     async fn test_migrate_backfills_null_seconds_and_power() {
@@ -2926,5 +3472,230 @@ mod tests {
             "peak queued should be MAX(2, 3) = 3"
         );
         assert_eq!(merged.source_table, "mixed");
+    }
+
+    // -----------------------------------------------------------------
+    // Daily rollup lookback + duplicate-bucket dedupe
+    // -----------------------------------------------------------------
+
+    /// Defect 1 regression: a daily row older than the lookback window must
+    /// NOT be rewritten by rollup_1h_to_1d even when its hourly source rows
+    /// have been partially pruned. Before the fix, the rollup re-aggregated
+    /// ALL hourly rows and overwrote old daily totals with the shrinking
+    /// remainder (the shrinking "All time" cost-avoided bug).
+    #[tokio::test]
+    async fn test_rollup_1h_to_1d_does_not_rewrite_days_outside_lookback() {
+        let db = test_db();
+        let key = "old-engine";
+        let now = chrono_now_ms();
+        let current_day_start = (now / 86_400_000) * 86_400_000;
+        // 10 days ago: far outside the 3-day lookback, inside the 30-day
+        // hourly retention so this is exactly the live-DB failure window.
+        let old_day = current_day_start - 10 * 86_400_000;
+
+        {
+            let c = db.inner.lock().await;
+            // Four hourly source rows for the old day...
+            for h in 0..4 {
+                c.execute(
+                    "INSERT INTO snapshots_1h \
+                     (engine_key, bucket_ts, total_prompt_tokens, sample_count) \
+                     VALUES (?1, ?2, ?3, 3600)",
+                    params![key, old_day + h * 3_600_000, 1000 + h],
+                )
+                .unwrap();
+            }
+            // ...the daily row holding the ORIGINAL full-day totals, and a
+            // simulated pruning that leaves only the first hour standing.
+            c.execute(
+                "INSERT INTO snapshots_1d \
+                 (engine_key, bucket_ts, total_prompt_tokens, sample_count) \
+                 VALUES (?1, ?2, 8640000, 86400)",
+                params![key, old_day],
+            )
+            .unwrap();
+            c.execute(
+                "DELETE FROM snapshots_1h WHERE engine_key = ?1 AND bucket_ts >= ?2",
+                params![key, old_day + 3_600_000],
+            )
+            .unwrap();
+        }
+
+        db.rollup_1h_to_1d(None).await.unwrap();
+
+        let (tokens, sc): (i64, i64) = {
+            let c = db.inner.lock().await;
+            c.query_row(
+                "SELECT total_prompt_tokens, sample_count FROM snapshots_1d \
+                 WHERE engine_key = ?1 AND bucket_ts = ?2",
+                params![key, old_day],
+                |r| Ok((r.get(0).unwrap(), r.get(1).unwrap())),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            tokens, 8640000,
+            "old daily row must not be rewritten from pruned hourly sources"
+        );
+        assert_eq!(sc, 86400, "old daily sample_count must stay intact");
+    }
+
+    /// Companion to the lookback regression: a daily row WITHIN the lookback
+    /// window is still re-aggregated normally from its hourly sources.
+    #[tokio::test]
+    async fn test_rollup_1h_to_1d_updates_recent_day_within_lookback() {
+        let db = test_db();
+        let key = "recent-engine";
+        let now = chrono_now_ms();
+        let current_day_start = (now / 86_400_000) * 86_400_000;
+        let yesterday = current_day_start - 86_400_000;
+
+        {
+            let c = db.inner.lock().await;
+            // Stale daily row that must be refreshed...
+            c.execute(
+                "INSERT INTO snapshots_1d \
+                 (engine_key, bucket_ts, total_prompt_tokens, sample_count) \
+                 VALUES (?1, ?2, 1, 1)",
+                params![key, yesterday],
+            )
+            .unwrap();
+            // ...and four hourly source rows totalling 2000 tokens / 14400s.
+            for h in 0..4 {
+                c.execute(
+                    "INSERT INTO snapshots_1h \
+                     (engine_key, bucket_ts, total_prompt_tokens, sample_count) \
+                     VALUES (?1, ?2, 500, 3600)",
+                    params![key, yesterday + h * 3_600_000],
+                )
+                .unwrap();
+            }
+        }
+
+        db.rollup_1h_to_1d(None).await.unwrap();
+
+        let (tokens, sc): (i64, i64) = {
+            let c = db.inner.lock().await;
+            c.query_row(
+                "SELECT total_prompt_tokens, sample_count FROM snapshots_1d \
+                 WHERE engine_key = ?1 AND bucket_ts = ?2",
+                params![key, yesterday],
+                |r| Ok((r.get(0).unwrap(), r.get(1).unwrap())),
+            )
+            .unwrap()
+        };
+        assert_eq!(tokens, 2000, "recent day re-aggregated from hourly rows");
+        assert_eq!(sc, 14400, "recent day sample_count = SUM(4 x 3600)");
+    }
+
+    /// Defect 2 regression: duplicate daily buckets for the same shifted day
+    /// (legacy UTC-keyed + offset-keyed) collapse to one row; the survivor is
+    /// the row with the larger sample_count (tie-break: larger
+    /// total_prompt_tokens); running the rollup again is a no-op. Rows of
+    /// other engines sharing the same calendar day are left untouched.
+    #[tokio::test]
+    async fn test_rollup_1h_to_1d_dedupes_duplicate_day_buckets() {
+        let db = test_db();
+        db.set_setting("utc_offset", "-4").await.unwrap();
+        let key = "dup-engine";
+        let guard_key = "guard-engine";
+        let tie_key = "tie-engine";
+        let now = chrono_now_ms();
+        let current_day_start = (now / 86_400_000) * 86_400_000;
+        let utc_day = current_day_start - 5 * 86_400_000;
+        let ofs_ms = -4 * 3_600_000;
+        // Same day-bucket formula the rollup/dedupe uses: a legacy UTC-midnight
+        // row and the offset-keyed row both map to this shifted-day key.
+        let shifted_key = ((utc_day - ofs_ms) / 86_400_000) * 86_400_000 + ofs_ms;
+        assert_ne!(
+            shifted_key, utc_day,
+            "offset-keyed row differs from UTC key"
+        );
+
+        {
+            let c = db.inner.lock().await;
+            // Duplicate pair for `key`: legacy UTC-keyed row (full day) vs
+            // offset-keyed row (degraded by the pruned-source rewrite bug).
+            c.execute(
+                "INSERT INTO snapshots_1d \
+                 (engine_key, bucket_ts, total_prompt_tokens, sample_count) \
+                 VALUES (?1, ?2, 5000, 86400)",
+                params![key, utc_day],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO snapshots_1d \
+                 (engine_key, bucket_ts, total_prompt_tokens, sample_count) \
+                 VALUES (?1, ?2, 100, 3600)",
+                params![key, shifted_key],
+            )
+            .unwrap();
+            // Same-day row of another engine: single row, must survive.
+            c.execute(
+                "INSERT INTO snapshots_1d \
+                 (engine_key, bucket_ts, total_prompt_tokens, sample_count) \
+                 VALUES (?1, ?2, 777, 86400)",
+                params![guard_key, utc_day],
+            )
+            .unwrap();
+            // Tie on sample_count: larger total_prompt_tokens must win.
+            c.execute(
+                "INSERT INTO snapshots_1d \
+                 (engine_key, bucket_ts, total_prompt_tokens, sample_count) \
+                 VALUES (?1, ?2, 700, 86400)",
+                params![tie_key, utc_day],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO snapshots_1d \
+                 (engine_key, bucket_ts, total_prompt_tokens, sample_count) \
+                 VALUES (?1, ?2, 300, 86400)",
+                params![tie_key, shifted_key],
+            )
+            .unwrap();
+        }
+
+        db.rollup_1h_to_1d(None).await.unwrap();
+
+        let read_rows = |c: &Connection, engine: &str| -> Vec<(i64, i64, i64)> {
+            let mut stmt = c
+                .prepare(
+                    "SELECT bucket_ts, total_prompt_tokens, sample_count \
+                     FROM snapshots_1d WHERE engine_key = ?1",
+                )
+                .unwrap();
+            stmt.query_map(params![engine], |r| {
+                Ok((r.get(0).unwrap(), r.get(1).unwrap(), r.get(2).unwrap()))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+
+        {
+            let c = db.inner.lock().await;
+            let rows = read_rows(&c, key);
+            assert_eq!(rows.len(), 1, "duplicate pair collapses to one row");
+            assert_eq!(rows[0].0, utc_day, "survivor keeps the larger-sample row");
+            assert_eq!(rows[0].1, 5000);
+            assert_eq!(rows[0].2, 86400);
+
+            let guard = read_rows(&c, guard_key);
+            assert_eq!(guard.len(), 1, "single-row day is untouched");
+            assert_eq!(guard[0].1, 777);
+
+            let tie = read_rows(&c, tie_key);
+            assert_eq!(tie.len(), 1, "tied pair collapses to one row");
+            assert_eq!(tie[0].1, 700, "tie-break keeps more prompt tokens");
+        }
+
+        // Idempotent: a second rollup tick changes nothing further.
+        db.rollup_1h_to_1d(None).await.unwrap();
+        {
+            let c = db.inner.lock().await;
+            assert_eq!(read_rows(&c, key).len(), 1, "dedupe is a no-op on rerun");
+            assert_eq!(read_rows(&c, guard_key).len(), 1);
+            assert_eq!(read_rows(&c, tie_key).len(), 1);
+        }
     }
 }
