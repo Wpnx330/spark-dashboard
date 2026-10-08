@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.1](https://github.com/Wpnx330/spark-dashboard/compare/spark-dashboard-v0.13.0...spark-dashboard-v0.13.1) (2026-10-08)
+
+
+### Dependencies & Chores
+
+* **ci:** publish container image to our own GHCR namespace ([324d39b](https://github.com/Wpnx330/spark-dashboard/commit/324d39b6689eceeed5265ab9cb15ea4f3f36b210))
+
 ## [0.13.0](https://github.com/Wpnx330/spark-dashboard/compare/spark-dashboard-v0.12.0...spark-dashboard-v0.13.0) (2026-10-08)
 
 
