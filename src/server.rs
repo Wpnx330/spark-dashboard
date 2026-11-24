@@ -29,11 +29,10 @@ struct FrontendAssets;
 
 /// Build the HTTP router.
 ///
-/// History API routes (`/api/history/*`) are only registered when `enable_history`
-/// is true — they include destructive (`POST /prune`) and write (`settings`,
-/// `toggle`) endpoints that must not be exposed unauthenticated on `0.0.0.0` by
-/// default. Pass `--enable-history` (or `SPARK_DASHBOARD_ENABLE_HISTORY=1`) to
-/// opt in; see `src/main.rs`.
+/// History API routes (`/api/history/*`) are registered by default — they
+/// include destructive (`POST /prune`) and write (`settings`, `toggle`)
+/// endpoints that are unauthenticated on `0.0.0.0`. Set
+/// `SPARK_DASHBOARD_ENABLE_HISTORY=0` to opt out; see `src/main.rs`.
 pub fn create_router(state: Arc<AppState>, enable_history: bool) -> Router {
     let router = Router::<Arc<AppState>>::new()
         .route("/ws", get(crate::ws::ws_handler))
@@ -424,7 +423,7 @@ mod tests {
     /// Same as [`test_router`] but with an explicit dashboard title, so the
     /// `/api/meta` default/custom behaviors can both be exercised.
     fn test_router_with_title(enable_history: bool, title: &str) -> Router {
-        let history = HistoryDb::open(":memory:").unwrap();
+        let history = HistoryDb::open_with_default(":memory:", true).unwrap();
         let (tx, _rx) = broadcast::channel::<String>(16);
         let state = Arc::new(AppState {
             tx,

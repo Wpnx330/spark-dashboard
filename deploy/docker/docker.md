@@ -113,7 +113,7 @@ All are optional; defaults match the binary. Set them in `.env`.
 | `SPARK_DASHBOARD_GPU_INDEX`         | _(unset)_   | Optional NVML GPU index; unset monitors all GPUs.    |
 | `SPARK_DASHBOARD_SIMULATE_GPUS`     | `0`         | Dev aid: append N fictive GPUs with simulated data.  |
 | `SPARK_DASHBOARD_PROVIDER_API_KEY`  | _(unset)_   | Fallback API key for auth-gated engines.             |
-| `SPARK_DASHBOARD_ENABLE_HISTORY`    | `false`     | Enable the `/api/history/*` API + recording.         |
+| `SPARK_DASHBOARD_ENABLE_HISTORY`    | `true`      | Enable the `/api/history/*` API + recording; set `0`/`false` to opt out. |
 | `SPARK_DASHBOARD_HISTORY_DB`        | `/data/history.db` | SQLite history DB path (must be writable).    |
 | `RUST_LOG`                          | `info`      | Log filter (`error`/`warn`/`info`/`debug`/`trace`).  |
 

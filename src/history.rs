@@ -27,12 +27,18 @@ pub struct HistoryDb {
 
 impl HistoryDb {
     /// Open (or create) the database and run migrations.
-    pub fn open(path: &str) -> rusqlite::Result<Self> {
+    ///
+    /// `default_enabled` decides recording on a FRESH database (no
+    /// `history_enabled` settings row yet); a persisted row — written by the
+    /// runtime toggle (`set_enabled`) — always wins. `main` passes the
+    /// resolved `--enable-history` / `SPARK_DASHBOARD_ENABLE_HISTORY` value so
+    /// an explicit `=0/false` keeps a fresh DB recording OFF.
+    pub fn open_with_default(path: &str, default_enabled: bool) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         Self::migrate(&conn)?;
-        let enabled = Arc::new(AtomicBool::new(false));
-        // Read current setting from DB
+        let enabled = Arc::new(AtomicBool::new(default_enabled));
+        // Read current setting from DB (an absent row keeps the default).
         if let Ok(Some(val)) = conn
             .query_row(
                 "SELECT value FROM settings WHERE key = 'history_enabled'",
@@ -1289,6 +1295,8 @@ mod tests {
     /// Open an in-memory database for testing (skipping file I/O).
     fn test_db() -> HistoryDb {
         // We bypass HistoryDb::open and manually construct from an in-memory conn.
+        // Note: this helper models a database whose settings row is absent and
+        // whose resolved default is ON, i.e. the post-default-on fresh state.
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
             .unwrap();
@@ -1482,6 +1490,69 @@ mod tests {
     async fn test_is_enabled_defaults_true() {
         let db = test_db();
         assert!(db.is_enabled());
+    }
+
+    /// A FRESH database opened via `HistoryDb::open_with_default(.., true)`
+    /// (the `main` path with no explicit opt-out) must have recording ON —
+    /// the fresh-deployment guarantee. Uses `:memory:` so the settings row is
+    /// guaranteed absent.
+    #[tokio::test]
+    async fn test_open_defaults_enabled_on_fresh_db() {
+        let db = HistoryDb::open_with_default(":memory:", true).unwrap();
+        assert!(db.is_enabled());
+    }
+
+    /// Explicit opt-out (`open_with_default(.., false)`, i.e.
+    /// `SPARK_DASHBOARD_ENABLE_HISTORY=0`) keeps a fresh DB recording OFF.
+    #[tokio::test]
+    async fn test_open_default_false_opts_out_on_fresh_db() {
+        let db = HistoryDb::open_with_default(":memory:", false).unwrap();
+        assert!(!db.is_enabled());
+    }
+
+    /// An existing `history_enabled` settings row always wins over the open
+    /// default — protects explicitly-configured hosts across the default-on
+    /// change (`false` row stays off despite default-on; `true` row stays on
+    /// despite default-off).
+    #[tokio::test]
+    async fn test_settings_row_overrides_open_default() {
+        let unique = format!(
+            "spark-hist-row-override-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(&unique);
+
+        for (seed, default_enabled, expect_enabled) in
+            [("false", true, false), ("true", false, true)]
+        {
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("history.db");
+            // Seed the settings row with a plain connection, then close it so
+            // HistoryDb::open_with_default reads the persisted value.
+            {
+                let conn = Connection::open(&path).unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS settings (
+                        key   TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    );",
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO settings (key, value) VALUES ('history_enabled', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![seed],
+                )
+                .unwrap();
+            }
+            let db = HistoryDb::open_with_default(path.to_str().unwrap(), default_enabled).unwrap();
+            assert_eq!(db.is_enabled(), expect_enabled, "seed={seed}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
     }
 
     #[tokio::test]

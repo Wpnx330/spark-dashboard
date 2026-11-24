@@ -48,7 +48,7 @@ mod tests {
     #[tokio::test]
     async fn probe_succeeds_against_running_server() {
         let (tx, _rx) = broadcast::channel::<String>(16);
-        let history = crate::history::HistoryDb::open(":memory:").unwrap();
+        let history = crate::history::HistoryDb::open_with_default(":memory:", true).unwrap();
         let state = Arc::new(AppState {
             tx,
             history,

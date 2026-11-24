@@ -126,10 +126,20 @@ struct RunArgs {
     enable_log_viewer: bool,
 
     /// Enable the historical metrics API (`/api/history/*`) and recording.
-    /// Off by default: the history endpoints include destructive (`prune`) and
-    /// write (`settings`, `toggle`) operations that must not be exposed
-    /// unauthenticated on `0.0.0.0`. Enable only on trusted networks.
-    #[arg(long, env = "SPARK_DASHBOARD_ENABLE_HISTORY", default_value_t = false)]
+    /// ON by default so fresh deployments record history without any special
+    /// flags or env vars. The endpoints include destructive (`prune`) and
+    /// write (`settings`, `toggle`) operations; opt out (e.g. on untrusted
+    /// networks, since `0.0.0.0` exposes them unauthenticated) with
+    /// `SPARK_DASHBOARD_ENABLE_HISTORY=0` (or `=false`).
+    ///
+    /// `BoolishValueParser` is explicit because the implied bool parser only
+    /// accepts `true`/`false`; the deployment convention here uses `0`/`1`.
+    #[arg(
+        long,
+        env = "SPARK_DASHBOARD_ENABLE_HISTORY",
+        default_value_t = true,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
     enable_history: bool,
 
     /// Run in node-agent mode: collect local hardware metrics and serve only
@@ -247,16 +257,19 @@ async fn run_server_inner(args: RunArgs) -> Result<(), Box<dyn std::error::Error
     // Initialize history database.
     //
     // We always open a database (even when history is disabled) so the
-    // metrics collector has somewhere to no-op into and so the `--enable-history`
-    // toggle can flip recording on at runtime without a restart. Recording is
-    // gated by `HistoryDb::is_enabled()`, which defaults to false.
+    // metrics collector has somewhere to no-op into and so the runtime
+    // toggle (UI `POST /api/history/toggle`) can flip recording without a
+    // restart. Recording is gated by `HistoryDb::is_enabled()`, which on a
+    // fresh DB (no `history_enabled` settings row) defaults to the resolved
+    // `--enable-history` value — ON unless `SPARK_DASHBOARD_ENABLE_HISTORY=0`
+    // was set. A persisted row (written by `set_enabled`) always wins.
     //
     // Path resolution: if the caller passed an explicit `--history-db-path`
     // (other than the default), honor it. Otherwise try `/var/lib/spark-dashboard`
     // (if the directory exists and is writable), fall back to `/tmp`, and
     // finally to `:memory:` so the dashboard always starts — losing history on
     // restart is preferable to crashing on boot.
-    let history_db = open_history_db(&args.history_db_path)?;
+    let history_db = open_history_db(&args.history_db_path, args.enable_history)?;
 
     if args.enable_history {
         tracing::warn!(
@@ -364,7 +377,10 @@ async fn run_node_agent(args: RunArgs) -> Result<(), Box<dyn std::error::Error>>
     // (required by metrics_collector's signature) but consume the receiver here
     // to capture snapshots.
     let engine_state: Arc<RwLock<Vec<engines::EngineSnapshot>>> = Arc::new(RwLock::new(Vec::new()));
-    let history_db = open_history_db(":memory:")?;
+    // Node-agent mode records nothing: the DB is ephemeral `:memory:` and
+    // there is no history API. Keep the recording default explicitly OFF so
+    // node-agent behavior is identical to before history defaulted on.
+    let history_db = open_history_db(":memory:", false)?;
 
     let snapshot_for_collector = snapshot.clone();
     let poll_interval = args.poll_interval;
@@ -433,10 +449,13 @@ async fn run_node_agent(args: RunArgs) -> Result<(), Box<dyn std::error::Error>>
 /// 3. Fall back to `/tmp/spark-dashboard-history.db` (always writable).
 /// 4. Final fallback: `:memory:` with a warning — the dashboard stays up but
 ///    history is lost on restart.
-fn open_history_db(requested: &str) -> Result<history::HistoryDb, Box<dyn std::error::Error>> {
+fn open_history_db(
+    requested: &str,
+    default_enabled: bool,
+) -> Result<history::HistoryDb, Box<dyn std::error::Error>> {
     // If the caller passed an explicit non-default path, honor it directly.
     if !requested.is_empty() && requested != "/data/history.db" && requested != ":memory:" {
-        match history::HistoryDb::open(requested) {
+        match history::HistoryDb::open_with_default(requested, default_enabled) {
             Ok(db) => {
                 tracing::info!("History database at {}", requested);
                 return Ok(db);
@@ -453,7 +472,10 @@ fn open_history_db(requested: &str) -> Result<history::HistoryDb, Box<dyn std::e
 
     if requested == ":memory:" {
         tracing::info!("History database at :memory: (explicit)");
-        return Ok(history::HistoryDb::open(":memory:")?);
+        return Ok(history::HistoryDb::open_with_default(
+            ":memory:",
+            default_enabled,
+        )?);
     }
 
     // Try /var/lib/spark-dashboard/history.db if the directory exists and is writable.
@@ -466,7 +488,7 @@ fn open_history_db(requested: &str) -> Result<history::HistoryDb, Box<dyn std::e
             .map(|m| m.permissions().readonly())
             .unwrap_or(true);
     if use_var {
-        match history::HistoryDb::open(var_path) {
+        match history::HistoryDb::open_with_default(var_path, default_enabled) {
             Ok(db) => {
                 tracing::info!("History database at {}", var_path);
                 return Ok(db);
@@ -483,7 +505,7 @@ fn open_history_db(requested: &str) -> Result<history::HistoryDb, Box<dyn std::e
 
     // Fall back to /tmp (always writable).
     let tmp_path = "/tmp/spark-dashboard-history.db";
-    match history::HistoryDb::open(tmp_path) {
+    match history::HistoryDb::open_with_default(tmp_path, default_enabled) {
         Ok(db) => {
             tracing::info!("History database at {}", tmp_path);
             Ok(db)
@@ -494,7 +516,10 @@ fn open_history_db(requested: &str) -> Result<history::HistoryDb, Box<dyn std::e
                 tmp_path,
                 e
             );
-            Ok(history::HistoryDb::open(":memory:")?)
+            Ok(history::HistoryDb::open_with_default(
+                ":memory:",
+                default_enabled,
+            )?)
         }
     }
 }
@@ -519,5 +544,35 @@ mod tests {
     fn title_can_be_overridden() {
         let cli = Cli::parse_from(["spark-dashboard", "--title", "RTX PRO Cluster"]);
         assert_eq!(cli.run.title, "RTX PRO Cluster");
+    }
+
+    /// History defaults ON when neither the flag nor the env var is set, and
+    /// `SPARK_DASHBOARD_ENABLE_HISTORY=0` (or `false`) opts back out. Both
+    /// directions are asserted in a single serial test because env-var reads
+    /// happen at `parse_from` time and are process-global.
+    #[test]
+    fn history_default_on_and_env_opt_out() {
+        // Direction 1: nothing set -> ON.
+        std::env::remove_var("SPARK_DASHBOARD_ENABLE_HISTORY");
+        let cli = Cli::parse_from(["spark-dashboard"]);
+        assert!(cli.run.enable_history);
+
+        // Direction 2a: explicit env=0 -> OFF (clap's bool env parser).
+        std::env::set_var("SPARK_DASHBOARD_ENABLE_HISTORY", "0");
+        let cli = Cli::parse_from(["spark-dashboard"]);
+        assert!(!cli.run.enable_history);
+
+        // Direction 2b: explicit env=false -> OFF too.
+        std::env::set_var("SPARK_DASHBOARD_ENABLE_HISTORY", "false");
+        let cli = Cli::parse_from(["spark-dashboard"]);
+        assert!(!cli.run.enable_history);
+
+        // ...and env=true still enables (explicitly-configured host).
+        std::env::set_var("SPARK_DASHBOARD_ENABLE_HISTORY", "true");
+        let cli = Cli::parse_from(["spark-dashboard"]);
+        assert!(cli.run.enable_history);
+
+        // Leave the process environment clean for other tests.
+        std::env::remove_var("SPARK_DASHBOARD_ENABLE_HISTORY");
     }
 }

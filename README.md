@@ -208,7 +208,8 @@ sudo spark-dashboard service status       # same as `systemctl status`
 Optional overrides live in `/etc/spark-dashboard/config.env` — set
 `SPARK_DASHBOARD_PORT`, `SPARK_DASHBOARD_BIND`, `SPARK_DASHBOARD_POLL_INTERVAL`,
 `SPARK_DASHBOARD_GPU_INDEX`, `SPARK_DASHBOARD_PROVIDER_API_KEY`, `SPARK_DASHBOARD_TITLE`,
-or `RUST_LOG`, then `sudo systemctl restart spark-dashboard`.
+`SPARK_DASHBOARD_ENABLE_HISTORY`, or `RUST_LOG`, then
+`sudo systemctl restart spark-dashboard`.
 
 ### Upgrade
 
@@ -248,6 +249,7 @@ spark-dashboard service status
       --engine-api-key <KEY>  API key for an endpoint, paired by index with --engine-url
       --provider-api-key <KEY> Fallback API key for any endpoint [env: SPARK_DASHBOARD_PROVIDER_API_KEY]
       --title <TITLE>         Dashboard title for the header and browser tab [env: SPARK_DASHBOARD_TITLE]
+      --enable-history        Enable history API + recording [env: SPARK_DASHBOARD_ENABLE_HISTORY] [default: true]
 ```
 
 On multi-GPU hosts, Spark Dashboard monitors all available NVIDIA GPUs by
@@ -291,6 +293,25 @@ Docker API (no `docker` CLI or shell required — works in distroless images).
 The stream is shared: one background Docker log stream fans out to all
 connected clients (same pattern as metrics). stdout and stderr are line-buffered
 so split frames don't produce partial lines.
+
+### History recording (`--enable-history`, on by default)
+
+The dashboard records GPU/engine metrics into a SQLite history database every
+poll tick. **History recording is ON by default** — a fresh deployment with no
+flags and no environment variables starts recording immediately.
+
+- **Opt-out:** set `SPARK_DASHBOARD_ENABLE_HISTORY=0` (or `=false`) in
+  `/etc/spark-dashboard/config.env` or your deployment environment. This
+  disables recording and unregisters the `/api/history/*` routes, exactly as
+  before the default changed.
+- **Runtime toggle:** the `/api/history/toggle` endpoint (and dashboard UI)
+  can flip recording on/off at runtime; the choice is persisted in the
+  `history_enabled` settings row and survives restarts.
+- **Security note:** `/api/history/*` is unauthenticated, and the dashboard
+  binds `0.0.0.0` by default — keep the default ON only on trusted networks
+  or put the dashboard behind an authenticating reverse proxy.
+- **Node-agent mode is unaffected:** `--node-agent` has no history recording
+  or history API at all.
 
 ## Development
 
