@@ -10,11 +10,17 @@ use tower_http::cors::CorsLayer;
 
 use crate::history::HistoryDb;
 
+/// Default dashboard title, shown when `SPARK_DASHBOARD_TITLE` is not set.
+/// Matches the static `<title>` in `frontend/index.html` so the header and
+/// browser tab stay identical out of the box.
+pub const DEFAULT_TITLE: &str = "Spark Dashboard";
+
 /// Shared application state injected into handlers.
 pub struct AppState {
     pub tx: broadcast::Sender<String>,
     pub history: HistoryDb,
     pub node_snapshots: crate::nodes::NodeSnapshots,
+    pub title: String,
 }
 
 #[derive(Embed)]
@@ -36,7 +42,9 @@ pub fn create_router(state: Arc<AppState>, enable_history: bool) -> Router {
         // engine/GPU is healthy (that's surfaced over /ws).
         .route("/healthz", get(healthz))
         // Aggregated snapshots from remote node agents (polled via --nodes).
-        .route("/api/nodes", get(nodes_handler));
+        .route("/api/nodes", get(nodes_handler))
+        // Runtime metadata for the frontend shell (dashboard title).
+        .route("/api/meta", get(meta_handler));
 
     // History API — opt-in only.
     let router = if enable_history {
@@ -77,6 +85,13 @@ async fn healthz() -> &'static str {
 async fn nodes_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let snapshots = state.node_snapshots.read().await.clone();
     Json(snapshots).into_response()
+}
+
+/// Returns runtime metadata for the frontend shell: the dashboard title
+/// (from `--title` / `SPARK_DASHBOARD_TITLE`) used for the header brand
+/// and `document.title`.
+async fn meta_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(serde_json::json!({ "title": state.title }))
 }
 
 // ---------------------------------------------------------------------------
@@ -403,12 +418,19 @@ mod tests {
 
     /// Build a router backed by an in-memory history DB for tests.
     fn test_router(enable_history: bool) -> Router {
+        test_router_with_title(enable_history, DEFAULT_TITLE)
+    }
+
+    /// Same as [`test_router`] but with an explicit dashboard title, so the
+    /// `/api/meta` default/custom behaviors can both be exercised.
+    fn test_router_with_title(enable_history: bool, title: &str) -> Router {
         let history = HistoryDb::open(":memory:").unwrap();
         let (tx, _rx) = broadcast::channel::<String>(16);
         let state = Arc::new(AppState {
             tx,
             history,
             node_snapshots: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            title: title.to_string(),
         });
         create_router(state, enable_history)
     }
@@ -497,5 +519,50 @@ mod tests {
         let body: serde_json::Value = resp.json().await.expect("json body");
         assert!(body.is_array(), "expected a JSON array, got: {body}");
         assert_eq!(body.as_array().unwrap().len(), 0);
+    }
+
+    /// `/api/meta` serves the default title when none is configured.
+    #[tokio::test]
+    async fn meta_endpoint_returns_default_title() {
+        let app = test_router(false);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let resp = reqwest::get(format!("http://{addr}/api/meta"))
+            .await
+            .expect("request to /api/meta");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("title").and_then(|v| v.as_str()),
+            Some(DEFAULT_TITLE)
+        );
+    }
+
+    /// `/api/meta` serves the configured title so one binary can brand
+    /// multiple clusters without a rebuild.
+    #[tokio::test]
+    async fn meta_endpoint_returns_configured_title() {
+        let app = test_router_with_title(false, "RTX PRO Cluster");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let resp = reqwest::get(format!("http://{addr}/api/meta"))
+            .await
+            .expect("request to /api/meta");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("title").and_then(|v| v.as_str()),
+            Some("RTX PRO Cluster")
+        );
     }
 }

@@ -207,8 +207,8 @@ sudo spark-dashboard service status       # same as `systemctl status`
 
 Optional overrides live in `/etc/spark-dashboard/config.env` — set
 `SPARK_DASHBOARD_PORT`, `SPARK_DASHBOARD_BIND`, `SPARK_DASHBOARD_POLL_INTERVAL`,
-`SPARK_DASHBOARD_GPU_INDEX`, `SPARK_DASHBOARD_PROVIDER_API_KEY`, or `RUST_LOG`, then
-`sudo systemctl restart spark-dashboard`.
+`SPARK_DASHBOARD_GPU_INDEX`, `SPARK_DASHBOARD_PROVIDER_API_KEY`, `SPARK_DASHBOARD_TITLE`,
+or `RUST_LOG`, then `sudo systemctl restart spark-dashboard`.
 
 ### Upgrade
 
@@ -247,6 +247,7 @@ spark-dashboard service status
       --engine-url <URL>      Manual engine endpoint (requires --engine)
       --engine-api-key <KEY>  API key for an endpoint, paired by index with --engine-url
       --provider-api-key <KEY> Fallback API key for any endpoint [env: SPARK_DASHBOARD_PROVIDER_API_KEY]
+      --title <TITLE>         Dashboard title for the header and browser tab [env: SPARK_DASHBOARD_TITLE]
 ```
 
 On multi-GPU hosts, Spark Dashboard monitors all available NVIDIA GPUs by
@@ -260,6 +261,14 @@ For auth-gated deployments (e.g. vLLM started with `--api-key`), pass
 engines too. Model info is resolved from `/v1/models` once and cached —
 re-resolved only on engine restart or every 10 minutes — so an auth-gated
 engine is no longer hit on every poll tick.
+
+### Dashboard title (`--title`, `SPARK_DASHBOARD_TITLE`)
+
+The header brand and browser-tab title default to `Spark Dashboard` and can be
+overridden at runtime with `--title` or `SPARK_DASHBOARD_TITLE` (e.g.
+`SPARK_DASHBOARD_TITLE=RTX PRO Cluster`). The value is served to the frontend
+by `GET /api/meta`, so the same binary can brand multiple hosts -- a DGX Spark
+fleet and an RTX PRO cluster, say -- without rebuilding.
 
 ### Log viewer (`--enable-log-viewer`, Linux only, opt-in)
 

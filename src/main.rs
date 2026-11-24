@@ -156,6 +156,17 @@ struct RunArgs {
         default_value = "/data/history.db"
     )]
     history_db_path: String,
+
+    /// Title shown in the dashboard header and browser tab. Served to the
+    /// frontend via `GET /api/meta`, so the same binary can brand multiple
+    /// hosts (e.g. a DGX Spark fleet and an RTX PRO cluster) without a rebuild.
+    #[arg(
+        long,
+        env = "SPARK_DASHBOARD_TITLE",
+        default_value = server::DEFAULT_TITLE,
+        value_name = "TITLE"
+    )]
+    title: String,
 }
 
 fn main() -> ExitCode {
@@ -311,6 +322,7 @@ async fn run_server_inner(args: RunArgs) -> Result<(), Box<dyn std::error::Error
         tx,
         history: history_db,
         node_snapshots,
+        title: args.title,
     });
 
     // Spawn the remote node-polling loop when --nodes is provided.
@@ -484,5 +496,28 @@ fn open_history_db(requested: &str) -> Result<history::HistoryDb, Box<dyn std::e
             );
             Ok(history::HistoryDb::open(":memory:")?)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// With no `--title` flag and no `SPARK_DASHBOARD_TITLE` in the
+    /// environment, the title must default to the hardcoded string so unset
+    /// behaves identically to builds before the flag existed.
+    #[test]
+    fn title_defaults_to_spark_dashboard() {
+        let cli = Cli::parse_from(["spark-dashboard"]);
+        assert_eq!(cli.run.title, server::DEFAULT_TITLE);
+        assert_eq!(cli.run.title, "Spark Dashboard");
+    }
+
+    /// `--title` overrides the default (the `env = "SPARK_DASHBOARD_TITLE"`
+    /// attribute wires the environment variable through the same field).
+    #[test]
+    fn title_can_be_overridden() {
+        let cli = Cli::parse_from(["spark-dashboard", "--title", "RTX PRO Cluster"]);
+        assert_eq!(cli.run.title, "RTX PRO Cluster");
     }
 }

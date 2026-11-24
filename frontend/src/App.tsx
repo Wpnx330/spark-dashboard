@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
 import { useMetrics } from './hooks/useMetrics'
 import { useNodes } from './hooks/useNodes'
+import { useMeta } from './hooks/useMeta'
 import { useMetricsHistory } from './hooks/useMetricsHistory'
 import { ConnectionBadge } from './components/ConnectionBadge'
 import { Dashboard } from './components/views/Dashboard'
@@ -11,6 +12,15 @@ import type { GpuEvent, InferenceRequest } from './types/events'
 function App() {
   const { metrics, connectionStatus, isStale } = useMetrics()
   const { nodes } = useNodes()
+  const { title } = useMeta()
+
+  // Two-tone brand treatment: the leading word carries the accent color, the
+  // remainder stays muted. For the default title this renders exactly like
+  // the previously hardcoded "Spark Dashboard" markup.
+  const leadEnd = title.indexOf(' ')
+  const brandLead = leadEnd === -1 ? title : title.slice(0, leadEnd)
+  const brandRest = leadEnd === -1 ? '' : title.slice(leadEnd + 1)
+
   const [consoleExpanded, setConsoleExpanded] = useState(false)
   const [view, setView] = useState<'metrics' | 'historical'>('metrics')
   const [selectedNode, setSelectedNode] = useState<number | null>(null)
@@ -44,8 +54,13 @@ function App() {
       <header className="shrink-0 border-b border-white/[0.04] px-4 py-1.5 flex justify-between items-center">
         <div className="flex items-center gap-3">
           <h1 className="text-xl font-semibold text-zinc-100 tracking-tight" style={{ fontFamily: 'Inter, sans-serif' }}>
-            <span className="text-[#76B900]">Spark</span>{' '}
-            <span className="text-zinc-500 font-normal">Dashboard</span>
+            <span className="text-[#76B900]">{brandLead}</span>
+            {brandRest && (
+              <>
+                {' '}
+                <span className="text-zinc-500 font-normal">{brandRest}</span>
+              </>
+            )}
           </h1>
           <div className="flex bg-[#1a1a1f] rounded-lg p-0.5 border border-white/[0.05]">
             <button

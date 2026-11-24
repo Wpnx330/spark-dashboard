@@ -53,6 +53,7 @@ mod tests {
             tx,
             history,
             node_snapshots: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            title: crate::server::DEFAULT_TITLE.to_string(),
         });
         // History routes aren't needed for a /healthz probe; leave them off.
         let app = crate::server::create_router(state, false);
