@@ -41,6 +41,7 @@ User=cwykel
 [Install]
 WantedBy=multi-user.target
 EOF
+ssh "$DEST_HOST" 'sudo mkdir -p /etc/systemd/system/spark-dashboard.service.d
 sudo tee /etc/systemd/system/spark-dashboard.service.d/override.conf > /dev/null << "EOF"
 [Service]
 PrivateTmp=false
@@ -58,7 +59,10 @@ SPARK_DASHBOARD_HISTORY_DB=/var/lib/spark-dashboard/history.db
 EOF
 chmod 644 /etc/spark-dashboard/config.env'
 
-echo "== 8. start + report =="
+echo "== 8. enable history logging (fresh DB ships toggle OFF — silent no-op!) =="
+ssh "$DEST_HOST" 'curl -sf -X POST -H "Content-Type: application/json" -d "{\"enabled\":true}" http://localhost:3000/api/history/toggle'
+
+echo "== 9. start + report =="
 ssh "$DEST_HOST" 'sudo systemctl enable --now spark-dashboard && sleep 2 && systemctl is-active spark-dashboard'
 
 echo "DONE. Verify: curl http://100.84.37.35:3000/api/meta"
