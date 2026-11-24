@@ -7,6 +7,7 @@ import { ConnectionBadge } from './components/ConnectionBadge'
 import { Dashboard } from './components/views/Dashboard'
 import { LogViewer } from './components/LogViewer'
 import { HistoryView } from './components/HistoryView'
+import { CommandView } from './components/CommandView'
 import type { GpuEvent, InferenceRequest } from './types/events'
 
 function App() {
@@ -22,7 +23,7 @@ function App() {
   const brandRest = leadEnd === -1 ? '' : title.slice(leadEnd + 1)
 
   const [consoleExpanded, setConsoleExpanded] = useState(false)
-  const [view, setView] = useState<'metrics' | 'historical'>('metrics')
+  const [view, setView] = useState<'command' | 'metrics' | 'historical'>('metrics')
   const [selectedNode, setSelectedNode] = useState<number | null>(null)
 
   const history = useMetricsHistory(metrics)
@@ -64,6 +65,16 @@ function App() {
           </h1>
           <div className="flex bg-[#1a1a1f] rounded-lg p-0.5 border border-white/[0.05]">
             <button
+              onClick={() => setView('command')}
+              className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors ${
+                view === 'command'
+                  ? 'bg-[#76B900] text-black'
+                  : 'text-zinc-400 hover:text-zinc-200'
+              }`}
+            >
+              Command
+            </button>
+            <button
               onClick={() => setView('metrics')}
               className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors ${
                 view === 'metrics'
@@ -89,7 +100,14 @@ function App() {
       </header>
 
       <main className={`flex-1 min-h-0 overflow-y-auto flex flex-col p-3 lg:p-4 2xl:p-5 min-[1920px]:p-6 ${isStale && view === 'metrics' ? 'opacity-50' : ''}`}>
-        {view === 'historical' ? (
+        {view === 'command' ? (
+          <CommandView
+            localTitle={title}
+            metrics={metrics}
+            connectionStatus={connectionStatus}
+            isStale={isStale}
+          />
+        ) : view === 'historical' ? (
           <HistoryView nodeCount={nodes.filter(n => n.online).length || 1} />
         ) : (
           <>

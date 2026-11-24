@@ -21,6 +21,15 @@ pub struct AppState {
     pub history: HistoryDb,
     pub node_snapshots: crate::nodes::NodeSnapshots,
     pub title: String,
+    /// Peer cluster dashboard URL from `--peer-url` /
+    /// `SPARK_DASHBOARD_PEER_URL`, served via `GET /api/meta` so the
+    /// frontend Command tab can query the peer directly. `None` (default)
+    /// when unset.
+    pub peer_url: Option<String>,
+    /// Shared engine snapshots (written by the engine collector, read here
+    /// only to expose the primary engine's history `engine_key` via
+    /// `GET /api/meta`). Clone of the collector's state.
+    pub engine_snapshots: Arc<tokio::sync::RwLock<Vec<crate::engines::EngineSnapshot>>>,
 }
 
 #[derive(Embed)]
@@ -88,9 +97,24 @@ async fn nodes_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse 
 
 /// Returns runtime metadata for the frontend shell: the dashboard title
 /// (from `--title` / `SPARK_DASHBOARD_TITLE`) used for the header brand
-/// and `document.title`.
+/// and `document.title`, the peer dashboard URL (from `--peer-url` /
+/// `SPARK_DASHBOARD_PEER_URL`) used by the Command tab, and the primary
+/// engine's history `engine_key` so the frontend can query history APIs
+/// for engines whose endpoint was auto-detected (not knowable from the
+/// WebSocket snapshot alone by peers).
 async fn meta_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(serde_json::json!({ "title": state.title }))
+    let primary = state.engine_snapshots.read().await.first().cloned();
+    let engine_key = primary.as_ref().map(|e| e.endpoint.clone());
+    let model = primary
+        .as_ref()
+        .and_then(|e| e.model.as_ref())
+        .map(|m| m.name.clone());
+    Json(serde_json::json!({
+        "title": state.title,
+        "peer_url": state.peer_url,
+        "engine_key": engine_key,
+        "model": model,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -423,6 +447,16 @@ mod tests {
     /// Same as [`test_router`] but with an explicit dashboard title, so the
     /// `/api/meta` default/custom behaviors can both be exercised.
     fn test_router_with_title(enable_history: bool, title: &str) -> Router {
+        test_router_with_meta(enable_history, title, None)
+    }
+
+    /// Build a router with full control over the `AppState` meta fields
+    /// (title + peer URL) served by `/api/meta`.
+    fn test_router_with_meta(
+        enable_history: bool,
+        title: &str,
+        peer_url: Option<String>,
+    ) -> Router {
         let history = HistoryDb::open_with_default(":memory:", true).unwrap();
         let (tx, _rx) = broadcast::channel::<String>(16);
         let state = Arc::new(AppState {
@@ -430,6 +464,8 @@ mod tests {
             history,
             node_snapshots: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             title: title.to_string(),
+            peer_url,
+            engine_snapshots: Arc::new(tokio::sync::RwLock::new(Vec::new())),
         });
         create_router(state, enable_history)
     }
@@ -562,6 +598,54 @@ mod tests {
         assert_eq!(
             body.get("title").and_then(|v| v.as_str()),
             Some("RTX PRO Cluster")
+        );
+    }
+
+    /// `/api/meta` reports `peer_url: null` when `--peer-url` is unset —
+    /// the frontend Command tab uses this to render the dimmed
+    /// "Peer not configured" card (single-cluster default deployment).
+    #[tokio::test]
+    async fn meta_endpoint_peer_url_null_when_unset() {
+        let app = test_router_with_meta(false, DEFAULT_TITLE, None);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let resp = reqwest::get(format!("http://{addr}/api/meta"))
+            .await
+            .expect("request to /api/meta");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert!(body.get("peer_url").and_then(|v| v.as_str()).is_none());
+    }
+
+    /// `/api/meta` serves the configured peer URL so the frontend Command
+    /// tab can query the peer cluster's dashboard directly over the LAN.
+    #[tokio::test]
+    async fn meta_endpoint_serves_configured_peer_url() {
+        let app = test_router_with_meta(
+            false,
+            DEFAULT_TITLE,
+            Some("http://192.168.10.188:3000".into()),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let resp = reqwest::get(format!("http://{addr}/api/meta"))
+            .await
+            .expect("request to /api/meta");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("peer_url").and_then(|v| v.as_str()),
+            Some("http://192.168.10.188:3000")
         );
     }
 }

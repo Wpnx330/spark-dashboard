@@ -177,6 +177,16 @@ struct RunArgs {
         value_name = "TITLE"
     )]
     title: String,
+
+    /// URL of the peer cluster's dashboard (e.g.
+    /// `http://192.168.10.188:3000`). Served to the frontend via `GET
+    /// /api/meta` as `peer_url`; the Command tab then fetches the peer's
+    /// `/api/meta` and `/api/history/*` directly over the LAN — no proxying
+    /// through this backend. Unset (default) means a single-cluster
+    /// deployment: the Command tab still renders, with a dimmed "Peer not
+    /// configured" card.
+    #[arg(long, env = "SPARK_DASHBOARD_PEER_URL", value_name = "URL")]
+    peer_url: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -336,6 +346,8 @@ async fn run_server_inner(args: RunArgs) -> Result<(), Box<dyn std::error::Error
         history: history_db,
         node_snapshots,
         title: args.title,
+        peer_url: args.peer_url,
+        engine_snapshots: engine_state,
     });
 
     // Spawn the remote node-polling loop when --nodes is provided.

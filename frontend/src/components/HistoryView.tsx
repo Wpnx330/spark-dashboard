@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useMetrics } from '@/hooks/useMetrics'
+import { computeSavings } from '@/lib/savings'
 
 interface HistorySummary {
   delta_prompt_tokens: number
@@ -229,19 +230,17 @@ export function HistoryView({ nodeCount = 1 }: { nodeCount?: number }) {
     }
   }
 
-  // Compute cost savings
-  const cloudPromptRate = parseFloat(settings?.cloud_prompt_rate || '0') || 0
-  const cloudGenRate = parseFloat(settings?.cloud_gen_rate || '0') || 0
-  const electRate = parseFloat(settings?.electricity_rate || '0') || 0
-  const cloudCost = (summary ? (summary.delta_prompt_tokens / 1_000_000) * cloudPromptRate : 0)
-    + (summary ? (summary.delta_gen_tokens / 1_000_000) * cloudGenRate : 0)
-  // Power is now recorded from all online nodes automatically (see
-  // metrics_collector), so no multiplier is needed. The `tp_gpu_count`
-  // setting is retained only as a deprecated/informational field for
-  // historical data recorded before multi-node monitoring was enabled.
-  const totalPowerKwh = summary ? summary.power_kwh : 0
-  const powerCost = totalPowerKwh * electRate
-  const netSavings = cloudCost - powerCost
+  // Compute cost savings — shared lib so the Command tab's savings band can
+  // never disagree with this view (D5); math unchanged.
+  const rates = {
+    cloud_prompt_rate: parseFloat(settings?.cloud_prompt_rate || '0') || 0,
+    cloud_gen_rate: parseFloat(settings?.cloud_gen_rate || '0') || 0,
+    electricity_rate: parseFloat(settings?.electricity_rate || '0') || 0,
+  }
+  const breakdown = computeSavings(summary, rates)
+  const cloudCost = breakdown.cloudCost
+  const powerCost = breakdown.powerCost
+  const netSavings = breakdown.netSavings
 
   const hours = summary?.total_seconds ? (summary.total_seconds / 3600).toFixed(1) : '—'
 
@@ -515,7 +514,7 @@ export function HistoryView({ nodeCount = 1 }: { nodeCount?: number }) {
               </div>
               <div>
                 <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Energy Used</span>
-                <div className="text-lg font-bold text-zinc-100 font-mono">{totalPowerKwh.toFixed(4)} kWh</div>
+                <div className="text-lg font-bold text-zinc-100 font-mono">{breakdown.powerKwh.toFixed(4)} kWh</div>
               </div>
             </div>
           </div>
