@@ -48,6 +48,10 @@ pub async fn metrics_collector(
     let mut networks = sysinfo::Networks::new_with_refreshed_list();
     let mut disks = sysinfo::Disks::new_with_refreshed_list();
 
+    // Local hostname, used to keep this host's own agent (which may appear in
+    // the node-poll list) out of the recorded cluster power total.
+    let local_hostname: Option<String> = sysinfo::System::host_name();
+
     // Initialize NVML (gracefully handle absence)
     let nvml = nvml_wrapper::Nvml::init().ok();
     let devices = match nvml.as_ref() {
@@ -235,21 +239,15 @@ pub async fn metrics_collector(
                 // Add power from every online remote node so the recorded
                 // value reflects the *actual* total cluster draw rather than
                 // just the local node. Falls back to local-only when no node
-                // snapshots are available (single-node deployments).
-                let remote_power_watts: f64 = node_snapshots
-                    .read()
-                    .await
-                    .iter()
-                    .filter(|n| n.online)
-                    .filter_map(|n| n.snapshot.as_ref())
-                    .filter_map(|s| s.gpu.power_watts)
-                    .sum();
-                let power_watts = match (local_power_watts, remote_power_watts) {
-                    (Some(local), remote) if remote > 0.0 => Some(local + remote),
-                    (Some(local), _) => Some(local),
-                    (None, remote) if remote > 0.0 => Some(remote),
-                    (None, _) => None,
-                };
+                // snapshots are available (single-node deployments). This
+                // host's own agent is excluded by hostname so its GPUs are
+                // not counted twice (once here via NVML, once via the poll
+                // list) — see `cluster_power_watts`.
+                let power_watts = cluster_power_watts(
+                    local_power_watts,
+                    &node_snapshots.read().await,
+                    local_hostname.as_deref(),
+                );
                 history_db
                     .insert_1s(
                         &eng.endpoint,
@@ -280,6 +278,40 @@ pub async fn metrics_collector(
                     .ok();
             }
         }
+    }
+}
+
+/// Combine local and remote GPU power readings into the recorded cluster
+/// total (used for the history database, not the `/api/nodes` display path).
+///
+/// Sums `gpu.power_watts` across online nodes with a snapshot, then combines
+/// that with the local node's own NVML reading. Nodes whose `hostname` matches
+/// `local_hostname` (case-insensitive) are excluded from the remote sum: the
+/// node-poll list may include this dashboard's own agent, and without the
+/// exclusion the local GPUs would be counted twice. When `local_hostname` is
+/// `None` (hostname lookup failed) no node is excluded — fail-open, so the
+/// recorded total never undercounts.
+#[cfg(target_os = "linux")]
+fn cluster_power_watts(
+    local_power_watts: Option<f64>,
+    nodes: &[crate::nodes::NodeSnapshot],
+    local_hostname: Option<&str>,
+) -> Option<f64> {
+    let remote_power_watts: f64 = nodes
+        .iter()
+        .filter(|n| n.online)
+        .filter(|n| match local_hostname {
+            Some(local) => !n.hostname.eq_ignore_ascii_case(local),
+            None => true,
+        })
+        .filter_map(|n| n.snapshot.as_ref())
+        .filter_map(|s| s.gpu.power_watts)
+        .sum();
+    match (local_power_watts, remote_power_watts) {
+        (Some(local), remote) if remote > 0.0 => Some(local + remote),
+        (Some(local), _) => Some(local),
+        (None, remote) if remote > 0.0 => Some(remote),
+        (None, _) => None,
     }
 }
 
@@ -427,4 +459,166 @@ pub struct NetworkMetrics {
     pub name: Option<String>,
     pub rx_bytes_per_sec: u64,
     pub tx_bytes_per_sec: u64,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod cluster_power_tests {
+    use super::*;
+    use crate::nodes::NodeSnapshot;
+
+    /// Minimal snapshot with only the fields `cluster_power_watts` reads.
+    fn snapshot_with_power(power_watts: Option<f64>) -> MetricsSnapshot {
+        MetricsSnapshot {
+            timestamp_ms: 0,
+            gpu: GpuMetrics {
+                index: Some(0),
+                name: None,
+                utilization_percent: None,
+                memory_total_bytes: None,
+                memory_used_bytes: None,
+                temperature_celsius: None,
+                power_watts,
+                power_limit_watts: None,
+                clock_graphics_mhz: None,
+                clock_sm_mhz: None,
+                clock_memory_mhz: None,
+                fan_speed_percent: None,
+            },
+            gpus: Vec::new(),
+            cpu: CpuMetrics {
+                name: None,
+                aggregate_percent: 0.0,
+                per_core: Vec::new(),
+            },
+            memory: MemoryMetrics {
+                total_bytes: 0,
+                display_total_bytes: 0,
+                used_bytes: 0,
+                available_bytes: 0,
+                cached_bytes: 0,
+                gpu_estimated_bytes: None,
+                gpu_memory_total_bytes: None,
+                gpu_memory_used_bytes: None,
+                is_unified: false,
+            },
+            disk: DiskMetrics {
+                name: None,
+                read_bytes_per_sec: 0,
+                write_bytes_per_sec: 0,
+            },
+            network: NetworkMetrics {
+                name: None,
+                rx_bytes_per_sec: 0,
+                tx_bytes_per_sec: 0,
+            },
+            engines: Vec::new(),
+            gpu_events: Vec::new(),
+        }
+    }
+
+    fn node(hostname: &str, online: bool, power_watts: Option<f64>) -> NodeSnapshot {
+        NodeSnapshot {
+            hostname: hostname.to_string(),
+            url: format!("http://{hostname}:3001"),
+            online,
+            last_seen_ms: 0,
+            snapshot: Some(snapshot_with_power(power_watts)),
+        }
+    }
+
+    #[test]
+    fn cluster_power_combines_local_with_three_remote_nodes() {
+        let nodes = vec![
+            node("spark-4e38", true, Some(56.5)),
+            node("spark-fc0d", true, Some(47.75)),
+            node("spark-470c", true, Some(58.0)),
+        ];
+        let power = cluster_power_watts(Some(100.0), &nodes, Some("spark-4cac"));
+        assert_eq!(power, Some(100.0 + 56.5 + 47.75 + 58.0));
+    }
+
+    #[test]
+    fn cluster_power_excludes_remote_node_matching_local_hostname() {
+        // Regression: the poll list includes this host's own agent, so one of
+        // the "remote" nodes IS the local node. Its reading must not be added
+        // on top of the local NVML value.
+        let nodes = vec![
+            node("spark-4cac", true, Some(56.5)),
+            node("spark-4e38", true, Some(47.75)),
+            node("spark-fc0d", true, Some(56.75)),
+            node("spark-470c", true, Some(58.0)),
+        ];
+        let power = cluster_power_watts(Some(100.0), &nodes, Some("spark-4cac"));
+        assert_eq!(power, Some(100.0 + 47.75 + 56.75 + 58.0));
+        assert_ne!(
+            power,
+            Some(100.0 + 56.5 + 47.75 + 56.75 + 58.0),
+            "local GPU power must not be double-counted"
+        );
+    }
+
+    #[test]
+    fn cluster_power_hostname_match_is_case_insensitive() {
+        let nodes = vec![
+            node("SPARK-4CAC", true, Some(56.5)),
+            node("spark-4e38", true, Some(47.75)),
+        ];
+        let power = cluster_power_watts(Some(100.0), &nodes, Some("Spark-4cac"));
+        assert_eq!(power, Some(100.0 + 47.75));
+    }
+
+    #[test]
+    fn cluster_power_with_unknown_local_hostname_includes_all_remotes() {
+        // Fail-open: without a hostname the local node cannot be identified,
+        // so every online remote is summed (never undercount).
+        let nodes = vec![
+            node("spark-4cac", true, Some(56.5)),
+            node("spark-4e38", true, Some(47.75)),
+        ];
+        let power = cluster_power_watts(Some(100.0), &nodes, None);
+        assert_eq!(power, Some(100.0 + 56.5 + 47.75));
+    }
+
+    #[test]
+    fn cluster_power_without_local_power_uses_remote_sum() {
+        let nodes = vec![
+            node("spark-4e38", true, Some(56.5)),
+            node("spark-fc0d", true, Some(47.75)),
+        ];
+        let power = cluster_power_watts(None, &nodes, Some("spark-4cac"));
+        assert_eq!(power, Some(56.5 + 47.75));
+    }
+
+    #[test]
+    fn cluster_power_none_when_no_local_power_and_no_online_remote_power() {
+        // Offline node with a stale snapshot and an online node without a
+        // power reading both contribute nothing; with no local reading either
+        // there is no power to record.
+        let nodes = vec![
+            node("spark-4e38", false, Some(56.5)),
+            node("spark-fc0d", true, None),
+        ];
+        let power = cluster_power_watts(None, &nodes, Some("spark-4cac"));
+        assert_eq!(power, None);
+    }
+
+    #[test]
+    fn cluster_power_zero_local_reading_is_still_a_reading() {
+        // Some(0.0) must not collapse to None when no remote power exists —
+        // the local node is reporting, it is just idle.
+        let nodes = vec![node("spark-4e38", false, Some(56.5))];
+        assert_eq!(
+            cluster_power_watts(Some(0.0), &nodes, Some("spark-4cac")),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn cluster_power_adds_remotes_onto_zero_local_reading() {
+        let nodes = vec![node("spark-4e38", true, Some(56.5))];
+        assert_eq!(
+            cluster_power_watts(Some(0.0), &nodes, Some("spark-4cac")),
+            Some(56.5)
+        );
+    }
 }
