@@ -3233,8 +3233,18 @@ mod tests {
     async fn test_merge_peak_kv_cache_uses_max() {
         let db = test_db();
         let key = "merge-peak-engine";
+        // Deterministic for ANY wall-clock time (skill testing pattern).
+        // query_summary() reads the REAL clock internally to find local
+        // today, so fixtures must anchor to the UTC day grid, not to now:
+        // daily row = a COMPLETED yesterday (full UTC day before today's
+        // UTC midnight), hourly row = 2h before the NEXT midnight (always
+        // inside today), range end = next UTC midnight (covers all of
+        // today regardless of the current time of day). The old version
+        // placed the hourly fixture at today+1h and queried to now+1000,
+        // which failed during 00:00-01:00 UTC (fixture beyond the bound).
         let now = chrono_now_ms();
         let start_of_today = (now / 86_400_000) * 86_400_000;
+        let end_of_today = start_of_today + 86_400_000;
 
         // Insert a daily row for yesterday with kv_cache_pct_max = 70.0.
         let yesterday = start_of_today - 86_400_000;
@@ -3250,7 +3260,9 @@ mod tests {
         }
 
         // Insert an hourly row for today with kv_cache_pct_max = 55.0.
-        let today_hour = start_of_today + 3_600_000;
+        // 2h before the NEXT midnight: always inside today, never beyond
+        // the range bound, regardless of the current time of day.
+        let today_hour = end_of_today - 7_200_000;
         {
             let conn = db.inner.lock().await;
             conn.execute(
@@ -3262,8 +3274,11 @@ mod tests {
             .unwrap();
         }
 
-        // Query spanning yesterday + today → triggers merge path.
-        let summary = db.query_summary(key, yesterday, now + 1000).await.unwrap();
+        // Query spanning yesterday + ALL of today → triggers merge path.
+        let summary = db
+            .query_summary(key, yesterday, end_of_today)
+            .await
+            .unwrap();
         assert!(summary.is_some());
         let s = summary.unwrap();
         assert_eq!(
