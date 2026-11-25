@@ -95,10 +95,24 @@ export function useClusterWindow(
     let cancelled = false
     async function load() {
       try {
-        const m = await fetch(`${base}/api/meta`)
-        const metaData = m.ok ? ((await m.json()) as ClusterMeta) : null
-        const s = await fetch(`${base}/api/history/settings`)
-        const ratesData: ClusterRates | null = s.ok ? await s.json() : null
+        // Legacy peers (pre-meta binaries) answer unknown GETs with the
+        // SPA fallback: 200 + HTML. `m.ok` is true but `.json()` throws,
+        // and a single try/catch around BOTH fetches let that failure
+        // also kill the settings fetch -> rates null -> peer savings $0.
+        // Parse each defensively and fetch settings independently.
+        const safeJson = async (r: Response) => {
+          try {
+            return await r.json()
+          } catch {
+            return null
+          }
+        }
+        const [m, s] = await Promise.all([
+          fetch(`${base}/api/meta`),
+          fetch(`${base}/api/history/settings`),
+        ])
+        const metaData = m.ok ? await safeJson(m) : null
+        const ratesData: ClusterRates | null = s.ok ? await safeJson(s) : null
         if (cancelled) return
         setMeta(metaData)
         setRates(ratesData)
