@@ -1119,10 +1119,12 @@ fn query_summary_one_table(
 
     match result {
         Ok(summary) => {
-            if summary.delta_prompt_tokens > 0
-                || summary.delta_gen_tokens > 0
-                || summary.total_requests > 0
-            {
+            // Accept any window that actually HAS samples, even an all-zero
+            // one. An idle window (no requests, no token deltas) is real
+            // data now that history records every second: the Command tab's
+            // Live peer card must show 0 active + idle wattage, not collapse
+            // to "no data". Empty windows (no rows) still fall through.
+            if summary.total_seconds.unwrap_or(0.0) > 0.0 {
                 Ok(Some(summary))
             } else {
                 Ok(None)
@@ -3289,6 +3291,65 @@ mod tests {
             (s.peak_kv_cache_pct.unwrap() - 70.0).abs() < 0.01,
             "merged peak should be MAX(70.0, 55.0) = 70.0"
         );
+    }
+
+    #[tokio::test]
+    async fn test_query_summary_idle_window_still_has_data() {
+        let db = test_db();
+        let key = "idle-engine";
+        // Day-grid anchored (skill pattern): trailing-60s style window built
+        // from a FIXED now so the test is hour-independent.
+        let now: i64 = 1_700_000_000_000;
+        // Simulate 60s of idle recording: rows every second, power present,
+        // zero request/token deltas (legacy vLLM idle counter behavior).
+        for k in 0..60 {
+            db.insert_1s(
+                key,
+                now - 60_000 + k * 1000,
+                Some(0),
+                Some(0),
+                Some(0),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(45.5),
+                None,
+                Some(43.0),
+                Some(0),
+                Some(0),
+                Some(0.0),
+                None,
+                Some(1.0),
+                None,
+                Some(0),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let s = db.query_summary(key, now - 60_000, now).await.unwrap();
+        let s = s.expect("idle window with rows must NOT be discarded as no-data");
+        assert_eq!(s.total_requests, 0);
+        assert_eq!(s.delta_prompt_tokens, 0);
+        assert_eq!(s.delta_gen_tokens, 0);
+        assert_eq!(s.peak_active_requests, 0);
+        // Idle wattage is REAL data: 60s * 45.5W > 0 kWh.
+        assert!(
+            s.power_kwh > 0.0,
+            "idle power must survive, got {}",
+            s.power_kwh
+        );
+        assert_eq!(s.total_seconds, Some(60.0));
+        // And a genuinely EMPTY window must still be None.
+        let empty = db
+            .query_summary(key, now + 3_600_000, now + 3_660_000)
+            .await
+            .unwrap();
+        assert!(empty.is_none(), "empty window must remain no-data");
     }
 
     /// FIX 1: hours spanning local midnight roll into the LOCAL day.

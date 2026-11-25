@@ -152,11 +152,14 @@ export function useClusterWindow(
         } else {
           setSummary(sumData as ClusterSummary)
         }
+        // Fold with reduce instead of Math.max(...spread): long windows
+        // can carry tens of thousands of points and spread would blow the
+        // JS call-stack limit (RangeError).
         const maxOf = (
           points: { value: number }[] | null | undefined,
         ): number | null =>
           points && points.length > 0
-            ? Math.max(...points.map((p) => p.value))
+            ? points.reduce((m, p) => (p.value > m ? p.value : m), points[0].value)
             : null
         const ttftData = ttftRes.ok ? await ttftRes.json() : null
         setTtftP95MaxMs(maxOf(ttftData?.points))
