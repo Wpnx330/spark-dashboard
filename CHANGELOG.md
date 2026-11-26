@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.14.0](https://github.com/Wpnx330/spark-dashboard/compare/spark-dashboard-v0.13.1...spark-dashboard-v0.14.0) (2026-11-26)
+
+
+### Features
+
+* **ui:** Command tab — two-cluster overview with windowed savings ([8047986](https://github.com/Wpnx330/spark-dashboard/commit/8047986a9d84b51f32ff676903ba449f99f4bc48))
+* **ui:** runtime-configurable dashboard title (--title / SPARK_DASHBOARD_TITLE) ([cddc146](https://github.com/Wpnx330/spark-dashboard/commit/cddc1462930041b55172f2d138388f5390cf5202))
+
+
+### Bug Fixes
+
+* **deploy:** mkdir drop-in dir + enable history toggle (fresh DB ships OFF) ([311ea9d](https://github.com/Wpnx330/spark-dashboard/commit/311ea9df12d1d5d0b8261354f78c63272d5ff649))
+* **history:** all-zero summary window is data, not "no data" ([708974a](https://github.com/Wpnx330/spark-dashboard/commit/708974a8c38d1e65251419911a6cddba89a50870))
+* **history:** default history recording ON for fresh deployments ([1c11c34](https://github.com/Wpnx330/spark-dashboard/commit/1c11c3430bb1861a0ff13b6584434baa2bfec286))
+* **ui:** legacy-peer meta HTML must not kill peer rate settings fetch ([07a33cd](https://github.com/Wpnx330/spark-dashboard/commit/07a33cd65e45eb455e1e1557eb7f62f79a818f47))
+
 ## [0.13.1](https://github.com/Wpnx330/spark-dashboard/compare/spark-dashboard-v0.13.0...spark-dashboard-v0.13.1) (2026-10-08)
 
 
